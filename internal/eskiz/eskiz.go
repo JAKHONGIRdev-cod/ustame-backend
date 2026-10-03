@@ -94,17 +94,17 @@ func (c *Client) post(ctx context.Context, token, phone, message string) (int, s
 	return res.StatusCode, string(raw), nil
 }
 
-// SendOTP kodni SMS bilan yuboradi. Test rejimida Eskiz faqat "Bu Eskiz dan test" matnini
-// qabul qiladi — kod server logiga yoziladi.
+// SendOTP kodni SMS bilan yuboradi. Eskiz test rejimida faqat "Bu Eskiz dan test" matnini
+// yuborishga ruxsat beradi, ya'ni kod foydalanuvchiga baribir yetmaydi. Shuning uchun
+// test rejimida SMS umuman yuborilmaydi (balans behuda sarflanmasin) — kod server logiga
+// yoziladi; sinash uchun TEST_PHONES dagi raqamlardan foydalaning.
 func (c *Client) SendOTP(ctx context.Context, phone, code string) error {
-	var message string
 	if c.TestMode {
-		message = "Bu Eskiz dan test"
-		log.Printf("TEST REJIM - %s uchun OTP: %s", phone, code)
-	} else {
-		// Eskiz'da moderatsiyadan o'tgan matn bilan harfma-harf bir xil bo'lsin
-		message = fmt.Sprintf("Ustago: tasdiqlash kodingiz %s. Kodni hech kimga bermang.", code)
+		log.Printf("TEST REJIM (SMS yuborilmadi) - %s uchun OTP: %s", phone, code)
+		return nil
 	}
+	// Eskiz'da moderatsiyadan o'tgan matn bilan harfma-harf bir xil bo'lsin
+	message := fmt.Sprintf("Ustago: tasdiqlash kodingiz %s. Kodni hech kimga bermang.", code)
 
 	tok, err := c.token(ctx, false)
 	if err != nil {
