@@ -15,6 +15,7 @@ import (
 
 	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/api"
 	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/config"
+	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/telegram"
 )
 
 func main() {
@@ -42,6 +43,16 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
+	if cfg.TelegramBotToken != "" {
+		bot := &telegram.Worker{
+			TG:    &telegram.Client{Token: cfg.TelegramBotToken, HTTP: &http.Client{Timeout: 40 * time.Second}},
+			Store: &telegram.PgStore{DB: db},
+		}
+		go bot.Run(ctx)
+	} else {
+		log.Print("TELEGRAM_BOT_TOKEN berilmagan — bildirishnomalar boti o'chiq")
+	}
+
 	go func() {
 		log.Printf("Ustago backend :%s portda ishlayapti", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

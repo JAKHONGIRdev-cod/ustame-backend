@@ -20,6 +20,9 @@ type Config struct {
 	EskizTestMode bool
 	// TEST_PHONES="998901112233:123456,..." — bu raqamlarga SMS ketmaydi, kod shu yerdan olinadi
 	TestPhones map[string]string
+	// TELEGRAM_BOT_TOKEN — bo'sh bo'lsa bildirishnomalar boti ishga tushmaydi.
+	// Faqat bitta joyda (Railway) bering: ikki nusxa bir token bilan ishlasa Telegram 409 qaytaradi.
+	TelegramBotToken string
 	// Web-sayt manzillari (CORS). "*" — hammasiga ruxsat (faqat lokal sinov uchun).
 	AllowedOrigins []string
 }
@@ -38,6 +41,8 @@ func Load() (*Config, error) {
 		EskizFrom:     getenv("ESKIZ_FROM", "4546"),
 		EskizTestMode: os.Getenv("ESKIZ_TEST_MODE") == "true",
 		TestPhones:    parseTestPhones(os.Getenv("TEST_PHONES")),
+
+		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 	}
 	for _, o := range strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",") {
 		if o = strings.TrimSpace(o); o != "" {
