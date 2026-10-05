@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/auth"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 )
 
 var sixDigits = regexp.MustCompile(`^\d{6}$`)

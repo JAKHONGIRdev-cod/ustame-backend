@@ -1,6 +1,6 @@
 -- =====================================================================
 -- Ilova SQL'i (Supabase'dan Neon'ga ko'chirilgan). Qayta ishga tushirish xavfsiz.
--- Manba: ustago-ref/supabase/*.sql — scripts/migrate-app.js orqali qo'llanadi.
+-- Manba: ustame/supabase/*.sql — scripts/migrate-app.js orqali qo'llanadi.
 --
 -- Supabase o'rniga:
 --   * auth.users  -> public.users ustidagi ko'rinish (id, phone)

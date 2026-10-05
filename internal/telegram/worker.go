@@ -45,10 +45,10 @@ type Worker struct {
 }
 
 const (
-	msgLinked = "✅ UstaGO bildirishnomalari ulandi. Yangi taklif, xabar va shartnoma yangiliklari shu yerga keladi.\n\n" +
+	msgLinked = "✅ Ustame bildirishnomalari ulandi. Yangi taklif, xabar va shartnoma yangiliklari shu yerga keladi.\n\n" +
 		"O'chirish uchun: /stop yoki ilovada Profil → Telegram → Uzish."
 	msgBadCode = "Havola eskirgan yoki noto'g'ri. Ilovada Profil → Telegram → «Botga ulanish» tugmasini qayta bosing."
-	msgHello   = "Assalomu alaykum! Bu UstaGO bildirishnomalar boti.\n\n" +
+	msgHello   = "Assalomu alaykum! Bu Ustame bildirishnomalar boti.\n\n" +
 		"Ulash uchun ilovada Profil → Telegram → «Botga ulanish» tugmasini bosing."
 	msgStopped = "Bildirishnomalar o'chirildi. Qayta ulash uchun ilovada «Botga ulanish» tugmasini bosing."
 )
@@ -132,7 +132,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 	}
 	chatID := u.Message.Chat.ID
 	cmd, arg, _ := strings.Cut(strings.TrimSpace(u.Message.Text), " ")
-	cmd, _, _ = strings.Cut(cmd, "@") // "/start@UstagoBot" ko'rinishi ham bo'ladi
+	cmd, _, _ = strings.Cut(cmd, "@") // "/start@UstameBot" ko'rinishi ham bo'ladi
 	arg = strings.TrimSpace(arg)
 
 	var reply string

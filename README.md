@@ -1,4 +1,4 @@
-# Ustago backend (Go)
+# Ustame backend (Go)
 
 Bitta API: mobil ilova (Expo), web-sayt va Telegram bildirishnomalar boti uchun. Hosting — Railway, baza — Neon Postgres.
 
@@ -42,7 +42,7 @@ Tokenni faqat bitta joyda (Railway) bering: bir token bilan ikki server `getUpda
 
 ## Railway'ga joylash
 
-1. Railway → New Project → Deploy from GitHub repo → `ustago-backend`. Yig'ish `Dockerfile` va `railway.json` bo'yicha.
+1. Railway → New Project → Deploy from GitHub repo → `ustame-backend`. Yig'ish `Dockerfile` va `railway.json` bo'yicha.
 2. Variables: `DATABASE_URL`, `JWT_SECRET`, `OTP_SECRET`, `ESKIZ_EMAIL`, `ESKIZ_PASSWORD`, `ESKIZ_TEST_MODE`,
    `TEST_PHONES`, `TELEGRAM_BOT_TOKEN` (`.env.local` dagi qiymatlar; `PORT` ni Railway o'zi beradi).
 3. Settings → Networking → Generate Domain. Shu manzilni ilovaning `eas.json` dagi `EXPO_PUBLIC_API_URL` ga yozing.

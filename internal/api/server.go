@@ -16,9 +16,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/auth"
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/config"
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/eskiz"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/config"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/eskiz"
 )
 
 const maxBodyBytes = 5 << 20 // rasm (3 MB) base64 ko'rinishida ~4 MB

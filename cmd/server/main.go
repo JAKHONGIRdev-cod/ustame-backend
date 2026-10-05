@@ -1,4 +1,4 @@
-// Ustago backend: mobil ilova, web-sayt va (keyinroq) Telegram bot uchun bitta API.
+// Ustame backend: mobil ilova, web-sayt va (keyinroq) Telegram bot uchun bitta API.
 package main
 
 import (
@@ -13,9 +13,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/api"
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/config"
-	"github.com/JAKHONGIRdev-cod/ustago-backend/internal/telegram"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/api"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/config"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/telegram"
 )
 
 func main() {
@@ -54,7 +54,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Ustago backend :%s portda ishlayapti", cfg.Port)
+		log.Printf("Ustame backend :%s portda ishlayapti", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}

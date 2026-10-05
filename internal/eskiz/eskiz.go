@@ -104,7 +104,7 @@ func (c *Client) SendOTP(ctx context.Context, phone, code string) error {
 		return nil
 	}
 	// Eskiz'da moderatsiyadan o'tgan matn bilan harfma-harf bir xil bo'lsin
-	message := fmt.Sprintf("Ustago: tasdiqlash kodingiz %s. Kodni hech kimga bermang.", code)
+	message := fmt.Sprintf("Ustame: tasdiqlash kodingiz %s. Kodni hech kimga bermang.", code)
 
 	tok, err := c.token(ctx, false)
 	if err != nil {

@@ -39,7 +39,7 @@ func (f *fakeTG) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.sent = append(f.sent, sentMsg{chat, p["text"].(string)})
 		w.Write([]byte(`{"ok":true,"result":{}}`))
 	case strings.HasSuffix(r.URL.Path, "/getMe"):
-		w.Write([]byte(`{"ok":true,"result":{"username":"UstagoTestBot"}}`))
+		w.Write([]byte(`{"ok":true,"result":{"username":"UstameTestBot"}}`))
 	default:
 		w.Write([]byte(`{"ok":false,"error_code":404,"description":"Not Found"}`))
 	}
@@ -121,7 +121,7 @@ func TestStartLinksChat(t *testing.T) {
 func TestStartWithBotSuffixAndStop(t *testing.T) {
 	w, _, st := newTest(t)
 	st.codes["k"] = true
-	w.handleUpdate(context.Background(), update(20, "/start@UstagoTestBot k"))
+	w.handleUpdate(context.Background(), update(20, "/start@UstameTestBot k"))
 	w.handleUpdate(context.Background(), update(20, "/stop"))
 	if !st.linked[20] || len(st.unlinked) != 1 || st.unlinked[0] != 20 {
 		t.Fatalf("linked=%v unlinked=%v", st.linked, st.unlinked)
@@ -184,7 +184,7 @@ func TestRunSavesUsername(t *testing.T) {
 	w.RetryDelay = 10 * time.Millisecond
 	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
 	w.Run(ctx) // ctx bekor bo'lgach qaytishi kerak
-	if st.username != "UstagoTestBot" {
+	if st.username != "UstameTestBot" {
 		t.Errorf("username = %q", st.username)
 	}
 }

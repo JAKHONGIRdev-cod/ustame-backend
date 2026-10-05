@@ -1,4 +1,4 @@
-module github.com/JAKHONGIRdev-cod/ustago-backend
+module github.com/JAKHONGIRdev-cod/ustame-backend
 
 go 1.27
 
