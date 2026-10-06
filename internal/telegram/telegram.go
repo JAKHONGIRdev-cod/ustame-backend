@@ -37,8 +37,22 @@ type Update struct {
 type Message struct {
 	Text string `json:"text"`
 	Chat struct {
-		ID int64 `json:"id"`
+		ID   int64  `json:"id"`
+		Type string `json:"type"` // "private", "group", ...
 	} `json:"chat"`
+	From    *Sender  `json:"from"`
+	Contact *Contact `json:"contact"`
+}
+
+type Sender struct {
+	ID int64 `json:"id"`
+}
+
+// Contact — "Raqamni yuborish" tugmasi yoki ulashilgan kontakt. UserID — kontakt egasining
+// Telegram id'si; o'z raqamini yuborganda u xabar yuboruvchining id'siga teng bo'ladi.
+type Contact struct {
+	PhoneNumber string `json:"phone_number"`
+	UserID      int64  `json:"user_id"`
 }
 
 type User struct {
@@ -110,7 +124,14 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout int) ([]U
 }
 
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
-	return c.call(ctx, "sendMessage", map[string]any{
-		"chat_id": chatID, "text": text, "disable_web_page_preview": true,
-	}, nil)
+	return c.SendMessageMarkup(ctx, chatID, text, nil)
+}
+
+// SendMessageMarkup — xabar va klaviatura (reply_markup); markup nil bo'lsa oddiy xabar.
+func (c *Client) SendMessageMarkup(ctx context.Context, chatID int64, text string, markup any) error {
+	params := map[string]any{"chat_id": chatID, "text": text, "disable_web_page_preview": true}
+	if markup != nil {
+		params["reply_markup"] = markup
+	}
+	return c.call(ctx, "sendMessage", params, nil)
 }

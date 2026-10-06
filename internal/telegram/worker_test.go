@@ -14,9 +14,10 @@ import (
 // fakeTG — Telegram Bot API o'rnida: sendMessage chaqiruvlarini yozib oladi,
 // chat_id bo'yicha oldindan berilgan xatoni qaytaradi.
 type fakeTG struct {
-	mu     sync.Mutex
-	sent   []sentMsg
-	errFor map[int64]string // chat_id -> butun JSON javob
+	mu      sync.Mutex
+	sent    []sentMsg
+	markups []any            // har bir yuborilgan xabarning reply_markup'i (yo'q bo'lsa nil)
+	errFor  map[int64]string // chat_id -> butun JSON javob
 }
 
 type sentMsg struct {
@@ -37,6 +38,7 @@ func (f *fakeTG) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.sent = append(f.sent, sentMsg{chat, p["text"].(string)})
+		f.markups = append(f.markups, p["reply_markup"])
 		w.Write([]byte(`{"ok":true,"result":{}}`))
 	case strings.HasSuffix(r.URL.Path, "/getMe"):
 		w.Write([]byte(`{"ok":true,"result":{"username":"UstameTestBot"}}`))
@@ -52,6 +54,27 @@ type fakeStore struct {
 	queue    []Notification
 	released []int64
 	username string
+
+	loginCodes map[string]bool  // kutilayotgan kirishlar (start_code)
+	loginChats map[int64]bool   // /start login_ bosilgan chatlar
+	verified   map[int64]string // chat -> tasdiqlangan raqam
+}
+
+func (s *fakeStore) BeginLogin(_ context.Context, code string, chat int64) (bool, error) {
+	if !s.loginCodes[code] {
+		return false, nil
+	}
+	s.loginChats[chat] = true
+	return true, nil
+}
+
+func (s *fakeStore) CompleteLogin(_ context.Context, chat int64, phone string) (bool, error) {
+	if !s.loginChats[chat] {
+		return false, nil
+	}
+	delete(s.loginChats, chat)
+	s.verified[chat] = phone
+	return true, nil
 }
 
 func (s *fakeStore) SaveBotUsername(_ context.Context, u string) error { s.username = u; return nil }
@@ -82,7 +105,8 @@ func newTest(t *testing.T) (*Worker, *fakeTG, *fakeStore) {
 	tg := &fakeTG{errFor: map[int64]string{}}
 	srv := httptest.NewServer(tg)
 	t.Cleanup(srv.Close)
-	st := &fakeStore{codes: map[string]bool{}, linked: map[int64]bool{}}
+	st := &fakeStore{codes: map[string]bool{}, linked: map[int64]bool{},
+		loginCodes: map[string]bool{}, loginChats: map[int64]bool{}, verified: map[int64]string{}}
 	w := &Worker{TG: &Client{Token: "123:SECRET", BaseURL: srv.URL, HTTP: srv.Client()}, Store: st}
 	w.defaults()
 	return w, tg, st

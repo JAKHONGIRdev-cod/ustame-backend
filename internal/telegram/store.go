@@ -65,6 +65,24 @@ func (s *PgStore) UnlinkChat(ctx context.Context, chatID int64) error {
 	return err
 }
 
+func (s *PgStore) BeginLogin(ctx context.Context, code string, chatID int64) (bool, error) {
+	tag, err := s.DB.Exec(ctx, `
+		update telegram_logins set chat_id = $2
+		where start_code = $1 and phone is null and used_at is null and expires_at > now()`, code, chatID)
+	return tag.RowsAffected() == 1, err
+}
+
+func (s *PgStore) CompleteLogin(ctx context.Context, chatID int64, phone string) (bool, error) {
+	tag, err := s.DB.Exec(ctx, `
+		update telegram_logins set phone = $2
+		where id = (
+			select id from telegram_logins
+			where chat_id = $1 and phone is null and used_at is null and expires_at > now()
+			order by id desc limit 1
+		)`, chatID, phone)
+	return tag.RowsAffected() == 1, err
+}
+
 func (s *PgStore) ClaimNotifications(ctx context.Context, limit int) ([]Notification, error) {
 	rows, err := s.DB.Query(ctx, `
 		with c as (

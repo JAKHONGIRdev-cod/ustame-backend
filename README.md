@@ -11,6 +11,8 @@ Biznes mantiq (e'lon, taklif, shartnoma, chat, baho, admin) va ruxsat tekshiruvl
 |---|---|
 | `POST /api/auth/send-code` `{phone}` | SMS-kod (Eskiz). 60 soniyada 1, soatiga 5 ta |
 | `POST /api/auth/verify` `{phone, code}` | `{token, user}` — 30 kunlik JWT |
+| `POST /api/auth/telegram/start` | `{url, secret, expires_in}` — Telegram orqali kirish (pastda) |
+| `POST /api/auth/telegram/check` `{secret}` | `{status: "pending"}` yoki `{status: "ok", token, user}`; eskirgan — 400 `LOGIN_EXPIRED` |
 | `GET/PATCH /api/me` | Profil, `{full_name?, active_role?}` |
 | `POST /api/rpc/{fn}` `{p_arg: ...}` | `sql/app.sql` dagi funksiya (faqat `authenticated` ga ruxsat berilganlari) |
 | `GET/POST/DELETE /api/files` | Rasmlar: avatar, e'lon rasmi, portfolio |
@@ -40,6 +42,19 @@ Smoke test (8 tekshiruv): `powershell -ExecutionPolicy Bypass -File scripts\smok
 
 Tokenni faqat bitta joyda (Railway) bering: bir token bilan ikki server `getUpdates` qilsa, Telegram 409 qaytaradi.
 
+## Telegram orqali kirish
+
+SMS'siz kirish (jadval: `sql/01-telegram-login.sql`):
+
+1. Ilova `POST /api/auth/telegram/start` → `t.me/<bot>?start=login_<kod>` ni ochadi, `secret` ni o'zida saqlaydi.
+2. Bot `/start login_<kod>` ni olib, «📱 Raqamni yuborish» tugmasini ko'rsatadi.
+3. Foydalanuvchi o'z raqamini yuboradi. Bot faqat `contact.user_id == from.id` (o'z raqami, forward emas) va
+   `+998` raqamlarni qabul qiladi.
+4. Ilova har 2 soniyada `POST /api/auth/telegram/check {secret}` qiladi; raqam tasdiqlangach token oladi.
+   Shu Telegram bildirishnomalar uchun ham ulanadi.
+
+Havola 10 daqiqa amal qiladi va bir martalik. `secret` havolada yo'q, bazada faqat sha256 xeshi saqlanadi.
+
 ## Railway'ga joylash
 
 1. Railway → New Project → Deploy from GitHub repo → `ustame-backend`. Yig'ish `Dockerfile` va `railway.json` bo'yicha.
@@ -56,5 +71,5 @@ internal/auth/    telefon formati, OTP xeshi, JWT (Node usta-api bilan mos)
 internal/eskiz/   SMS yuborish
 internal/telegram/ bildirishnomalar boti (ulash + navbatdagi xabarlarni yuborish)
 internal/api/     endpointlar
-sql/              baza sxemasi (00-auth.sql, app.sql)
+sql/              baza sxemasi (00-auth.sql, 01-telegram-login.sql, app.sql)
 ```

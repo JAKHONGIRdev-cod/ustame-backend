@@ -49,6 +49,8 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /api/auth/send-code", s.sendCode)
 	mux.HandleFunc("POST /api/auth/verify", s.verify)
+	mux.HandleFunc("POST /api/auth/telegram/start", s.telegramStart)
+	mux.HandleFunc("POST /api/auth/telegram/check", s.telegramCheck)
 	mux.HandleFunc("GET /api/me", s.getMe)
 	mux.HandleFunc("PATCH /api/me", s.patchMe)
 	mux.HandleFunc("POST /api/rpc/{fn}", s.rpc)

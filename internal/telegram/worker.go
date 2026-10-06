@@ -25,6 +25,10 @@ type Store interface {
 	// LinkChat — telegram_link_code shu kodga teng foydalanuvchiga chat'ni bog'laydi.
 	LinkChat(ctx context.Context, code string, chatID int64) (bool, error)
 	UnlinkChat(ctx context.Context, chatID int64) error
+	// BeginLogin — start_code bo'yicha muddati o'tmagan, hali tasdiqlanmagan kirishni shu chat'ga bog'laydi.
+	BeginLogin(ctx context.Context, code string, chatID int64) (bool, error)
+	// CompleteLogin — shu chat'dagi oxirgi kutilayotgan kirishga tasdiqlangan raqamni yozadi.
+	CompleteLogin(ctx context.Context, chatID int64, phone string) (bool, error)
 	// ClaimNotifications — yuborilmagan xabarlarni "yuborildi" deb belgilab oladi
 	// (ikki nusxa bir vaqtda ishlasa ham bir xabar ikki marta ketmasin).
 	ClaimNotifications(ctx context.Context, limit int) ([]Notification, error)
@@ -51,6 +55,27 @@ const (
 	msgHello   = "Assalomu alaykum! Bu Ustame bildirishnomalar boti.\n\n" +
 		"Ulash uchun ilovada Profil → Telegram → «Botga ulanish» tugmasini bosing."
 	msgStopped = "Bildirishnomalar o'chirildi. Qayta ulash uchun ilovada «Botga ulanish» tugmasini bosing."
+
+	// Telegram orqali kirish
+	loginPrefix   = "login_" // t.me/<bot>?start=login_<kod>
+	contactButton = "📱 Raqamni yuborish"
+
+	msgLoginAsk       = "Ustame ilovasiga kirish uchun pastdagi «" + contactButton + "» tugmasini bosing."
+	msgLoginBadCode   = "Kirish havolasi eskirgan. Ilovada «Telegram orqali kirish» tugmasini qayta bosing."
+	msgLoginNotOwn    = "Faqat o'zingizning raqamingizni yuboring: pastdagi «" + contactButton + "» tugmasini bosing."
+	msgLoginNotUz     = "Hozircha faqat O'zbekiston raqamlari (+998) bilan kirish mumkin."
+	msgLoginNoSession = "Avval ilovada «Telegram orqali kirish» tugmasini bosing, keyin raqamingizni yuboring."
+	msgLoginDone      = "✅ Raqamingiz tasdiqlandi. Ilovaga qayting — kirish avtomatik davom etadi.\n\n" +
+		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
+)
+
+var (
+	askContactKeyboard = map[string]any{
+		"keyboard":          [][]map[string]any{{{"text": contactButton, "request_contact": true}}},
+		"resize_keyboard":   true,
+		"one_time_keyboard": true,
+	}
+	removeKeyboard = map[string]any{"remove_keyboard": true}
 )
 
 func (w *Worker) defaults() {
@@ -127,16 +152,38 @@ func (w *Worker) pollUpdates(ctx context.Context) {
 }
 
 func (w *Worker) handleUpdate(ctx context.Context, u Update) {
-	if u.Message == nil {
+	m := u.Message
+	if m == nil {
 		return
 	}
-	chatID := u.Message.Chat.ID
-	cmd, arg, _ := strings.Cut(strings.TrimSpace(u.Message.Text), " ")
+	chatID := m.Chat.ID
+	if m.Contact != nil {
+		if reply, markup := w.contactReply(ctx, m); reply != "" {
+			w.send(ctx, chatID, reply, markup)
+		}
+		return
+	}
+	cmd, arg, _ := strings.Cut(strings.TrimSpace(m.Text), " ")
 	cmd, _, _ = strings.Cut(cmd, "@") // "/start@UstameBot" ko'rinishi ham bo'ladi
 	arg = strings.TrimSpace(arg)
 
 	var reply string
+	var markup any
 	switch {
+	case cmd == "/start" && strings.HasPrefix(arg, loginPrefix):
+		if m.Chat.Type != "private" {
+			return
+		}
+		ok, err := w.Store.BeginLogin(ctx, strings.TrimPrefix(arg, loginPrefix), chatID)
+		switch {
+		case err != nil:
+			log.Printf("telegram: kirishni boshlashda xato: %v", err)
+			return
+		case ok:
+			reply, markup = msgLoginAsk, askContactKeyboard
+		default:
+			reply = msgLoginBadCode
+		}
 	case cmd == "/start" && arg != "":
 		ok, err := w.Store.LinkChat(ctx, arg, chatID)
 		switch {
@@ -157,9 +204,51 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 	default:
 		reply = msgHello
 	}
-	if err := w.TG.SendMessage(ctx, chatID, reply); err != nil {
+	w.send(ctx, chatID, reply, markup)
+}
+
+// contactReply — yuborilgan kontaktni tekshiradi va kirishni tasdiqlaydi. Bo'sh javob — jim turamiz.
+func (w *Worker) contactReply(ctx context.Context, m *Message) (string, any) {
+	if m.Chat.Type != "private" {
+		return "", nil
+	}
+	// Forward qilingan yoki boshqa odamning kontakti: user_id yuboruvchiniki bilan mos kelmaydi
+	if m.From == nil || m.Contact.UserID != m.From.ID {
+		return msgLoginNotOwn, askContactKeyboard
+	}
+	phone, ok := uzPhone(m.Contact.PhoneNumber)
+	if !ok {
+		return msgLoginNotUz, removeKeyboard
+	}
+	ok, err := w.Store.CompleteLogin(ctx, m.Chat.ID, phone)
+	switch {
+	case err != nil:
+		log.Printf("telegram: kirishni tasdiqlashda xato: %v", err)
+		return "", nil
+	case !ok:
+		return msgLoginNoSession, removeKeyboard
+	}
+	return msgLoginDone, removeKeyboard
+}
+
+func (w *Worker) send(ctx context.Context, chatID int64, text string, markup any) {
+	if err := w.TG.SendMessageMarkup(ctx, chatID, text, markup); err != nil {
 		log.Printf("telegram: javob yuborilmadi: %v", err)
 	}
+}
+
+// uzPhone: "+998 90 123-45-67" -> "998901234567". Telegram raqamni xalqaro ko'rinishda beradi.
+func uzPhone(raw string) (string, bool) {
+	d := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, raw)
+	if len(d) == 12 && strings.HasPrefix(d, "998") {
+		return d, true
+	}
+	return "", false
 }
 
 func (w *Worker) deliverLoop(ctx context.Context) {
