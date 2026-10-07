@@ -981,7 +981,10 @@ begin
 end;
 $$;
 
-create or replace function public.get_messages(p_contract_id uuid)
+-- p_after berilsa faqat shu vaqtdan keyingi xabarlar (chat har necha soniyada faqat yangilarini oladi).
+-- Eski ilova versiyalari p_after'siz chaqiradi — butun yozishma qaytadi.
+drop function if exists public.get_messages(uuid);
+create or replace function public.get_messages(p_contract_id uuid, p_after timestamptz default null)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
   v_uid uuid := require_uid();
@@ -996,7 +999,9 @@ begin
       'id', m.id, 'sender_id', m.sender_id, 'text', m.text,
       'created_at', m.created_at, 'read_at', m.read_at
     ) order by m.created_at asc)
-    from messages m where m.contract_id = p_contract_id
+    from messages m
+    where m.contract_id = p_contract_id
+      and (p_after is null or m.created_at > p_after)
   ), '[]'::jsonb);
 end;
 $$;
@@ -1044,13 +1049,13 @@ $$;
 
 revoke execute on function
   public.send_message(uuid, text),
-  public.get_messages(uuid),
+  public.get_messages(uuid, timestamptz),
   public.mark_messages_read(uuid)
 from public, anon, authenticated;
 
 grant execute on function
   public.send_message(uuid, text),
-  public.get_messages(uuid),
+  public.get_messages(uuid, timestamptz),
   public.mark_messages_read(uuid)
 to authenticated;
 
