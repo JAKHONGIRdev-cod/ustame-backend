@@ -1564,10 +1564,13 @@ begin
 
   if new.status = 'submitted' then
     v_recipient := new.client_id;
-    v_msg := format(E'\U0001F4E6 Usta "%s" ishini tugatdi deb belgiladi — tasdiqlashingiz kerak.', v_job_title);
+    v_msg := format(E'\U0001F4E6 Usta "%s" ishini tugatdi deb belgiladi. 48 soat ichida ishni qabul qiling yoki e''tiroz bildiring — javob bo''lmasa, ish avtomatik qabul qilinadi.', v_job_title);
   elsif new.status = 'completed' then
     v_recipient := new.provider_id;
     v_msg := format(E'\U0001F389 "%s" shartnomasi yakunlandi.', v_job_title);
+    -- Mijoz ham bilsin (ayniqsa 48 soatdan keyin avtomatik qabul qilinganda) va ustani baholasin
+    perform queue_notification(new.client_id,
+      format(E'✅ "%s" ishi yakunlandi. Ilovada ustani baholashni unutmang.', v_job_title));
   elsif new.status = 'disputed' then
     v_recipient := new.provider_id;
     v_msg := format(E'⚠️ Mijoz "%s" shartnomasi bo''yicha nizo ochdi. Sabab: %s', v_job_title, new.dispute_reason);
