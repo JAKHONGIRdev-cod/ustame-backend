@@ -144,6 +144,26 @@ create index if not exists contracts_job_idx on public.contracts (job_id);
 create unique index if not exists contracts_one_live_per_job
   on public.contracts (job_id) where status in ('active', 'submitted', 'disputed', 'completed');
 
+-- Kafolatlangan to'lov (to'lov tizimi ulanguncha admin pul harakatini qo'lda belgilaydi):
+--   none     — kafolat ishlatilmagan (hisob-kitob mijoz va usta o'rtasida)
+--   held     — mijoz puli Ustame'da ushlab turilibdi
+--   released — ish qabul qilingach pul ustaga o'tkazildi
+--   refunded — shartnoma bekor bo'lgach pul mijozga qaytarildi
+alter table public.contracts add column if not exists payment_status text not null default 'none';
+alter table public.contracts add column if not exists payment_held_at timestamptz;
+alter table public.contracts add column if not exists payment_released_at timestamptz;
+alter table public.contracts add column if not exists payment_refunded_at timestamptz;
+
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'contracts_payment_status_check') then
+    alter table public.contracts add constraint contracts_payment_status_check
+      check (payment_status in ('none', 'held', 'released', 'refunded'));
+  end if;
+end $$;
+
+create index if not exists contracts_payment_held_idx
+  on public.contracts (created_at) where payment_status = 'held';
+
 create table if not exists public.reviews (
   id          uuid primary key default gen_random_uuid(),
   contract_id uuid not null references public.contracts (id) on delete cascade,
@@ -726,6 +746,8 @@ begin
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
     'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
+    'payment_status', v_k.payment_status, 'payment_held_at', v_k.payment_held_at,
+    'payment_released_at', v_k.payment_released_at, 'payment_refunded_at', v_k.payment_refunded_at,
     'job', (select jsonb_build_object('id', j.id, 'title', j.title, 'description', j.description,
                                       'category', j.category, 'district', j.district,
                                       'address', (select address from job_addresses a where a.job_id = j.id))
@@ -1793,6 +1815,8 @@ begin
   select jsonb_build_object(
     'pending_providers',   (select count(*) from provider_profiles where status = 'pending'),
     'disputed_contracts',  (select count(*) from contracts where status = 'disputed'),
+    'payments_action',     (select count(*) from contracts
+                             where payment_status = 'held' and status in ('completed', 'cancelled')),
     'total_users',         (select count(*) from profiles),
     'total_providers',     (select count(*) from provider_profiles where status = 'approved'),
     'open_jobs',           (select count(*) from jobs where status = 'open'),
@@ -1854,6 +1878,102 @@ begin
 end;
 $$;
 
+-- Admin: pul harakati bo'yicha shartnomalar. action:
+--   release — pul kafolatda, ish yakunlangan: ustaga o'tkazish kerak
+--   refund  — pul kafolatda, shartnoma bekor: mijozga qaytarish kerak
+--   held    — pul kafolatda, ish davom etmoqda
+--   hold    — kafolatsiz faol shartnoma: mijoz to'lasa "qabul qilindi" deb belgilanadi
+create or replace function public.admin_get_payments()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(x.row_data order by x.sort_key, x.created_at desc), '[]'::jsonb)
+  into v
+  from (
+    select k.created_at,
+      case
+        when k.payment_status = 'held' and k.status = 'completed' then 1
+        when k.payment_status = 'held' and k.status = 'cancelled' then 2
+        when k.payment_status = 'held' then 3
+        else 4
+      end as sort_key,
+      jsonb_build_object(
+        'id', k.id, 'price', k.price, 'status', k.status, 'payment_status', k.payment_status,
+        'payment_held_at', k.payment_held_at, 'created_at', k.created_at,
+        'action', case
+          when k.payment_status = 'held' and k.status = 'completed' then 'release'
+          when k.payment_status = 'held' and k.status = 'cancelled' then 'refund'
+          when k.payment_status = 'held' then 'held'
+          else 'hold'
+        end,
+        'job',      jsonb_build_object('id', j.id, 'title', j.title),
+        'client',   jsonb_build_object('id', cp.id, 'full_name', cp.full_name, 'phone', cu.phone),
+        'provider', jsonb_build_object('id', pp.id, 'full_name', pp.full_name, 'phone', pu.phone)
+      ) as row_data
+    from contracts k
+    join jobs j on j.id = k.job_id
+    join profiles cp on cp.id = k.client_id
+    join auth.users cu on cu.id = k.client_id
+    join profiles pp on pp.id = k.provider_id
+    join auth.users pu on pu.id = k.provider_id
+    where k.payment_status = 'held'
+       or (k.payment_status = 'none' and k.status in ('active', 'submitted', 'disputed'))
+    order by 2, k.created_at desc
+    limit 100
+  ) x;
+  return v;
+end;
+$$;
+
+-- Admin: pul harakatini belgilash. Faqat shu o'tishlar mumkin:
+--   none -> held      (shartnoma active / submitted / disputed — mijoz pulni o'tkazdi)
+--   held -> released  (shartnoma completed — pul ustaga o'tkazildi)
+--   held -> refunded  (shartnoma cancelled — pul mijozga qaytarildi)
+create or replace function public.admin_set_payment(p_contract_id uuid, p_status text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_k contracts;
+  v_title text;
+  v_sum text;
+  v_link text := '/contract/' || p_contract_id;
+begin
+  perform require_admin();
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if not coalesce(
+       (p_status = 'held' and v_k.payment_status = 'none' and v_k.status in ('active', 'submitted', 'disputed'))
+    or (p_status = 'released' and v_k.payment_status = 'held' and v_k.status = 'completed')
+    or (p_status = 'refunded' and v_k.payment_status = 'held' and v_k.status = 'cancelled'), false) then
+    raise exception 'INVALID_STATE';
+  end if;
+
+  update contracts set
+    payment_status      = p_status,
+    payment_held_at     = case when p_status = 'held' then now() else payment_held_at end,
+    payment_released_at = case when p_status = 'released' then now() else payment_released_at end,
+    payment_refunded_at = case when p_status = 'refunded' then now() else payment_refunded_at end
+  where id = p_contract_id;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  v_sum := replace(to_char(v_k.price, 'FM999,999,999'), ',', ' ');
+  if p_status = 'held' then
+    perform queue_notification(v_k.provider_id, format(
+      E'\U0001F512 "%s": mijoz puli (%s so''m) Ustame''da kafolatda. Ishni qabul qilgach pul sizga o''tkaziladi.',
+      v_title, v_sum), v_link);
+    perform queue_notification(v_k.client_id, format(
+      E'\U0001F512 "%s": to''lovingiz (%s so''m) kafolatda. Ishni qabul qilganingizdan keyingina ustaga o''tkaziladi.',
+      v_title, v_sum), v_link);
+  elsif p_status = 'released' then
+    perform queue_notification(v_k.provider_id, format(
+      E'\U0001F4B8 "%s": %s so''m sizga o''tkazildi.', v_title, v_sum), v_link);
+  else
+    perform queue_notification(v_k.client_id, format(
+      E'↩️ "%s": %s so''m sizga qaytarildi.', v_title, v_sum), v_link);
+  end if;
+end;
+$$;
+
 create or replace function public.get_me()
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
@@ -1887,12 +2007,12 @@ $$;
 revoke execute on function
   public.admin_review_provider(uuid, boolean, text), public.admin_resolve_dispute(uuid, text),
   public.admin_get_dashboard_stats(), public.admin_get_pending_providers(),
-  public.admin_get_disputed_contracts()
+  public.admin_get_disputed_contracts(), public.admin_get_payments(), public.admin_set_payment(uuid, text)
   from public, anon, authenticated;
 
 grant execute on function
   public.admin_review_provider(uuid, boolean, text), public.admin_resolve_dispute(uuid, text),
   public.admin_get_dashboard_stats(), public.admin_get_pending_providers(),
-  public.admin_get_disputed_contracts()
+  public.admin_get_disputed_contracts(), public.admin_get_payments(), public.admin_set_payment(uuid, text)
   to authenticated;
 
