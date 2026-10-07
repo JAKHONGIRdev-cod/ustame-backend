@@ -1469,6 +1469,55 @@ create table if not exists public.notification_outbox (
 create index if not exists notification_outbox_pending_idx
   on public.notification_outbox (created_at) where sent_at is null;
 
+-- Bildirishnoma bosilganda ilovada ochiladigan sahifa (expo-router yo'li, masalan /chat/<id>)
+alter table public.notification_outbox add column if not exists link text;
+
+-- Telefonga (push) yuborilishi Telegram'dan alohida kuzatiladi: sent_at — Telegram, push_sent_at — push
+do $$ begin
+  if not exists (select 1 from information_schema.columns
+                 where table_schema = 'public' and table_name = 'notification_outbox'
+                   and column_name = 'push_sent_at') then
+    alter table public.notification_outbox add column push_sent_at timestamptz;
+    -- Push qo'shilishidan oldingi eski xabarlar telefonga yuborilmaydi
+    update public.notification_outbox set push_sent_at = now();
+  end if;
+end $$;
+
+create index if not exists notification_outbox_push_pending_idx
+  on public.notification_outbox (id) where push_sent_at is null;
+
+-- Telefonlarning Expo push tokenlari (bitta foydalanuvchida bir nechta qurilma bo'lishi mumkin)
+create table if not exists public.push_tokens (
+  token      text primary key,
+  user_id    uuid not null references public.users (id) on delete cascade,
+  platform   text not null check (platform in ('android', 'ios')),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists push_tokens_user_idx on public.push_tokens (user_id);
+
+alter table public.push_tokens enable row level security;
+
+-- Ilova kirgandan keyin chaqiradi. Qurilmada boshqa hisobga kirilgan bo'lsa token yangi egasiga o'tadi.
+create or replace function public.register_push_token(p_token text, p_platform text)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if p_token is null or p_token !~ '^Expo(nent)?PushToken\[[A-Za-z0-9_-]{10,}\]$'
+     or p_platform is null or p_platform not in ('android', 'ios') then
+    raise exception 'INVALID_INPUT';
+  end if;
+  insert into push_tokens (token, user_id, platform) values (p_token, v_uid, p_platform)
+  on conflict (token) do update set user_id = excluded.user_id, platform = excluded.platform, updated_at = now();
+end;
+$$;
+
+-- Hisobdan chiqishda: bu telefonga boshqa bildirishnoma kelmaydi
+create or replace function public.unregister_push_token(p_token text)
+returns void language sql security definer set search_path = public as $$
+  delete from push_tokens where token = p_token and user_id = require_uid();
+$$;
+
 alter table public.notification_outbox enable row level security;
 
 create or replace function public.get_telegram_link()
@@ -1495,9 +1544,10 @@ begin
 end;
 $$;
 
-create or replace function public.queue_notification(p_user_id uuid, p_message text)
+drop function if exists public.queue_notification(uuid, text);
+create or replace function public.queue_notification(p_user_id uuid, p_message text, p_link text default null)
 returns void language sql security definer set search_path = public as $$
-  insert into notification_outbox (user_id, message) values (p_user_id, p_message);
+  insert into notification_outbox (user_id, message, link) values (p_user_id, p_message, p_link);
 $$;
 
 create or replace function public.notify_new_proposal()
@@ -1507,7 +1557,8 @@ begin
   select client_id, title into v_client_id, v_job_title from jobs where id = new.job_id;
   select full_name into v_provider_name from profiles where id = new.provider_id;
   perform queue_notification(v_client_id, format(
-    E'\U0001F514 "%s" e''loningizga yangi taklif keldi.\n%s', v_job_title, v_provider_name));
+    E'\U0001F514 "%s" e''loningizga yangi taklif keldi.\n%s', v_job_title, v_provider_name),
+    '/job/' || new.job_id);
   return new;
 end;
 $$;
@@ -1524,7 +1575,8 @@ begin
   if new.status = 'accepted' and old.status is distinct from 'accepted' then
     select title into v_job_title from jobs where id = new.job_id;
     perform queue_notification(new.provider_id, format(
-      E'✅ Tabriklaymiz! "%s" e''longa taklifingiz qabul qilindi.', v_job_title));
+      E'✅ Tabriklaymiz! "%s" e''longa taklifingiz qabul qilindi.', v_job_title),
+      '/job/' || new.job_id);
   end if;
   return new;
 end;
@@ -1542,7 +1594,8 @@ begin
   select title into v_job_title from jobs where id = new.job_id;
   select full_name into v_client_name from profiles where id = new.client_id;
   perform queue_notification(new.provider_id, format(
-    E'⭐ %s sizni "%s" e''loniga shaxsan taklif qildi.', v_client_name, v_job_title));
+    E'⭐ %s sizni "%s" e''loniga shaxsan taklif qildi.', v_client_name, v_job_title),
+    '/job/' || new.job_id);
   return new;
 end;
 $$;
@@ -1559,7 +1612,8 @@ begin
   select case when client_id = new.sender_id then provider_id else client_id end
     into v_recipient from contracts where id = new.contract_id;
   select full_name into v_sender_name from profiles where id = new.sender_id;
-  perform queue_notification(v_recipient, format(E'\U0001F4AC %s: %s', v_sender_name, left(new.text, 200)));
+  perform queue_notification(v_recipient, format(E'\U0001F4AC %s: %s', v_sender_name, left(new.text, 200)),
+    '/chat/' || new.contract_id);
   return new;
 end;
 $$;
@@ -1584,7 +1638,8 @@ begin
     v_msg := format(E'\U0001F389 "%s" shartnomasi yakunlandi.', v_job_title);
     -- Mijoz ham bilsin (ayniqsa 48 soatdan keyin avtomatik qabul qilinganda) va ustani baholasin
     perform queue_notification(new.client_id,
-      format(E'✅ "%s" ishi yakunlandi. Ilovada ustani baholashni unutmang.', v_job_title));
+      format(E'✅ "%s" ishi yakunlandi. Ilovada ustani baholashni unutmang.', v_job_title),
+      '/contract/' || new.id);
   elsif new.status = 'disputed' then
     v_recipient := new.provider_id;
     v_msg := format(E'⚠️ Mijoz "%s" shartnomasi bo''yicha nizo ochdi. Sabab: %s', v_job_title, new.dispute_reason);
@@ -1598,7 +1653,7 @@ begin
     end if;
   end if;
 
-  if v_recipient is not null then perform queue_notification(v_recipient, v_msg); end if;
+  if v_recipient is not null then perform queue_notification(v_recipient, v_msg, '/contract/' || new.id); end if;
   return new;
 end;
 $$;
@@ -1643,8 +1698,14 @@ revoke execute on function public.get_telegram_link(), public.unlink_telegram()
 grant execute on function public.get_telegram_link(), public.unlink_telegram()
   to authenticated;
 
+revoke execute on function public.register_push_token(text, text), public.unregister_push_token(text)
+  from public, anon, authenticated;
+
+grant execute on function public.register_push_token(text, text), public.unregister_push_token(text)
+  to authenticated;
+
 revoke execute on function
-  public.queue_notification(uuid, text), public.notify_new_proposal(),
+  public.queue_notification(uuid, text, text), public.notify_new_proposal(),
   public.notify_proposal_accepted(), public.notify_job_invite(),
   public.notify_new_message(), public.notify_contract_status()
   from public, anon, authenticated;
@@ -1681,7 +1742,8 @@ begin
     case when p_approve
       then E'✅ Tabriklaymiz! Usta profilingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
       else format(E'❌ Usta profilingiz rad etildi. Sabab: %s', coalesce(p_reason, '-'))
-    end);
+    end,
+    case when p_approve then '/' else '/become-provider' end);
 end;
 $$;
 
@@ -1705,13 +1767,15 @@ begin
   if p_winner = 'provider' then
     perform _complete_contract(p_contract_id);
     perform queue_notification(v_k.client_id,
-      format(E'⚖️ "%s" shartnomasi bo''yicha nizo admin tomonidan usta foydasiga hal qilindi.', v_job_title));
+      format(E'⚖️ "%s" shartnomasi bo''yicha nizo admin tomonidan usta foydasiga hal qilindi.', v_job_title),
+      '/contract/' || p_contract_id);
   else
     update contracts set status = 'cancelled', cancelled_at = now(), cancelled_by = 'admin'
      where id = p_contract_id;
     update jobs set status = 'cancelled', closed_at = now() where id = v_k.job_id;
     perform queue_notification(v_k.client_id,
-      format(E'⚖️ "%s" shartnomasi bo''yicha nizo admin tomonidan siz foydangizga hal qilindi.', v_job_title));
+      format(E'⚖️ "%s" shartnomasi bo''yicha nizo admin tomonidan siz foydangizga hal qilindi.', v_job_title),
+      '/contract/' || p_contract_id);
   end if;
 end;
 $$;

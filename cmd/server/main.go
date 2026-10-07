@@ -16,6 +16,7 @@ import (
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/api"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/config"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/jobs"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/push"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/telegram"
 )
 
@@ -53,6 +54,12 @@ func main() {
 	}
 	// Mijoz 48 soat javob bermagan topshirilgan ishlar avtomatik qabul qilinadi
 	go jobs.AutoApprove(ctx, db, 5*time.Minute)
+	// Telefonlarga push-bildirishnomalar (Expo) — Telegram botidan mustaqil
+	pusher := &push.Worker{
+		Expo:  &push.Client{AccessToken: cfg.ExpoAccessToken, HTTP: &http.Client{Timeout: 20 * time.Second}},
+		Store: &push.PgStore{DB: db},
+	}
+	go pusher.Run(ctx)
 
 	if cfg.TelegramBotToken != "" {
 		bot := &telegram.Worker{
