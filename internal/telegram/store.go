@@ -53,7 +53,7 @@ func (s *PgStore) LinkChat(ctx context.Context, code string, chatID int64) (bool
 		return false, err
 	}
 	// Kod bir martalik: keyingi ulanishda get_telegram_link() yangisini yaratadi
-	if _, err := tx.Exec(ctx, `update users set telegram_chat_id = $1, telegram_link_code = null where id::text = $2`,
+	if _, err := tx.Exec(ctx, `update users set telegram_chat_id = $1, telegram_link_code = null where id = $2::uuid`,
 		chatID, userID); err != nil {
 		return false, err
 	}

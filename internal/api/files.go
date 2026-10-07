@@ -54,7 +54,7 @@ func (s *Server) canWrite(r *http.Request, u *user, bucket, folder, name string)
 			return false, nil
 		}
 		var clientID string
-		err := s.db.QueryRow(r.Context(), `select client_id::text from jobs where id::text = $1`, folder).Scan(&clientID)
+		err := s.db.QueryRow(r.Context(), `select client_id::text from jobs where id = $1::uuid`, folder).Scan(&clientID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}

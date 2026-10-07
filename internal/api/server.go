@@ -149,18 +149,29 @@ func publicUser(u *user) map[string]any {
 	}
 }
 
-// requireUser: Bearer token -> users qatori. Token yo'q/noto'g'ri/eskirgan yoki
-// token_version mos kelmasa (bekor qilingan) — nil.
-func (s *Server) requireUser(ctx context.Context, r *http.Request) *user {
+// tokenUser: Bearer tokendagi foydalanuvchi id va token_version (bazaga bormasdan, faqat imzo/muddat).
+// Token bekor qilinmaganini (token_version) chaqiruvchi bazada tekshirishi shart.
+func (s *Server) tokenUser(r *http.Request) (id string, tv int, ok bool) {
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
-		return nil
+		return "", 0, false
 	}
 	id, tv, err := auth.ParseToken(s.cfg.JWTSecret, token)
 	if err != nil {
+		return "", 0, false
+	}
+	return id, tv, true
+}
+
+// requireUser: Bearer token -> users qatori. Token yo'q/noto'g'ri/eskirgan yoki
+// token_version mos kelmasa (bekor qilingan) — nil.
+func (s *Server) requireUser(ctx context.Context, r *http.Request) *user {
+	id, tv, ok := s.tokenUser(r)
+	if !ok {
 		return nil
 	}
-	u, err := scanUser(s.db.QueryRow(ctx, `select `+userColumns+` from users where id::text = $1`, id))
+	// id::text = $1 emas: ustunni o'zgartirsak indeks ishlamaydi va butun jadval o'qiladi
+	u, err := scanUser(s.db.QueryRow(ctx, `select `+userColumns+` from users where id = $1::uuid`, id))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			log.Printf("requireUser: %v", err)

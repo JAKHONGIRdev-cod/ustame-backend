@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -135,8 +138,8 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := s.requireUser(ctx, r)
-	if u == nil {
+	uid, tv, ok := s.tokenUser(r)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
 		return
 	}
@@ -146,10 +149,13 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_INPUT")
 		return
 	}
+	// Nomlar tartiblanadi: SQL matni har safar bir xil bo'lsa, pgx tayyorlangan so'rovni keshdan oladi
+	// (Go map tartibi tasodifiy — aks holda har chaqiruvda qayta tayyorlash uchun qo'shimcha borib-kelish).
+	names := slices.Sorted(maps.Keys(body))
 	named := make([]string, 0, len(body))
 	args := make([]any, 0, len(body))
-	for name, v := range body {
-		arg, err := toArg(v)
+	for _, name := range names {
+		arg, err := toArg(body[name])
 		if !argName.MatchString(name) || err != nil {
 			writeError(w, http.StatusBadRequest, "INVALID_INPUT")
 			return
@@ -158,31 +164,25 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		named = append(named, fmt.Sprintf("%s => $%d", name, len(args)))
 	}
 	call := fmt.Sprintf("public.%s(%s)", fn, strings.Join(named, ", "))
-	claims, _ := json.Marshal(map[string]string{"sub": u.ID, "role": "authenticated"})
 
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		s.fail(w, "rpc begin", err)
-		return
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `select set_config('request.jwt.claims', $1, true)`, string(claims)); err != nil {
-		s.fail(w, "rpc claims", err)
-		return
-	}
-
+	// Foydalanuvchini tekshirish (auth.set_request_user) va funksiya bitta paketda ketadi: paket
+	// yashirin tranzaksiyada bajariladi, shuning uchun bazaga bir marta borib-kelinadi (oldin 5 marta).
+	// Token bekor qilingan bo'lsa set_request_user AUTH_REQUIRED tashlaydi va funksiya bajarilmaydi.
 	var result *string
+	scan := func(row pgx.Row) error { return row.Scan(&result) }
+	b := &pgx.Batch{}
+	b.Queue(`select auth.set_request_user($1::uuid, $2)`, uid, tv)
 	switch kind {
 	case returnsVoid:
-		_, err = tx.Exec(ctx, "select "+call, args...)
+		b.Queue("select "+call, args...)
 	case returnsJSON:
-		err = tx.QueryRow(ctx, "select "+call+"::text", args...).Scan(&result)
+		b.Queue("select "+call+"::text", args...).QueryRow(scan)
 	default:
-		err = tx.QueryRow(ctx, "select to_jsonb("+call+")::text", args...).Scan(&result)
+		b.Queue("select to_jsonb("+call+")::text", args...).QueryRow(scan)
 	}
-	if err == nil {
-		err = tx.Commit(ctx)
-	}
+	start := time.Now()
+	err = s.db.SendBatch(ctx, b).Close()
+	w.Header().Set("Server-Timing", fmt.Sprintf("db;dur=%d", time.Since(start).Milliseconds()))
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && errorCode.MatchString(pgErr.Message) {

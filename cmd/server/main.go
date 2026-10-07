@@ -28,7 +28,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("baza: %v", err)
+	}
+	// Bir nechta ulanish doim ochiq turadi: yangi ulanish (TLS + parol) bazaga bir necha marta
+	// borib-kelishni talab qiladi, birinchi so'rovni sekinlashtirmasligi uchun.
+	poolCfg.MinConns = 2
+	db, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		log.Fatalf("baza: %v", err)
 	}

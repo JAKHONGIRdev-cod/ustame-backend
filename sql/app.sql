@@ -26,6 +26,20 @@ create or replace function auth.uid() returns uuid language sql stable as $$
   select nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub', '')::uuid
 $$;
 
+-- Backend /api/rpc har so'rovda funksiyadan oldin chaqiradi (bitta paketda, bazaga bir marta borib):
+-- token bekor qilinmaganini (token_version) tekshiradi va auth.uid() uchun request.jwt.claims ni
+-- shu tranzaksiyaga o'rnatadi. Xato bo'lsa keyingi funksiya umuman bajarilmaydi.
+create or replace function auth.set_request_user(p_uid uuid, p_tv int) returns void
+language plpgsql as $$
+begin
+  if not exists (select 1 from public.users where id = p_uid and token_version = p_tv) then
+    raise exception 'AUTH_REQUIRED';
+  end if;
+  perform set_config('request.jwt.claims',
+    json_build_object('sub', p_uid, 'role', 'authenticated')::text, true);
+end $$;
+revoke all on function auth.set_request_user(uuid, int) from public;
+
 create or replace view public.profiles as
   select id, full_name, active_role, created_at, avatar_updated_at, is_admin,
          telegram_chat_id, telegram_link_code

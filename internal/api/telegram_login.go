@@ -156,7 +156,7 @@ func (s *Server) telegramCheck(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, "telegram-check", err)
 			return
 		}
-		if _, err := tx.Exec(ctx, `update users set telegram_chat_id = $1 where id::text = $2`, *chatID, u.ID); err != nil {
+		if _, err := tx.Exec(ctx, `update users set telegram_chat_id = $1 where id = $2::uuid`, *chatID, u.ID); err != nil {
 			s.fail(w, "telegram-check", err)
 			return
 		}

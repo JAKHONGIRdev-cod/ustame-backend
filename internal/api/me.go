@@ -47,7 +47,7 @@ func (s *Server) patchMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated, err := scanUser(s.db.QueryRow(r.Context(), `
-		update users set full_name = $1, active_role = $2 where id::text = $3
+		update users set full_name = $1, active_role = $2 where id = $3::uuid
 		returning `+userColumns, fullName, activeRole, u.ID))
 	if err != nil {
 		s.fail(w, "patch me", err)
