@@ -711,7 +711,7 @@ begin
     'cancelled_at', v_k.cancelled_at, 'cancelled_by', v_k.cancelled_by, 'cancel_reason', v_k.cancel_reason,
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
-    'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '3 days' end,
+    'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
     'job', (select jsonb_build_object('id', j.id, 'title', j.title, 'description', j.description,
                                       'category', j.category, 'district', j.district,
                                       'address', (select address from job_addresses a where a.job_id = j.id))
@@ -874,7 +874,7 @@ declare
   r record;
   n int := 0;
 begin
-  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '3 days'
+  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '48 hours'
   loop
     perform _complete_contract(r.id);
     n := n + 1;

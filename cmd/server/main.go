@@ -15,6 +15,7 @@ import (
 
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/api"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/config"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/jobs"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/telegram"
 )
 
@@ -43,6 +44,9 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
+	// Mijoz 48 soat javob bermagan topshirilgan ishlar avtomatik qabul qilinadi
+	go jobs.AutoApprove(ctx, db, 5*time.Minute)
+
 	if cfg.TelegramBotToken != "" {
 		bot := &telegram.Worker{
 			TG:    &telegram.Client{Token: cfg.TelegramBotToken, HTTP: &http.Client{Timeout: 40 * time.Second}},
