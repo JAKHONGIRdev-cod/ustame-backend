@@ -121,6 +121,16 @@ func toArg(v any) (any, error) {
 	return nil, fmt.Errorf("unsupported %T", v)
 }
 
+// readOnly — faqat o'qiydigan funksiyalar (nomlash qoidasi bo'yicha): ular bildirishnoma yaratmaydi.
+func readOnly(fn string) bool {
+	for _, p := range []string{"get_", "find_", "search_", "admin_get_"} {
+		if strings.HasPrefix(fn, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	fn := r.PathValue("fn")
@@ -196,6 +206,11 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		log.Printf("rpc %s: %v", fn, err)
 		writeError(w, http.StatusInternalServerError, "SERVER_ERROR")
 		return
+	}
+
+	s.Activity.Notify()
+	if !readOnly(fn) {
+		s.Outbox.Notify()
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

@@ -20,7 +20,8 @@ type Message struct {
 type Store interface {
 	// Claim — push yuborilmagan xabarlarni "yuborildi" deb belgilab oladi va har biri uchun
 	// foydalanuvchining barcha tokenlarini qaytaradi (tokeni yo'q foydalanuvchiniki shunchaki belgilanadi).
-	Claim(ctx context.Context, limit int) ([]Message, error)
+	// claimed — navbatdan olingan xabarlar soni (tokenlar sonidan farq qiladi).
+	Claim(ctx context.Context, limit int) (claimed int, list []Message, err error)
 	// Release — yuborib bo'lmagan xabarlarni keyinroq qayta urinish uchun qaytaradi.
 	Release(ctx context.Context, ids []int64) error
 	// DeleteTokens — ilova o'chirilgan yoki ruxsat olib qo'yilgan telefonlar tokenlari.
@@ -35,7 +36,10 @@ type Worker struct {
 	Expo  Sender
 	Store Store
 
-	Every      time.Duration // navbatni tekshirish oralig'i (standart 3 s)
+	// Wake — API navbatga xabar qo'shilgan bo'lishi mumkin bo'lganda signal beradi (internal/wakeup).
+	// Navbat doimiy so'ralmaydi: Neon bo'sh paytda uxlab, oylik hisoblash soatlarini tejasin.
+	Wake       <-chan struct{}
+	IdlePoll   time.Duration // signalsiz zaxira tekshiruv oralig'i (standart 6 soat)
 	RetryDelay time.Duration // xatodan keyin kutish (standart 10 s)
 	MaxAge     time.Duration // shundan eski xabar telefonga yuborilmaydi (standart 6 soat)
 }
@@ -47,8 +51,8 @@ const (
 )
 
 func (w *Worker) defaults() {
-	if w.Every == 0 {
-		w.Every = 3 * time.Second
+	if w.IdlePoll == 0 {
+		w.IdlePoll = 6 * time.Hour
 	}
 	if w.RetryDelay == 0 {
 		w.RetryDelay = 10 * time.Second
@@ -62,8 +66,12 @@ func (w *Worker) defaults() {
 func (w *Worker) Run(ctx context.Context) {
 	w.defaults()
 	for ctx.Err() == nil {
-		wait := w.Every
-		if w.deliverOnce(ctx) {
+		failed, full := w.deliverOnce(ctx)
+		if full && !failed {
+			continue // navbatda yana xabar bor
+		}
+		wait := w.IdlePoll
+		if failed {
 			wait = w.RetryDelay
 		}
 		t := time.NewTimer(wait)
@@ -71,28 +79,37 @@ func (w *Worker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			t.Stop()
 			return
+		case <-w.Wake:
+			if failed {
+				// Xatodan keyin baribir RetryDelay kutamiz — Expo ishlamayotgan bo'lsa urib turmaslik uchun
+				select {
+				case <-ctx.Done():
+				case <-t.C:
+				}
+			}
 		case <-t.C:
 		}
+		t.Stop()
 	}
 }
 
-// deliverOnce — bir partiyani yuboradi; true — xato bo'ldi, keyingi urinishgacha ko'proq kutish kerak.
-func (w *Worker) deliverOnce(ctx context.Context) bool {
+// deliverOnce — bir partiyani yuboradi. failed — xato bo'ldi (keyinroq qayta urinish kerak),
+// full — navbatdan to'la partiya olindi, yana bo'lishi mumkin.
+func (w *Worker) deliverOnce(ctx context.Context) (failed, full bool) {
 	w.defaults()
-	list, err := w.Store.Claim(ctx, batchRows)
+	claimed, list, err := w.Store.Claim(ctx, batchRows)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("push: navbat o'qilmadi: %v", err)
 		}
-		return true
+		return true, false
 	}
-	failed := false
 	for start := 0; start < len(list); start += batchSend {
 		if w.send(ctx, list[start:min(start+batchSend, len(list))]) {
 			failed = true
 		}
 	}
-	return failed
+	return failed, claimed == batchRows
 }
 
 func (w *Worker) send(ctx context.Context, part []Message) bool {

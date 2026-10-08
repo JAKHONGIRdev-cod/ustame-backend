@@ -6,21 +6,43 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
 
 type fakeStore struct {
+	mu       sync.Mutex // Run alohida goroutine'da ishlaganda
 	queue    []Message
 	released []int64
 	deleted  []string
+	claims   int
 }
 
-func (f *fakeStore) Claim(_ context.Context, limit int) ([]Message, error) {
-	n := min(limit, len(f.queue))
-	out := f.queue[:n]
-	f.queue = f.queue[n:]
-	return out, nil
+// Claim — soddalashtirilgan: navbatdagi hamma qatorni oladi; claimed — alohida xabarlar (ID) soni.
+func (f *fakeStore) Claim(_ context.Context, limit int) (int, []Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claims++
+	out := f.queue
+	f.queue = nil
+	ids := map[int64]bool{}
+	for _, m := range out {
+		ids[m.ID] = true
+	}
+	return min(len(ids), limit), out, nil
+}
+
+func (f *fakeStore) add(m Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queue = append(f.queue, m)
+}
+
+func (f *fakeStore) claimCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claims
 }
 
 func (f *fakeStore) Release(_ context.Context, ids []int64) error {
@@ -68,7 +90,7 @@ func TestDeliverSendsWithLink(t *testing.T) {
 		{ID: 2, Token: "ExponentPushToken[aaaaaaaaaaaa]", Text: "Xabar", CreatedAt: time.Now()},
 	}}
 	w := &Worker{Expo: expo, Store: st}
-	if failed := w.deliverOnce(context.Background()); failed {
+	if failed, _ := w.deliverOnce(context.Background()); failed {
 		t.Fatal("xato bo'lmasligi kerak edi")
 	}
 	if len(*got) != 3 {
@@ -114,7 +136,7 @@ func TestDeliverReleasesOnServerError(t *testing.T) {
 		{ID: 8, Token: "ExponentPushToken[aaaaaaaaaaaa]", Text: "eski", CreatedAt: time.Now().Add(-7 * time.Hour)},
 	}}
 	w := &Worker{Expo: expo, Store: st}
-	if failed := w.deliverOnce(context.Background()); !failed {
+	if failed, _ := w.deliverOnce(context.Background()); !failed {
 		t.Fatal("xato bo'lishi kerak edi")
 	}
 	// 7 bir marta qaytariladi (ikki telefon bo'lsa ham), eskirgan 8 tashlab yuboriladi
@@ -137,5 +159,30 @@ func TestDeliverEmptyQueueSendsNothing(t *testing.T) {
 	(&Worker{Expo: expo, Store: &fakeStore{}}).deliverOnce(context.Background())
 	if len(*got) != 0 {
 		t.Fatalf("bo'sh navbatda so'rov ketmasligi kerak: %d", len(*got))
+	}
+}
+
+// Navbat doimiy so'ralmaydi: birinchi tekshiruvdan keyin faqat signal (yoki zaxira vaqt) kutiladi.
+func TestRunWaitsForWake(t *testing.T) {
+	expo, got := fakeExpo(t, 200, okTickets)
+	st := &fakeStore{}
+	wake := make(chan struct{}, 1)
+	w := &Worker{Expo: expo, Store: st, Wake: wake, IdlePoll: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+	if n := st.claimCount(); n != 1 {
+		t.Fatalf("signalsiz faqat ishga tushishda bir marta tekshirilishi kerak, tekshiruvlar: %d", n)
+	}
+	st.add(Message{ID: 9, Token: "ExponentPushToken[aaaaaaaaaaaa]", Text: "yangi", CreatedAt: time.Now()})
+	wake <- struct{}{}
+	for deadline := time.Now().Add(time.Second); st.claimCount() < 2 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if st.claimCount() != 2 || len(*got) != 1 {
+		t.Fatalf("signaldan keyin bir marta tekshirib, 1 ta yuborishi kerak edi: tekshiruv %d, yuborilgan %d", st.claimCount(), len(*got))
 	}
 }

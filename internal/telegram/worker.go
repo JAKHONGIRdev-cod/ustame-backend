@@ -42,8 +42,11 @@ type Worker struct {
 	TG    *Client
 	Store Store
 
-	PollTimeout   int           // getUpdates kutish vaqti, soniya (standart 25)
-	OutboxEvery   time.Duration // navbatni tekshirish oralig'i (standart 3 s)
+	PollTimeout int // getUpdates kutish vaqti, soniya (standart 25)
+	// Wake — API navbatga xabar qo'shilgan bo'lishi mumkin bo'lganda signal beradi (internal/wakeup).
+	// Navbat doimiy so'ralmaydi: Neon bo'sh paytda uxlab, oylik hisoblash soatlarini tejasin.
+	Wake          <-chan struct{}
+	IdlePoll      time.Duration // signalsiz zaxira tekshiruv oralig'i (standart 6 soat)
 	RetryDelay    time.Duration // xatodan keyin kutish (standart 5 s)
 	MaxMessageAge time.Duration // shundan eski xabar yuborilmay tashlanadi (standart 24 soat)
 }
@@ -82,8 +85,8 @@ func (w *Worker) defaults() {
 	if w.PollTimeout == 0 {
 		w.PollTimeout = 25
 	}
-	if w.OutboxEvery == 0 {
-		w.OutboxEvery = 3 * time.Second
+	if w.IdlePoll == 0 {
+		w.IdlePoll = 6 * time.Hour
 	}
 	if w.RetryDelay == 0 {
 		w.RetryDelay = 5 * time.Second
@@ -251,22 +254,47 @@ func uzPhone(raw string) (string, bool) {
 	return "", false
 }
 
+const deliverBatch = 20
+
 func (w *Worker) deliverLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		if wait := w.deliverOnce(ctx); !sleep(ctx, max(wait, w.OutboxEvery)) {
-			return
+		wait, full := w.deliverOnce(ctx)
+		switch {
+		case wait > 0: // xato yoki 429 — shu muddatdan keyin qayta urinamiz
+			if !sleep(ctx, wait) {
+				return
+			}
+		case full: // navbatda yana xabar bor
+		default:
+			if !w.waitForWork(ctx) {
+				return
+			}
 		}
 	}
 }
 
-// deliverOnce — bir partiya xabarni yuboradi; qaytargan vaqt — keyingi urinishgacha qo'shimcha kutish.
-func (w *Worker) deliverOnce(ctx context.Context) time.Duration {
-	list, err := w.Store.ClaimNotifications(ctx, 20)
+// waitForWork — API signalini yoki zaxira tekshiruv vaqtini kutadi; ctx bekor bo'lsa false.
+func (w *Worker) waitForWork(ctx context.Context) bool {
+	t := time.NewTimer(w.IdlePoll)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-w.Wake:
+	case <-t.C:
+	}
+	return true
+}
+
+// deliverOnce — bir partiya xabarni yuboradi. wait — keyingi urinishgacha kutish (xatoda),
+// full — partiya to'la edi, navbatda yana bo'lishi mumkin.
+func (w *Worker) deliverOnce(ctx context.Context) (wait time.Duration, full bool) {
+	list, err := w.Store.ClaimNotifications(ctx, deliverBatch)
 	if err != nil {
 		log.Printf("telegram: navbat o'qilmadi: %v", err)
-		return w.RetryDelay
+		return w.RetryDelay, false
 	}
-	var wait time.Duration
+	full = len(list) == deliverBatch
 	for i, n := range list {
 		if n.ChatID == nil {
 			continue // botga ulanmagan foydalanuvchi — xabar shunchaki "yuborilgan" qoladi
@@ -287,7 +315,7 @@ func (w *Worker) deliverOnce(ctx context.Context) time.Duration {
 			for _, rest := range list[i:] {
 				w.release(ctx, rest.ID)
 			}
-			return time.Duration(max(apiErr.RetryAfter, 1)) * time.Second
+			return time.Duration(max(apiErr.RetryAfter, 1)) * time.Second, false
 		case time.Since(n.CreatedAt) > w.MaxMessageAge:
 			log.Printf("telegram: %d-xabar eskirdi, tashlab yuborildi: %v", n.ID, err)
 		default:
@@ -296,7 +324,7 @@ func (w *Worker) deliverOnce(ctx context.Context) time.Duration {
 			wait = w.RetryDelay
 		}
 	}
-	return wait
+	return wait, full
 }
 
 func (w *Worker) release(ctx context.Context, id int64) {

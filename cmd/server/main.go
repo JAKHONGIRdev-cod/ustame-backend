@@ -18,6 +18,7 @@ import (
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/jobs"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/push"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/telegram"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/wakeup"
 )
 
 func main() {
@@ -33,9 +34,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("baza: %v", err)
 	}
-	// Bir nechta ulanish doim ochiq turadi: yangi ulanish (TLS + parol) bazaga bir necha marta
-	// borib-kelishni talab qiladi, birinchi so'rovni sekinlashtirmasligi uchun.
-	poolCfg.MinConns = 2
+	// Neon bepul tarifida baza 5 daqiqa tinch tursa uxlaydi (oylik hisoblash soatlari tejaladi).
+	// Doimiy ochiq ulanish saqlamaymiz va bo'sh ulanishni undan oldin yopamiz.
+	poolCfg.MinConns = 0
+	poolCfg.MaxConnIdleTime = 4 * time.Minute
 	db, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		log.Fatalf("baza: %v", err)
@@ -45,19 +47,26 @@ func main() {
 		log.Fatalf("bazaga ulanib bo'lmadi: %v", err)
 	}
 
+	// Bazani doimiy so'rab turish o'rniga: API yozuvdan keyin signal beradi, ishchilar shuni kutadi
+	outbox, activity := &wakeup.Hub{}, &wakeup.Hub{}
+	app := api.New(cfg, db)
+	app.Outbox, app.Activity = outbox, activity
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           api.New(cfg, db).Handler(),
+		Handler:           app.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
-	// Mijoz 48 soat javob bermagan topshirilgan ishlar avtomatik qabul qilinadi
-	go jobs.AutoApprove(ctx, db, 5*time.Minute)
+	// Mijoz 48 soat javob bermagan topshirilgan ishlar avtomatik qabul qilinadi: baza uyg'oq paytda
+	// (API faolligi, 10 daqiqada ko'pi bilan bir marta) yoki zaxira sifatida 6 soatda bir marta
+	go jobs.AutoApprove(ctx, db, activity.Subscribe(), 10*time.Minute, 6*time.Hour, outbox.Notify)
 	// Telefonlarga push-bildirishnomalar (Expo) — Telegram botidan mustaqil
 	pusher := &push.Worker{
 		Expo:  &push.Client{AccessToken: cfg.ExpoAccessToken, HTTP: &http.Client{Timeout: 20 * time.Second}},
 		Store: &push.PgStore{DB: db},
+		Wake:  outbox.Subscribe(),
 	}
 	go pusher.Run(ctx)
 
@@ -65,6 +74,7 @@ func main() {
 		bot := &telegram.Worker{
 			TG:    &telegram.Client{Token: cfg.TelegramBotToken, HTTP: &http.Client{Timeout: 40 * time.Second}},
 			Store: &telegram.PgStore{DB: db},
+			Wake:  outbox.Subscribe(),
 		}
 		go bot.Run(ctx)
 	} else {

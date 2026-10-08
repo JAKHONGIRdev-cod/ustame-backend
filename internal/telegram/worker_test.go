@@ -48,6 +48,7 @@ func (f *fakeTG) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type fakeStore struct {
+	mu       sync.Mutex      // queue (deliverLoop alohida goroutine'da ishlaydi)
 	codes    map[string]bool // haqiqiy kodlar
 	linked   map[int64]bool
 	unlinked []int64
@@ -92,9 +93,23 @@ func (s *fakeStore) UnlinkChat(_ context.Context, chat int64) error {
 	return nil
 }
 func (s *fakeStore) ClaimNotifications(context.Context, int) ([]Notification, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	q := s.queue
 	s.queue = nil
 	return q, nil
+}
+
+func (s *fakeStore) add(n Notification) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queue = append(s.queue, n)
+}
+
+func (f *fakeTG) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent)
 }
 func (s *fakeStore) ReleaseNotification(_ context.Context, id int64) error {
 	s.released = append(s.released, id)
@@ -166,7 +181,7 @@ func TestDeliver(t *testing.T) {
 		{ID: 5, ChatID: chat(4), Text: "eski", CreatedAt: now.Add(-48 * time.Hour)},
 	}
 
-	wait := w.deliverOnce(context.Background())
+	wait, _ := w.deliverOnce(context.Background())
 
 	if len(tg.sent) != 1 || tg.sent[0] != (sentMsg{1, "a"}) {
 		t.Errorf("yuborilgan: %v", tg.sent)
@@ -190,7 +205,7 @@ func TestDeliverRateLimited(t *testing.T) {
 		{ID: 2, ChatID: chat(7), Text: "429", CreatedAt: time.Now()},
 		{ID: 3, ChatID: chat(6), Text: "keyingi", CreatedAt: time.Now()},
 	}
-	wait := w.deliverOnce(context.Background())
+	wait, _ := w.deliverOnce(context.Background())
 	if wait != 9*time.Second {
 		t.Errorf("wait = %v, 9s kutilgan", wait)
 	}
@@ -199,6 +214,31 @@ func TestDeliverRateLimited(t *testing.T) {
 	}
 	if len(tg.sent) != 1 {
 		t.Errorf("yuborilgan: %v", tg.sent)
+	}
+}
+
+// Navbat doimiy so'ralmaydi: yangi xabar faqat API signalidan keyin yuboriladi (Neon uxlay olsin).
+func TestDeliverLoopWaitsForWake(t *testing.T) {
+	w, tg, st := newTest(t)
+	wake := make(chan struct{}, 1)
+	w.Wake = wake
+	w.IdlePoll = time.Hour // zaxira tekshiruv bu testda ishlamasin
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.deliverLoop(ctx)
+
+	time.Sleep(50 * time.Millisecond) // birinchi (bo'sh) tekshiruvdan keyin signal kutmoqda
+	st.add(Notification{ID: 1, ChatID: chat(5), Text: "signal bilan", CreatedAt: time.Now()})
+	time.Sleep(50 * time.Millisecond)
+	if n := tg.count(); n != 0 {
+		t.Fatalf("signalsiz yuborilmasligi kerak edi, yuborildi: %d", n)
+	}
+	wake <- struct{}{}
+	for deadline := time.Now().Add(time.Second); tg.count() == 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := tg.count(); n != 1 {
+		t.Fatalf("signaldan keyin 1 ta xabar yuborilishi kerak edi: %d", n)
 	}
 }
 

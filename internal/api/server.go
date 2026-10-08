@@ -19,6 +19,7 @@ import (
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/config"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/eskiz"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/wakeup"
 )
 
 const maxBodyBytes = 5 << 20 // rasm (3 MB) base64 ko'rinishida ~4 MB
@@ -28,6 +29,10 @@ type Server struct {
 	db    *pgxpool.Pool
 	sms   *eskiz.Client
 	funcs *funcCache
+
+	// Outbox — yozuvchi RPC'dan keyin: navbatga bildirishnoma tushgan bo'lishi mumkin.
+	// Activity — har qanday RPC'dan keyin: baza hozir uyg'oq (davriy ishlar shu paytda ishlaydi).
+	Outbox, Activity *wakeup.Hub
 }
 
 func New(cfg *config.Config, db *pgxpool.Pool) *Server {

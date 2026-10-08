@@ -3,7 +3,6 @@ package push
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -13,7 +12,9 @@ type PgStore struct {
 	DB *pgxpool.Pool
 }
 
-func (s *PgStore) Claim(ctx context.Context, limit int) ([]Message, error) {
+func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) {
+	// Tokeni yo'q foydalanuvchining xabari ham belgilanadi va "claimed" ga kiradi (select count(*) from u);
+	// left join'da token null bo'lgan qator — yuboriladigan telefon yo'q.
 	rows, err := s.DB.Query(ctx, `
 		with c as (
 			select id from notification_outbox
@@ -26,17 +27,27 @@ func (s *PgStore) Claim(ctx context.Context, limit int) ([]Message, error) {
 			from c where o.id = c.id
 			returning o.id, o.user_id, o.message, o.link, o.created_at
 		)
-		select u.id, t.token, u.message, u.link, u.created_at
-		from u join push_tokens t on t.user_id = u.user_id
+		select (select count(*)::int from u), u.id, t.token, u.message, u.link, u.created_at
+		from u left join push_tokens t on t.user_id = u.user_id
 		order by u.id`, limit)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Message, error) {
+	claimed := 0
+	var list []Message
+	for rows.Next() {
 		var m Message
-		err := row.Scan(&m.ID, &m.Token, &m.Text, &m.Link, &m.CreatedAt)
-		return m, err
-	})
+		var token *string
+		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		if token != nil {
+			m.Token = *token
+			list = append(list, m)
+		}
+	}
+	return claimed, list, rows.Err()
 }
 
 func (s *PgStore) Release(ctx context.Context, ids []int64) error {
