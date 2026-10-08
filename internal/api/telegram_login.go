@@ -149,6 +149,15 @@ func (s *Server) telegramCheck(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "telegram-check", err)
 		return
 	}
+	if u.Blocked {
+		// Kirish havolasi ishlatilgan deb belgilanadi, lekin token berilmaydi va Telegram ulanmaydi
+		if err := tx.Commit(ctx); err != nil {
+			s.fail(w, "telegram-check", err)
+			return
+		}
+		writeError(w, http.StatusForbidden, "ACCOUNT_BLOCKED")
+		return
+	}
 	// Bildirishnomalar ham shu Telegram'ga keladi (telegram_chat_id unikal: boshqa profildan uziladi)
 	if chatID != nil {
 		if _, err := tx.Exec(ctx, `update users set telegram_chat_id = null where telegram_chat_id = $1 and id::text <> $2`,

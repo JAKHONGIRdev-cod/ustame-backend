@@ -151,6 +151,10 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "verify", err)
 		return
 	}
+	if u.Blocked {
+		writeError(w, http.StatusForbidden, "ACCOUNT_BLOCKED")
+		return
+	}
 	token, err := auth.SignToken(s.cfg.JWTSecret, u.ID, u.TokenVersion)
 	if err != nil {
 		s.fail(w, "verify", err)

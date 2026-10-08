@@ -22,6 +22,11 @@ create schema if not exists auth;
 create or replace view auth.users as
   select id, phone from public.users;
 
+-- Moderatsiya va hisobni o'chirish (Google Play talabi)
+alter table public.users add column if not exists blocked_at timestamptz;
+alter table public.users add column if not exists block_reason text;
+alter table public.users add column if not exists deleted_at timestamptz;
+
 create or replace function auth.uid() returns uuid language sql stable as $$
   select nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub', '')::uuid
 $$;
@@ -32,7 +37,8 @@ $$;
 create or replace function auth.set_request_user(p_uid uuid, p_tv int) returns void
 language plpgsql as $$
 begin
-  if not exists (select 1 from public.users where id = p_uid and token_version = p_tv) then
+  if not exists (select 1 from public.users where id = p_uid and token_version = p_tv
+                 and blocked_at is null and deleted_at is null) then
     raise exception 'AUTH_REQUIRED';
   end if;
   perform set_config('request.jwt.claims',
@@ -1817,6 +1823,8 @@ begin
     'disputed_contracts',  (select count(*) from contracts where status = 'disputed'),
     'payments_action',     (select count(*) from contracts
                              where payment_status = 'held' and status in ('completed', 'cancelled')),
+    'errors_24h',          (select count(*) from client_errors where created_at > now() - interval '24 hours'),
+    'blocked_users',       (select count(*) from users where blocked_at is not null and deleted_at is null),
     'total_users',         (select count(*) from profiles),
     'total_providers',     (select count(*) from provider_profiles where status = 'approved'),
     'open_jobs',           (select count(*) from jobs where status = 'open'),
@@ -2016,3 +2024,193 @@ grant execute on function
   public.admin_get_disputed_contracts(), public.admin_get_payments(), public.admin_set_payment(uuid, text)
   to authenticated;
 
+
+-- ===== moderatsiya, hisobni o'chirish, ilova xatolari =====
+
+-- Foydalanuvchining ochiq e'lonlari, kutilayotgan takliflari va push tokenlarini yopadi
+-- (bloklash va hisobni o'chirishda). Faol shartnomalarga tegmaydi.
+create or replace function public._close_user_activity(p_user_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  update proposals set status = 'closed', updated_at = now()
+   where status = 'submitted'
+     and job_id in (select id from jobs where client_id = p_user_id and status = 'open');
+  update jobs set status = 'cancelled', closed_at = now() where client_id = p_user_id and status = 'open';
+  update proposals set status = 'withdrawn', updated_at = now()
+   where provider_id = p_user_id and status = 'submitted';
+  delete from push_tokens where user_id = p_user_id;
+end;
+$$;
+
+-- Admin: foydalanuvchilarni ism yoki telefon bo'yicha qidirish (bloklanganlar birinchi)
+create or replace function public.admin_search_users(p_query text default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_q text := nullif(btrim(coalesce(p_query, '')), '');
+  v_digits text;
+  v jsonb;
+begin
+  perform require_admin();
+  v_digits := nullif(regexp_replace(coalesce(v_q, ''), '\D', '', 'g'), '');
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', u.id, 'full_name', u.full_name, 'phone', u.phone, 'active_role', u.active_role,
+    'is_admin', u.is_admin, 'created_at', u.created_at,
+    'blocked_at', u.blocked_at, 'block_reason', u.block_reason,
+    'provider_status', (select pp.status from provider_profiles pp where pp.user_id = u.id),
+    'jobs_count', (select count(*) from jobs j where j.client_id = u.id),
+    'contracts_count', (select count(*) from contracts k where k.client_id = u.id or k.provider_id = u.id)
+  ) order by u.blocked_at desc nulls last, u.created_at desc), '[]'::jsonb)
+  into v
+  from (
+    select * from users u
+    where u.deleted_at is null
+      and (v_q is null
+           or u.full_name ilike '%' || v_q || '%'
+           or (v_digits is not null and u.phone like '%' || v_digits || '%'))
+    order by u.blocked_at desc nulls last, u.created_at desc
+    limit 50
+  ) u;
+  return v;
+end;
+$$;
+
+-- Admin: bloklash — hisobdan chiqariladi, kira olmaydi, ochiq e'lon va takliflari yopiladi,
+-- usta profili katalogdan olinadi. Faol shartnomalar admin tomonidan alohida hal qilinadi.
+create or replace function public.admin_block_user(p_user_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_admin uuid := require_admin();
+  v_u users;
+  v_reason text := left(btrim(coalesce(p_reason, '')), 500);
+begin
+  if char_length(v_reason) < 3 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_u from users where id = p_user_id for update;
+  if not found or v_u.deleted_at is not null then raise exception 'NOT_FOUND'; end if;
+  if v_u.is_admin or p_user_id = v_admin then raise exception 'NOT_ALLOWED'; end if;
+  if v_u.blocked_at is not null then raise exception 'INVALID_STATE'; end if;
+
+  update users set blocked_at = now(), block_reason = v_reason, token_version = token_version + 1
+   where id = p_user_id;
+  update provider_profiles
+     set status = 'rejected', rejection_reason = left('Hisob bloklangan: ' || v_reason, 500), reviewed_at = now()
+   where user_id = p_user_id and status <> 'rejected';
+  perform _close_user_activity(p_user_id);
+end;
+$$;
+
+create or replace function public.admin_unblock_user(p_user_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform require_admin();
+  update users set blocked_at = null, block_reason = null
+   where id = p_user_id and blocked_at is not null and deleted_at is null;
+  if not found then raise exception 'INVALID_STATE'; end if;
+end;
+$$;
+
+-- Admin: qoidabuzar (spam, firibgarlik) ochiq e'lonni olib tashlash; mijozga sababi yuboriladi
+create or replace function public.admin_remove_job(p_job_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_job jobs;
+  v_reason text := left(btrim(coalesce(p_reason, '')), 300);
+begin
+  perform require_admin();
+  if char_length(v_reason) < 3 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_job from jobs where id = p_job_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+
+  update jobs set status = 'cancelled', closed_at = now() where id = p_job_id;
+  update proposals set status = 'closed', updated_at = now() where job_id = p_job_id and status = 'submitted';
+  perform queue_notification(v_job.client_id, format(
+    E'⚠️ "%s" e''loningiz moderator tomonidan olib tashlandi. Sabab: %s', v_job.title, v_reason),
+    '/job/' || p_job_id);
+end;
+$$;
+
+-- Hisobni o'chirish (Google Play talabi). Shaxsiy ma'lumotlar o'chiriladi: telefon, ism, rasmlar,
+-- manzillar, usta profili, sevimlilar. Qarshi tomonga tegishli yozuvlar (yakunlangan shartnoma,
+-- sharh, xabarlar) qoladi, ismi "O'chirilgan hisob" bo'ladi. Shu raqam bilan keyin yangi hisob ochish mumkin.
+create or replace function public.delete_my_account()
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if exists (select 1 from contracts
+             where (client_id = v_uid or provider_id = v_uid)
+               and (status in ('active', 'submitted', 'disputed') or payment_status = 'held')) then
+    raise exception 'HAS_ACTIVE_CONTRACTS';
+  end if;
+
+  perform _close_user_activity(v_uid);
+  delete from files
+   where (bucket in ('avatars', 'portfolio-photos') and path like v_uid::text || '/%')
+      or (bucket = 'job-photos' and split_part(path, '/', 1) in (select id::text from jobs where client_id = v_uid));
+  delete from job_addresses where job_id in (select id from jobs where client_id = v_uid);
+  delete from favorites where client_id = v_uid or provider_id = v_uid;
+  delete from job_invites where client_id = v_uid or provider_id = v_uid;
+  delete from provider_profiles where user_id = v_uid;
+  update users set
+    full_name = 'O''chirilgan hisob', phone = 'deleted:' || id::text, active_role = 'client',
+    telegram_chat_id = null, telegram_link_code = null, avatar_updated_at = null, is_admin = false,
+    token_version = token_version + 1, deleted_at = now()
+  where id = v_uid;
+end;
+$$;
+
+-- Ilova xatolari (telefon/saytda yiqilish): backend POST /api/client-errors orqali yozadi
+create table if not exists public.client_errors (
+  id          bigint generated always as identity primary key,
+  created_at  timestamptz not null default now(),
+  user_id     uuid references public.users (id) on delete set null,
+  platform    text not null,
+  app_version text,
+  message     text not null,
+  stack       text,
+  context     text
+);
+
+create index if not exists client_errors_created_idx on public.client_errors (created_at desc);
+
+alter table public.client_errors enable row level security;
+
+-- Admin: oxirgi 30 kundagi xatolar, bir xil xabar bo'yicha guruhlangan (eng yangisi birinchi)
+create or replace function public.admin_get_client_errors()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(x.row_data order by x.last_seen desc), '[]'::jsonb)
+  into v
+  from (
+    select max(e.created_at) as last_seen, jsonb_build_object(
+      'message', e.message,
+      'count', count(*),
+      'users', count(distinct e.user_id),
+      'first_seen', min(e.created_at),
+      'last_seen', max(e.created_at),
+      'platforms', to_jsonb(array_agg(distinct e.platform)),
+      'versions', coalesce(to_jsonb(array_agg(distinct e.app_version) filter (where e.app_version is not null)), '[]'::jsonb),
+      'context', (array_agg(e.context order by e.created_at desc))[1],
+      'stack', (array_agg(e.stack order by e.created_at desc))[1]
+    ) as row_data
+    from client_errors e
+    where e.created_at > now() - interval '30 days'
+    group by e.message
+    order by max(e.created_at) desc
+    limit 50
+  ) x;
+  return v;
+end;
+$$;
+
+revoke execute on function
+  public._close_user_activity(uuid), public.admin_search_users(text), public.admin_block_user(uuid, text),
+  public.admin_unblock_user(uuid), public.admin_remove_job(uuid, text), public.delete_my_account(),
+  public.admin_get_client_errors()
+from public, anon, authenticated;
+
+grant execute on function
+  public.admin_search_users(text), public.admin_block_user(uuid, text), public.admin_unblock_user(uuid),
+  public.admin_remove_job(uuid, text), public.delete_my_account(), public.admin_get_client_errors()
+to authenticated;

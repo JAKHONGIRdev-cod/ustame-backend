@@ -30,6 +30,8 @@ type Server struct {
 	sms   *eskiz.Client
 	funcs *funcCache
 
+	errLimit hourLimiter // POST /api/client-errors cheklovi
+
 	// Outbox — yozuvchi RPC'dan keyin: navbatga bildirishnoma tushgan bo'lishi mumkin.
 	// Activity — har qanday RPC'dan keyin: baza hozir uyg'oq (davriy ishlar shu paytda ishlaydi).
 	Outbox, Activity *wakeup.Hub
@@ -62,6 +64,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/files", s.getFiles)
 	mux.HandleFunc("POST /api/files", s.uploadFile)
 	mux.HandleFunc("DELETE /api/files", s.deleteFile)
+	mux.HandleFunc("POST /api/client-errors", s.clientError)
 	return s.cors(recoverer(mux))
 }
 
@@ -130,15 +133,16 @@ type user struct {
 	TelegramChatID  *int64     `json:"-"`
 	IsAdmin         bool       `json:"is_admin"`
 	TokenVersion    int        `json:"-"`
+	Blocked         bool       `json:"-"` // admin bloklagan: kira olmaydi
 }
 
 const userColumns = `id::text, phone, full_name, active_role, created_at, avatar_updated_at,
-	telegram_chat_id, is_admin, token_version`
+	telegram_chat_id, is_admin, token_version, blocked_at is not null`
 
 func scanUser(row pgx.Row) (*user, error) {
 	var u user
 	err := row.Scan(&u.ID, &u.Phone, &u.FullName, &u.ActiveRole, &u.CreatedAt, &u.AvatarUpdatedAt,
-		&u.TelegramChatID, &u.IsAdmin, &u.TokenVersion)
+		&u.TelegramChatID, &u.IsAdmin, &u.TokenVersion, &u.Blocked)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +187,7 @@ func (s *Server) requireUser(ctx context.Context, r *http.Request) *user {
 		}
 		return nil
 	}
-	if u.TokenVersion != tv {
+	if u.TokenVersion != tv || u.Blocked {
 		return nil
 	}
 	return u
