@@ -128,6 +128,7 @@ begin
     'category', v_job.category, 'district', v_job.district, 'budget', v_job.budget,
     'urgency', v_job.urgency, 'status', v_job.status, 'created_at', v_job.created_at,
     'has_photo', v_job.has_photo,
+    'photos', _job_photos(v_job.id),
     'is_mine', v_is_client,
     'address', case when v_is_party then v_addr.address end,
     'location', case

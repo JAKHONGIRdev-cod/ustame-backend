@@ -159,6 +159,7 @@ alter table public.contracts add column if not exists payment_status text not nu
 alter table public.contracts add column if not exists payment_held_at timestamptz;
 alter table public.contracts add column if not exists payment_released_at timestamptz;
 alter table public.contracts add column if not exists payment_refunded_at timestamptz;
+alter table public.contracts add column if not exists payment_held_amount int;
 
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'contracts_payment_status_check') then
@@ -772,6 +773,14 @@ begin
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
     'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
+    'price_change', case when v_k.status in ('active', 'submitted') then (
+        select jsonb_build_object('id', c.id, 'old_price', c.old_price, 'new_price', c.new_price,
+                                  'reason', c.reason, 'created_at', c.created_at)
+        from price_changes c where c.contract_id = v_k.id and c.status = 'pending') end,
+    'price_history', coalesce((
+        select jsonb_agg(jsonb_build_object('old_price', c.old_price, 'new_price', c.new_price, 'reason', c.reason,
+                                            'status', c.status, 'created_at', c.created_at) order by c.created_at)
+        from price_changes c where c.contract_id = v_k.id and c.status in ('approved', 'declined')), '[]'::jsonb),
     'payment_status', v_k.payment_status, 'payment_held_at', v_k.payment_held_at,
     'payment_released_at', v_k.payment_released_at, 'payment_refunded_at', v_k.payment_refunded_at,
     'job', (select jsonb_build_object('id', j.id, 'title', j.title, 'description', j.description,
@@ -816,6 +825,9 @@ declare v_job_id uuid;
 begin
   update contracts set status = 'completed', completed_at = now()
    where id = p_contract_id returning job_id into v_job_id;
+  -- Javobsiz qolgan narx o'zgartirish so'rovi endi kuchini yo'qotadi
+  update price_changes set status = 'cancelled', decided_at = now()
+   where contract_id = p_contract_id and status = 'pending';
   update jobs set status = 'completed', closed_at = now() where id = v_job_id;
 end;
 $$;
@@ -1210,7 +1222,8 @@ returns void language plpgsql security definer set search_path = public as $$
 declare v_uid uuid := require_uid();
 begin
   if job_client_id(p_job_id) <> v_uid then raise exception 'NOT_ALLOWED'; end if;
-  update jobs set has_photo = true where id = p_job_id;
+  update jobs set has_photo = exists (select 1 from files where bucket = 'job-photos' and path = p_job_id::text || '/photo.jpg')
+   where id = p_job_id;
 end;
 $$;
 
@@ -1252,6 +1265,7 @@ begin
     'category', v_job.category, 'district', v_job.district, 'budget', v_job.budget,
     'urgency', v_job.urgency, 'status', v_job.status, 'created_at', v_job.created_at,
     'has_photo', v_job.has_photo,
+    'photos', _job_photos(v_job.id),
     'is_mine', v_is_client,
     'address', case when v_is_party then (select address from job_addresses where job_id = p_job_id) end,
     'proposals_count', (select count(*) from proposals p where p.job_id = p_job_id and p.status = 'submitted'),
@@ -1931,7 +1945,7 @@ begin
       end as sort_key,
       jsonb_build_object(
         'id', k.id, 'price', k.price, 'status', k.status, 'payment_status', k.payment_status,
-        'payment_held_at', k.payment_held_at, 'created_at', k.created_at,
+        'payment_held_at', k.payment_held_at, 'held_amount', k.payment_held_amount, 'created_at', k.created_at,
         'action', case
           when k.payment_status = 'held' and k.status = 'completed' then 'release'
           when k.payment_status = 'held' and k.status = 'cancelled' then 'refund'
@@ -1982,6 +1996,7 @@ begin
   update contracts set
     payment_status      = p_status,
     payment_held_at     = case when p_status = 'held' then now() else payment_held_at end,
+    payment_held_amount = case when p_status = 'held' then price else payment_held_amount end,
     payment_released_at = case when p_status = 'released' then now() else payment_released_at end,
     payment_refunded_at = case when p_status = 'refunded' then now() else payment_refunded_at end
   where id = p_contract_id;
@@ -2372,3 +2387,160 @@ from public, anon, authenticated;
 grant execute on function
   public.set_my_availability(int), public.admin_get_waiting_jobs(), public.admin_offer_job(uuid, uuid)
 to authenticated;
+
+
+-- ===== narx o'zgarmasligi kafolati =====
+-- Kelishilgan narxni usta o'zi o'zgartira olmaydi: sababini yozib so'raydi, mijoz tasdiqlasagina
+-- shartnoma narxi yangilanadi. Har bir so'rov tarixda qoladi (nizoda dalil).
+create table if not exists public.price_changes (
+  id          uuid primary key default gen_random_uuid(),
+  contract_id uuid not null references public.contracts (id) on delete cascade,
+  old_price   int not null,
+  new_price   int not null check (new_price between 10000 and 100000000),
+  reason      text not null check (char_length(reason) between 5 and 500),
+  status      text not null default 'pending' check (status in ('pending', 'approved', 'declined', 'cancelled')),
+  created_at  timestamptz not null default now(),
+  decided_at  timestamptz
+);
+
+create unique index if not exists price_changes_one_pending
+  on public.price_changes (contract_id) where status = 'pending';
+
+alter table public.price_changes enable row level security;
+
+create or replace function public.request_price_change(p_contract_id uuid, p_new_price int, p_reason text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_reason text := btrim(coalesce(p_reason, ''));
+  v_title text;
+  v_id uuid;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status not in ('active', 'submitted') then raise exception 'INVALID_STATE'; end if;
+  if p_new_price is null or p_new_price not between 10000 and 100000000 or p_new_price = v_k.price then
+    raise exception 'INVALID_PRICE';
+  end if;
+  if char_length(v_reason) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  if exists (select 1 from price_changes where contract_id = p_contract_id and status = 'pending') then
+    raise exception 'PRICE_CHANGE_PENDING';
+  end if;
+
+  insert into price_changes (contract_id, old_price, new_price, reason)
+  values (p_contract_id, v_k.price, p_new_price, left(v_reason, 500))
+  returning id into v_id;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.client_id, format(
+    E'\U0001F4AC "%s": usta narxni %s so''mdan %s so''mga o''zgartirishni so''radi. Sabab: %s. Siz tasdiqlamaguningizcha narx o''zgarmaydi.',
+    v_title, replace(to_char(v_k.price, 'FM999,999,999'), ',', ' '),
+    replace(to_char(p_new_price, 'FM999,999,999'), ',', ' '), left(v_reason, 200)), '/contract/' || p_contract_id);
+  return v_id;
+end;
+$$;
+
+create or replace function public.decide_price_change(p_change_id uuid, p_approve boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_c price_changes;
+  v_k contracts;
+  v_title text;
+  v_sum text;
+  v_diff int;
+  r record;
+begin
+  select * into v_c from price_changes where id = p_change_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_k from contracts where id = v_c.contract_id for update;
+  if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_c.status <> 'pending' or v_k.status not in ('active', 'submitted') then raise exception 'INVALID_STATE'; end if;
+
+  update price_changes set status = case when p_approve then 'approved' else 'declined' end, decided_at = now()
+   where id = p_change_id;
+  if p_approve then
+    update contracts set price = v_c.new_price where id = v_k.id;
+  end if;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  v_sum := replace(to_char(v_c.new_price, 'FM999,999,999'), ',', ' ');
+  perform queue_notification(v_k.provider_id,
+    case when p_approve
+      then format(E'✅ "%s": mijoz yangi narxni tasdiqladi — %s so''m.', v_title, v_sum)
+      else format(E'❌ "%s": mijoz narx o''zgarishini rad etdi. Ish kelishilgan narx bo''yicha davom etadi.', v_title)
+    end, '/contract/' || v_k.id);
+
+  -- Pul allaqachon kafolatda bo'lsa, farqni operator hal qiladi
+  if p_approve and v_k.payment_status = 'held' then
+    v_diff := v_c.new_price - coalesce(v_k.payment_held_amount, v_k.price);
+    if v_diff > 0 then
+      perform queue_notification(v_k.client_id, format(
+        E'\U0001F512 "%s": kafolatdagi summa yangi narxdan %s so''m kam. Farqni Ustame operatoriga o''tkazing.',
+        v_title, replace(to_char(v_diff, 'FM999,999,999'), ',', ' ')), '/contract/' || v_k.id);
+    elsif v_diff < 0 then
+      perform queue_notification(v_k.client_id, format(
+        E'↩️ "%s": ortiqcha %s so''m ish yakunlangach sizga qaytariladi.',
+        v_title, replace(to_char(-v_diff, 'FM999,999,999'), ',', ' ')), '/contract/' || v_k.id);
+    end if;
+    for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+      perform queue_notification(r.id, format(
+        E'\U0001F4B0 "%s": narx %s so''mga o''zgardi, kafolatdagi summa bilan farq bor.', v_title, v_sum),
+        '/admin/payments');
+    end loop;
+  end if;
+end;
+$$;
+
+revoke execute on function public.request_price_change(uuid, int, text), public.decide_price_change(uuid, boolean)
+from public, anon, authenticated;
+
+grant execute on function public.request_price_change(uuid, int, text), public.decide_price_change(uuid, boolean)
+to authenticated;
+
+
+-- ===== e'lon rasmlari (4 tagacha) =====
+-- Nomlar qat'iy: photo.jpg (asosiy — kartochkada ko'rinadi), photo-2.jpg, photo-3.jpg, photo-4.jpg.
+-- Ro'yxat files jadvalidan olinadi (alohida jadval yo'q); v — keshni yangilash uchun o'zgarish vaqti.
+create or replace function public._job_photos(p_job_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('name', n.name, 'v', (extract(epoch from f.updated_at) * 1000)::bigint)
+                            order by n.ord), '[]'::jsonb)
+  from unnest(array['photo.jpg', 'photo-2.jpg', 'photo-3.jpg', 'photo-4.jpg']) with ordinality as n(name, ord)
+  join files f on f.bucket = 'job-photos' and f.path = p_job_id::text || '/' || n.name;
+$$;
+
+revoke execute on function public._job_photos(uuid) from public, anon, authenticated;
+
+-- Mijoz e'lon rasmini o'chiradi. Asosiy rasm o'chsa, keyingisi uning o'rniga o'tadi.
+create or replace function public.delete_job_photo(p_job_id uuid, p_name text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_next text;
+begin
+  if job_client_id(p_job_id) is distinct from v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if p_name is null or p_name not in ('photo.jpg', 'photo-2.jpg', 'photo-3.jpg', 'photo-4.jpg') then
+    raise exception 'INVALID_INPUT';
+  end if;
+  delete from files where bucket = 'job-photos' and path = p_job_id::text || '/' || p_name;
+  if p_name = 'photo.jpg' then
+    select n.name into v_next
+      from unnest(array['photo-2.jpg', 'photo-3.jpg', 'photo-4.jpg']) with ordinality as n(name, ord)
+      join files f on f.bucket = 'job-photos' and f.path = p_job_id::text || '/' || n.name
+     order by n.ord limit 1;
+    if v_next is not null then
+      update files set path = p_job_id::text || '/photo.jpg', updated_at = now()
+       where bucket = 'job-photos' and path = p_job_id::text || '/' || v_next;
+    end if;
+  end if;
+  update jobs set has_photo = exists (select 1 from files where bucket = 'job-photos' and path = p_job_id::text || '/photo.jpg')
+   where id = p_job_id;
+end;
+$$;
+
+revoke execute on function public.delete_job_photo(uuid, text) from public, anon, authenticated;
+
+grant execute on function public.delete_job_photo(uuid, text) to authenticated;

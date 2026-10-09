@@ -16,7 +16,7 @@ import (
 //   GET    /api/files?bucket=..&prefix=..   -> ro'yxat [{ name, created_at }] (eng yangisi birinchi)
 //   POST   /api/files  { bucket, path, content_type, data (base64) }  -> yuklash (upsert)
 //   DELETE /api/files?bucket=..&path=..     -> o'chirish
-// Yozish huquqi: avatars/<uid>/avatar.jpg, job-photos/<o'z e'loni id>/photo.jpg,
+// Yozish huquqi: avatars/<uid>/avatar.jpg, job-photos/<o'z e'loni id>/photo[-2..4].jpg,
 // portfolio-photos/<uid>/<fayl>.
 
 const (
@@ -25,10 +25,12 @@ const (
 )
 
 var (
-	buckets    = []string{"avatars", "job-photos", "portfolio-photos"}
-	imageTypes = []string{"image/jpeg", "image/png", "image/webp"}
-	filePath   = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
-	uuidLike   = regexp.MustCompile(`^[0-9a-f-]{36}$`)
+	buckets = []string{"avatars", "job-photos", "portfolio-photos"}
+	// E'londa 4 tagacha rasm; nomlar qat'iy (sql/app.sql: _job_photos bilan bir xil)
+	jobPhotoNames = []string{"photo.jpg", "photo-2.jpg", "photo-3.jpg", "photo-4.jpg"}
+	imageTypes    = []string{"image/jpeg", "image/png", "image/webp"}
+	filePath      = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
+	uuidLike      = regexp.MustCompile(`^[0-9a-f-]{36}$`)
 )
 
 // parsePath "<papka>/<nom>" ni ajratadi; bucket noma'lum yoki format noto'g'ri bo'lsa ok=false.
@@ -50,7 +52,7 @@ func (s *Server) canWrite(r *http.Request, u *user, bucket, folder, name string)
 	case "portfolio-photos":
 		return folder == u.ID, nil
 	case "job-photos":
-		if name != "photo.jpg" {
+		if !slices.Contains(jobPhotoNames, name) {
 			return false, nil
 		}
 		var clientID string
