@@ -440,7 +440,7 @@ begin
   if char_length(btrim(coalesce(p_description, ''))) not between 10 and 2000 then raise exception 'INVALID_DESCRIPTION'; end if;
   if char_length(btrim(coalesce(p_address, ''))) not between 5 and 300 then raise exception 'INVALID_ADDRESS'; end if;
   if p_budget is not null and p_budget not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
-  if coalesce(p_urgency, 'flexible') not in ('today', 'this_week', 'flexible') then raise exception 'INVALID_INPUT'; end if;
+  if coalesce(p_urgency, 'flexible') not in ('urgent', 'today', 'this_week', 'flexible') then raise exception 'INVALID_INPUT'; end if;
 
   insert into jobs (client_id, category, district, title, description, budget, urgency)
   values (v_uid, btrim(p_category), btrim(p_district), btrim(p_title), btrim(p_description),
@@ -541,18 +541,35 @@ declare v_uid uuid := require_uid();
 begin
   if job_client_id(p_job_id) is distinct from v_uid then raise exception 'NOT_ALLOWED'; end if;
 
+  -- Sifat bali: reyting (baho yo'q bo'lsa 4.0), bajarilgan ishlar, voz kechish va yutqazilgan nizolar
+  -- jarimasi, kelish vaqti va narx. Kutilayotgan takliflar ichida eng yaxshi 3 tasi — "tavsiya".
   return coalesce((
     select jsonb_agg(jsonb_build_object(
-      'id', p.id, 'price', p.price, 'message', p.message, 'status', p.status, 'created_at', p.created_at,
-      'provider', jsonb_build_object(
-        'id', pr.id, 'full_name', pr.full_name, 'headline', pp.headline,
-        'experience_years', pp.experience_years, 'stats', provider_stats(pr.id)
-      )
-    ) order by (p.status = 'submitted') desc, p.created_at asc)
-    from proposals p
-    join profiles pr on pr.id = p.provider_id
-    left join provider_profiles pp on pp.user_id = p.provider_id
-    where p.job_id = p_job_id and p.status in ('submitted', 'declined', 'accepted')
+      'id', x.id, 'price', x.price, 'message', x.message, 'status', x.status, 'created_at', x.created_at,
+      'eta_minutes', x.eta_minutes, 'score', round(x.score),
+      'recommended', x.status = 'submitted' and x.rank <= 3,
+      'provider', x.provider
+    ) order by (x.status = 'submitted') desc, x.score desc, x.created_at asc)
+    from (
+      select y.*, rank() over (partition by y.status = 'submitted' order by y.score desc, y.created_at) as rank
+      from (
+        select p.id, p.price, p.message, p.status, p.created_at, p.eta_minutes,
+          jsonb_build_object('id', pr.id, 'full_name', pr.full_name, 'headline', pp.headline,
+                             'experience_years', pp.experience_years, 'stats', st.s) as provider,
+          coalesce((st.s->>'avg_rating')::numeric, 4.0) * 20
+            + least((st.s->>'completed_jobs')::int, 20) * 1.5
+            - (st.s->>'withdrawals')::int * 10
+            - (st.s->>'disputes_lost')::int * 15
+            + case when p.eta_minutes is not null then greatest(0, 30 - p.eta_minutes / 2.0) else 0 end
+            + 20.0 * min(p.price) filter (where p.status = 'submitted') over () / p.price
+            as score
+        from proposals p
+        join profiles pr on pr.id = p.provider_id
+        left join provider_profiles pp on pp.user_id = p.provider_id
+        cross join lateral (select provider_stats(pr.id) as s) st
+        where p.job_id = p_job_id and p.status in ('submitted', 'declined', 'accepted')
+      ) y
+    ) x
   ), '[]'::jsonb);
 end;
 $$;
@@ -635,7 +652,9 @@ begin
 end;
 $$;
 
-create or replace function public.submit_proposal(p_job_id uuid, p_price int, p_message text)
+-- p_eta_minutes — "qancha vaqtda yetib boraman" (shoshilinch e'lonlarda tavsiya tartibiga ta'sir qiladi)
+drop function if exists public.submit_proposal(uuid, int, text);
+create or replace function public.submit_proposal(p_job_id uuid, p_price int, p_message text, p_eta_minutes int default null)
 returns uuid language plpgsql security definer set search_path = public as $$
 declare
   v_uid uuid := require_uid();
@@ -646,6 +665,7 @@ begin
   if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
   if p_price is null or p_price not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
   if char_length(coalesce(p_message, '')) > 1000 then raise exception 'INVALID_MESSAGE'; end if;
+  if p_eta_minutes is not null and p_eta_minutes not between 5 and 600 then raise exception 'INVALID_INPUT'; end if;
 
   select * into v_job from jobs where id = p_job_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
@@ -660,13 +680,13 @@ begin
     end if;
     update proposals
        set price = p_price, message = btrim(coalesce(p_message, '')), status = 'submitted',
-           created_at = now(), updated_at = now()
+           eta_minutes = p_eta_minutes, created_at = now(), updated_at = now()
      where id = v_existing.id;
     return v_existing.id;
   end if;
 
-  insert into proposals (job_id, provider_id, price, message)
-  values (p_job_id, v_uid, p_price, btrim(coalesce(p_message, '')))
+  insert into proposals (job_id, provider_id, price, message, eta_minutes)
+  values (p_job_id, v_uid, p_price, btrim(coalesce(p_message, '')), p_eta_minutes)
   returning id into v_id;
   return v_id;
 end;
@@ -941,7 +961,7 @@ grant execute on function
   public.decline_proposal(uuid),
   public.accept_proposal(uuid),
   public.find_jobs(text, text, text, int, int),
-  public.submit_proposal(uuid, int, text),
+  public.submit_proposal(uuid, int, text, int),
   public.withdraw_proposal(uuid),
   public.get_my_proposals(),
   public.get_my_contracts(text),
@@ -1824,6 +1844,9 @@ begin
     'payments_action',     (select count(*) from contracts
                              where payment_status = 'held' and status in ('completed', 'cancelled')),
     'errors_24h',          (select count(*) from client_errors where created_at > now() - interval '24 hours'),
+    'waiting_jobs',        (select count(*) from jobs j where j.status = 'open'
+                             and j.created_at > now() - interval '7 days'
+                             and not exists (select 1 from proposals p where p.job_id = j.id and p.status = 'submitted')),
     'blocked_users',       (select count(*) from users where blocked_at is not null and deleted_at is null),
     'total_users',         (select count(*) from profiles),
     'total_providers',     (select count(*) from provider_profiles where status = 'approved'),
@@ -2213,4 +2236,139 @@ from public, anon, authenticated;
 grant execute on function
   public.admin_search_users(text), public.admin_block_user(uuid, text), public.admin_unblock_user(uuid),
   public.admin_remove_job(uuid, text), public.delete_my_account(), public.admin_get_client_errors()
+to authenticated;
+
+
+-- ===== tezkor tanlov: shoshilinch e'lon, bo'sh ustalar, operator =====
+
+-- Shoshilinch e'lon ('urgent'): ustaga zudlik bilan kerak
+do $$ begin
+  alter table public.jobs drop constraint if exists jobs_urgency_check;
+  alter table public.jobs add constraint jobs_urgency_check
+    check (urgency in ('urgent', 'today', 'this_week', 'flexible'));
+end $$;
+
+-- Taklifdagi "qancha vaqtda yetib boraman" (daqiqa)
+alter table public.proposals add column if not exists eta_minutes int;
+
+-- Usta "Hozir bo'shman" — shu vaqtgacha shoshilinch e'lonlar unga darhol yuboriladi
+alter table public.provider_profiles add column if not exists available_until timestamptz;
+
+create index if not exists provider_profiles_available_idx
+  on public.provider_profiles (available_until) where status = 'approved';
+
+-- p_hours: 1..12 — shuncha soatga bo'sh, 0 — o'chirish. Yangi vaqtni qaytaradi (yoki null).
+create or replace function public.set_my_availability(p_hours int)
+returns timestamptz language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_until timestamptz;
+begin
+  if p_hours is null or p_hours not between 0 and 12 then raise exception 'INVALID_INPUT'; end if;
+  if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
+  v_until := case when p_hours = 0 then null else now() + make_interval(hours => p_hours) end;
+  update provider_profiles set available_until = v_until where user_id = v_uid;
+  return v_until;
+end;
+$$;
+
+-- Shoshilinch e'lon joylanishi bilan: shu kasb va tumandagi bo'sh ustalarga va adminlarga xabar
+create or replace function public.notify_urgent_job()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare r record;
+begin
+  if new.urgency <> 'urgent' then return new; end if;
+  for r in
+    select pp.user_id from provider_profiles pp join users u on u.id = pp.user_id
+     where pp.status = 'approved' and pp.available_until > now()
+       and new.category = any (pp.categories) and new.district = any (pp.districts)
+       and pp.user_id <> new.client_id and u.blocked_at is null and u.deleted_at is null
+  loop
+    perform queue_notification(r.user_id, format(
+      E'\U0001F6A8 Shoshilinch: "%s" (%s). Narx va qancha vaqtda yetib borishingizni yozing.',
+      new.title, new.district), '/job/' || new.id);
+  end loop;
+  for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+    perform queue_notification(r.id, format(E'\U0001F6A8 Yangi shoshilinch e''lon: "%s" (%s, %s).',
+      new.title, new.category, new.district), '/admin/waiting');
+  end loop;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_notify_urgent_job on public.jobs;
+
+create trigger trg_notify_urgent_job after insert on public.jobs
+for each row execute function public.notify_urgent_job();
+
+-- Operator: hali birorta ham taklif kelmagan ochiq e'lonlar (shoshilinchlari birinchi, eskisi birinchi)
+-- va har biriga mos ustalar (bo'shlari birinchi, keyin reyting bo'yicha)
+create or replace function public.admin_get_waiting_jobs()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(x.row_data order by x.urgent desc, x.created_at asc), '[]'::jsonb)
+  into v
+  from (
+    select j.created_at, j.urgency = 'urgent' as urgent, jsonb_build_object(
+      'id', j.id, 'title', j.title, 'category', j.category, 'district', j.district,
+      'urgency', j.urgency, 'created_at', j.created_at,
+      'waiting_minutes', floor(extract(epoch from now() - j.created_at) / 60),
+      'client', jsonb_build_object('id', c.id, 'full_name', c.full_name, 'phone', c.phone),
+      'invited', (select count(*) from job_invites i where i.job_id = j.id),
+      'candidates', coalesce((
+        select jsonb_agg(m.cand order by m.available desc, m.rating desc nulls last, m.completed desc)
+        from (
+          select coalesce(pp.available_until > now(), false) as available,
+                 (st.s->>'avg_rating')::numeric as rating, (st.s->>'completed_jobs')::int as completed,
+                 jsonb_build_object(
+                   'id', u.id, 'full_name', u.full_name, 'phone', u.phone,
+                   'available', coalesce(pp.available_until > now(), false),
+                   'available_until', pp.available_until, 'stats', st.s,
+                   'invited', exists (select 1 from job_invites i where i.job_id = j.id and i.provider_id = u.id)
+                 ) as cand
+          from provider_profiles pp
+          join users u on u.id = pp.user_id
+          cross join lateral (select provider_stats(u.id) as s) st
+          where pp.status = 'approved' and j.category = any (pp.categories) and j.district = any (pp.districts)
+            and u.id <> j.client_id and u.blocked_at is null and u.deleted_at is null
+          order by available desc, rating desc nulls last, completed desc
+          limit 8
+        ) m
+      ), '[]'::jsonb)
+    ) as row_data
+    from jobs j
+    join users c on c.id = j.client_id
+    where j.status = 'open' and j.created_at > now() - interval '7 days'
+      and not exists (select 1 from proposals p where p.job_id = j.id and p.status = 'submitted')
+    order by (j.urgency = 'urgent') desc, j.created_at asc
+    limit 50
+  ) x;
+  return v;
+end;
+$$;
+
+-- Operator ishni ustaga taklif qiladi (mijoz nomidan taklif sifatida — ustaga bildirishnoma boradi)
+create or replace function public.admin_offer_job(p_job_id uuid, p_provider_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_job jobs;
+begin
+  perform require_admin();
+  select * into v_job from jobs where id = p_job_id;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+  if not is_approved_provider(p_provider_id) or p_provider_id = v_job.client_id then raise exception 'PROVIDER_NOT_AVAILABLE'; end if;
+  insert into job_invites (job_id, provider_id, client_id) values (p_job_id, p_provider_id, v_job.client_id)
+  on conflict (job_id, provider_id) do nothing;
+end;
+$$;
+
+revoke execute on function
+  public.set_my_availability(int), public.notify_urgent_job(), public.admin_get_waiting_jobs(),
+  public.admin_offer_job(uuid, uuid)
+from public, anon, authenticated;
+
+grant execute on function
+  public.set_my_availability(int), public.admin_get_waiting_jobs(), public.admin_offer_job(uuid, uuid)
 to authenticated;
