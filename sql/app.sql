@@ -583,6 +583,7 @@ begin
         left join provider_profiles pp on pp.user_id = p.provider_id
         cross join lateral (select provider_stats(pr.id) as s) st
         where p.job_id = p_job_id and p.status in ('submitted', 'declined', 'accepted')
+          and (p.status = 'accepted' or not _blocked(v_uid, p.provider_id))
       ) y
     ) x
   ), '[]'::jsonb);
@@ -619,6 +620,7 @@ begin
   if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
   if v_p.status <> 'submitted' then raise exception 'INVALID_STATE'; end if;
   if not is_approved_provider(v_p.provider_id) then raise exception 'PROVIDER_NOT_AVAILABLE'; end if;
+  if _blocked(v_uid, v_p.provider_id) then raise exception 'USER_BLOCKED'; end if;
 
   insert into contracts (job_id, proposal_id, client_id, provider_id, price)
   values (v_job.id, v_p.id, v_uid, v_p.provider_id, v_p.price)
@@ -686,6 +688,7 @@ begin
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_job.client_id = v_uid then raise exception 'OWN_JOB'; end if;
   if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+  if _blocked(v_uid, v_job.client_id) then raise exception 'USER_BLOCKED'; end if;
 
   select * into v_existing from proposals where job_id = p_job_id and provider_id = v_uid for update;
   if found then
@@ -1047,6 +1050,7 @@ begin
   select * into v_k from contracts where id = p_contract_id;
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_k.client_id <> v_uid and v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if _blocked(v_k.client_id, v_k.provider_id) then raise exception 'USER_BLOCKED'; end if;
 
   insert into messages (contract_id, sender_id, text)
   values (p_contract_id, v_uid, v_text)
@@ -1426,6 +1430,7 @@ begin
   if v_job.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
   if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
   if not is_approved_provider(p_provider_id) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
+  if _blocked(v_uid, p_provider_id) then raise exception 'USER_BLOCKED'; end if;
 
   insert into job_invites (job_id, provider_id, client_id) values (p_job_id, p_provider_id, v_uid)
   on conflict (job_id, provider_id) do nothing;
@@ -1879,6 +1884,7 @@ begin
                              and j.created_at > now() - interval '7 days'
                              and not exists (select 1 from proposals p where p.job_id = j.id and p.status = 'submitted')),
     'blocked_users',       (select count(*) from users where blocked_at is not null and deleted_at is null),
+    'open_reports',        (select count(*) from reports where status = 'open'),
     'total_users',         (select count(*) from profiles),
     'total_providers',     (select count(*) from provider_profiles where status = 'approved'),
     'open_jobs',           (select count(*) from jobs where status = 'open'),
@@ -2210,6 +2216,7 @@ begin
       or (bucket = 'job-photos' and split_part(path, '/', 1) in (select id::text from jobs where client_id = v_uid));
   delete from job_addresses where job_id in (select id from jobs where client_id = v_uid);
   delete from favorites where client_id = v_uid or provider_id = v_uid;
+  delete from user_blocks where blocker_id = v_uid or blocked_id = v_uid;
   delete from job_invites where client_id = v_uid or provider_id = v_uid;
   delete from provider_profiles where user_id = v_uid;
   update users set
@@ -2630,3 +2637,211 @@ $$;
 revoke execute on function public.set_work_stage(uuid, text, int) from public, anon, authenticated;
 
 grant execute on function public.set_work_stage(uuid, text, int) to authenticated;
+
+
+-- ===== shikoyatlar va bloklash (Google Play: foydalanuvchi kontenti talabi) =====
+-- Bloklash ikki tomonlama ta'sir qiladi: bir-birining e'lon/taklifini ko'rmaydi, taklif va chat yopiladi.
+create table if not exists public.user_blocks (
+  blocker_id uuid not null references public.users (id) on delete cascade,
+  blocked_id uuid not null references public.users (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (blocker_id, blocked_id),
+  check (blocker_id <> blocked_id)
+);
+
+create index if not exists user_blocks_blocked_idx on public.user_blocks (blocked_id);
+
+alter table public.user_blocks enable row level security;
+
+create or replace function public._blocked(p_a uuid, p_b uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from user_blocks
+                 where (blocker_id = p_a and blocked_id = p_b) or (blocker_id = p_b and blocked_id = p_a));
+$$;
+
+revoke execute on function public._blocked(uuid, uuid) from public, anon, authenticated;
+
+create or replace function public.block_user(p_user_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if p_user_id is null or p_user_id = v_uid then raise exception 'INVALID_INPUT'; end if;
+  if not exists (select 1 from users where id = p_user_id and deleted_at is null) then raise exception 'NOT_FOUND'; end if;
+  insert into user_blocks (blocker_id, blocked_id) values (v_uid, p_user_id) on conflict do nothing;
+  delete from favorites where (client_id = v_uid and provider_id = p_user_id) or (client_id = p_user_id and provider_id = v_uid);
+end;
+$$;
+
+create or replace function public.unblock_user(p_user_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  delete from user_blocks where blocker_id = v_uid and blocked_id = p_user_id;
+end;
+$$;
+
+create or replace function public.get_my_blocks()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'full_name', p.full_name, 'created_at', b.created_at)
+                            order by b.created_at desc), '[]'::jsonb)
+  from user_blocks b join profiles p on p.id = b.blocked_id
+  where b.blocker_id = auth.uid();
+$$;
+
+-- Shikoyatlar: e'lon, foydalanuvchi yoki chat xabari ustidan. Bitta narsaga bir kishidan bitta ochiq shikoyat.
+create table if not exists public.reports (
+  id               uuid primary key default gen_random_uuid(),
+  reporter_id      uuid not null references public.users (id) on delete cascade,
+  target_type      text not null check (target_type in ('job', 'user', 'message')),
+  target_id        uuid not null,
+  reported_user_id uuid not null references public.users (id) on delete cascade,
+  reason           text not null check (reason in ('fraud', 'abuse', 'spam', 'fake', 'other')),
+  comment          text not null default '' check (char_length(comment) <= 500),
+  status           text not null default 'open' check (status in ('open', 'resolved', 'dismissed')),
+  action           text,
+  created_at       timestamptz not null default now(),
+  resolved_at      timestamptz,
+  resolved_by      uuid references public.users (id) on delete set null
+);
+
+create unique index if not exists reports_one_open
+  on public.reports (reporter_id, target_type, target_id) where status = 'open';
+create index if not exists reports_open_idx on public.reports (created_at) where status = 'open';
+
+alter table public.reports enable row level security;
+
+create or replace function public.report_content(p_target_type text, p_target_id uuid, p_reason text, p_comment text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_owner uuid;
+  v_k contracts;
+  v_id uuid;
+  v_label text;
+  r record;
+begin
+  if p_reason is null or p_reason not in ('fraud', 'abuse', 'spam', 'fake', 'other') then raise exception 'INVALID_INPUT'; end if;
+  if char_length(coalesce(p_comment, '')) > 500 then raise exception 'INVALID_INPUT'; end if;
+
+  if p_target_type = 'job' then
+    select client_id, title into v_owner, v_label from jobs where id = p_target_id;
+  elsif p_target_type = 'user' then
+    select id, full_name into v_owner, v_label from profiles where id = p_target_id;
+  elsif p_target_type = 'message' then
+    -- Xabar ustidan faqat shu yozishma ishtirokchisi shikoyat qila oladi
+    select m.sender_id, left(m.text, 80) into v_owner, v_label from messages m where m.id = p_target_id;
+    if v_owner is not null then
+      select k.* into v_k from contracts k join messages m on m.contract_id = k.id where m.id = p_target_id;
+      if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_ALLOWED'; end if;
+    end if;
+  else
+    raise exception 'INVALID_INPUT';
+  end if;
+  if v_owner is null then raise exception 'NOT_FOUND'; end if;
+  if v_owner = v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if exists (select 1 from reports where reporter_id = v_uid and target_type = p_target_type
+                                     and target_id = p_target_id and status = 'open') then
+    raise exception 'ALREADY_REPORTED';
+  end if;
+  if (select count(*) from reports where reporter_id = v_uid and created_at > now() - interval '24 hours') >= 20 then
+    raise exception 'TOO_MANY_REPORTS';
+  end if;
+
+  insert into reports (reporter_id, target_type, target_id, reported_user_id, reason, comment)
+  values (v_uid, p_target_type, p_target_id, v_owner, p_reason, btrim(coalesce(p_comment, '')))
+  returning id into v_id;
+
+  for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+    perform queue_notification(r.id, format(E'\U0001F6A9 Yangi shikoyat (%s): %s',
+      case p_target_type when 'job' then 'e''lon' when 'user' then 'foydalanuvchi' else 'xabar' end,
+      coalesce(v_label, '')), '/admin/reports');
+  end loop;
+  return v_id;
+end;
+$$;
+
+-- Admin: ochiq shikoyatlar (eskisi birinchi), keyin oxirgi hal qilinganlar
+create or replace function public.admin_get_reports()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(x.item order by x.open desc, case when x.open then x.created_at end asc,
+                                            x.created_at desc), '[]'::jsonb)
+  into v
+  from (
+    select rp.status = 'open' as open, rp.created_at,
+      jsonb_build_object(
+        'id', rp.id, 'target_type', rp.target_type, 'target_id', rp.target_id, 'reason', rp.reason,
+        'comment', rp.comment, 'status', rp.status, 'action', rp.action,
+        'created_at', rp.created_at, 'resolved_at', rp.resolved_at,
+        'target', case rp.target_type
+          when 'job' then (select jsonb_build_object('title', j.title, 'description', left(j.description, 300),
+                                                     'status', j.status) from jobs j where j.id = rp.target_id)
+          when 'message' then (select jsonb_build_object('text', m.text, 'contract_id', m.contract_id)
+                               from messages m where m.id = rp.target_id)
+        end,
+        'reported_user', (select jsonb_build_object('id', u.id, 'full_name', u.full_name, 'phone', u.phone,
+                                                    'blocked', u.blocked_at is not null,
+                                                    'open_reports', (select count(*) from reports o
+                                                                     where o.reported_user_id = u.id and o.status = 'open'))
+                          from users u where u.id = rp.reported_user_id),
+        'reporter', (select jsonb_build_object('id', u.id, 'full_name', u.full_name, 'phone', u.phone)
+                     from users u where u.id = rp.reporter_id)
+      ) as item
+    from reports rp
+    where rp.status = 'open' or rp.resolved_at > now() - interval '7 days'
+    order by rp.status = 'open' desc, rp.created_at desc
+    limit 100
+  ) x;
+  return v;
+end;
+$$;
+
+-- Admin: shikoyatni hal qilish. p_action:
+--   dismiss        — asossiz, rad etiladi
+--   remove_job     — e'lon olib tashlanadi (faqat ochiq e'lon)
+--   hide_message   — xabar matni yashiriladi
+--   block_user     — shikoyat qilingan foydalanuvchi bloklanadi (barcha faoliyati yopiladi)
+-- Shu narsaga tushgan boshqa ochiq shikoyatlar ham birga yopiladi.
+create or replace function public.admin_resolve_report(p_report_id uuid, p_action text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_admin uuid := require_admin();
+  v_r reports;
+  v_reason text;
+begin
+  select * into v_r from reports where id = p_report_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_r.status <> 'open' then raise exception 'INVALID_STATE'; end if;
+  v_reason := 'Shikoyat: ' || case v_r.reason when 'fraud' then 'firibgarlik' when 'abuse' then 'haqorat'
+                                              when 'spam' then 'spam' when 'fake' then 'soxta ma''lumot' else 'qoidabuzarlik' end;
+
+  if p_action = 'remove_job' then
+    if v_r.target_type <> 'job' then raise exception 'INVALID_INPUT'; end if;
+    perform admin_remove_job(v_r.target_id, v_reason);
+  elsif p_action = 'hide_message' then
+    if v_r.target_type <> 'message' then raise exception 'INVALID_INPUT'; end if;
+    update messages set text = '[Xabar moderator tomonidan yashirildi]' where id = v_r.target_id;
+  elsif p_action = 'block_user' then
+    perform admin_block_user(v_r.reported_user_id, v_reason);
+  elsif p_action <> 'dismiss' then
+    raise exception 'INVALID_INPUT';
+  end if;
+
+  update reports set status = case when p_action = 'dismiss' then 'dismissed' else 'resolved' end,
+                     action = p_action, resolved_at = now(), resolved_by = v_admin
+   where status = 'open'
+     and (id = p_report_id
+          or (target_type = v_r.target_type and target_id = v_r.target_id)
+          or (p_action = 'block_user' and reported_user_id = v_r.reported_user_id));
+end;
+$$;
+
+revoke execute on function public.block_user(uuid), public.unblock_user(uuid), public.get_my_blocks(),
+  public.report_content(text, uuid, text, text), public.admin_get_reports(), public.admin_resolve_report(uuid, text)
+from public, anon, authenticated;
+
+grant execute on function public.block_user(uuid), public.unblock_user(uuid), public.get_my_blocks(),
+  public.report_content(text, uuid, text, text), public.admin_get_reports(), public.admin_resolve_report(uuid, text)
+to authenticated;

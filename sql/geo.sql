@@ -79,6 +79,7 @@ begin
       from jobs j join profiles c on c.id = j.client_id
       where j.status = 'open'
         and j.client_id <> v_uid
+        and not _blocked(v_uid, j.client_id)
         and (p_category is null or j.category = p_category)
         and (p_district is null or j.district = p_district)
         and (v_q is null or j.title ilike '%' || v_q || '%' or j.description ilike '%' || v_q || '%')
@@ -194,6 +195,7 @@ begin
       cross join lateral (select provider_stats(pp.user_id) as stats) s
       where pp.status = 'approved'
         and pp.user_id <> v_uid
+        and not _blocked(v_uid, pp.user_id)
         and (p_category is null or p_category = any (pp.categories))
         and (p_district is null or p_district = any (pp.districts))
         and (v_like is null
