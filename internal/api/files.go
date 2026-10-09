@@ -17,7 +17,8 @@ import (
 //   POST   /api/files  { bucket, path, content_type, data (base64) }  -> yuklash (upsert)
 //   DELETE /api/files?bucket=..&path=..     -> o'chirish
 // Yozish huquqi: avatars/<uid>/avatar.jpg, job-photos/<o'z e'loni id>/photo[-2..4].jpg,
-// portfolio-photos/<uid>/<fayl>.
+// portfolio-photos/<uid>/<fayl>, work-photos/<o'z shartnomasi id>/before-1..3.jpg | after-1..3.jpg
+// (faqat usta, shartnoma faol yoki topshirilgan paytda).
 
 const (
 	maxFileBytes = 3 << 20
@@ -25,12 +26,14 @@ const (
 )
 
 var (
-	buckets = []string{"avatars", "job-photos", "portfolio-photos"}
+	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos"}
 	// E'londa 4 tagacha rasm; nomlar qat'iy (sql/app.sql: _job_photos bilan bir xil)
 	jobPhotoNames = []string{"photo.jpg", "photo-2.jpg", "photo-3.jpg", "photo-4.jpg"}
-	imageTypes    = []string{"image/jpeg", "image/png", "image/webp"}
-	filePath      = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
-	uuidLike      = regexp.MustCompile(`^[0-9a-f-]{36}$`)
+	// Ishdan oldin/keyin rasmlari (sql/app.sql: _work_photos bilan bir xil)
+	workPhotoNames = []string{"before-1.jpg", "before-2.jpg", "before-3.jpg", "after-1.jpg", "after-2.jpg", "after-3.jpg"}
+	imageTypes     = []string{"image/jpeg", "image/png", "image/webp"}
+	filePath       = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
+	uuidLike       = regexp.MustCompile(`^[0-9a-f-]{36}$`)
 )
 
 // parsePath "<papka>/<nom>" ni ajratadi; bucket noma'lum yoki format noto'g'ri bo'lsa ok=false.
@@ -61,6 +64,17 @@ func (s *Server) canWrite(r *http.Request, u *user, bucket, folder, name string)
 			return false, nil
 		}
 		return clientID == u.ID, err
+	case "work-photos":
+		if !slices.Contains(workPhotoNames, name) {
+			return false, nil
+		}
+		var providerID, status string
+		err := s.db.QueryRow(r.Context(), `select provider_id::text, status from contracts where id = $1::uuid`, folder).
+			Scan(&providerID, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return providerID == u.ID && (status == "active" || status == "submitted"), err
 	}
 	return false, nil
 }

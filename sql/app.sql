@@ -161,6 +161,12 @@ alter table public.contracts add column if not exists payment_released_at timest
 alter table public.contracts add column if not exists payment_refunded_at timestamptz;
 alter table public.contracts add column if not exists payment_held_amount int;
 
+-- Usta holatlari: yo'lga chiqdi (va qachon yetib borishini aytdi) -> yetib keldi -> ish boshlandi
+alter table public.contracts add column if not exists on_the_way_at timestamptz;
+alter table public.contracts add column if not exists eta_at timestamptz;
+alter table public.contracts add column if not exists arrived_at timestamptz;
+alter table public.contracts add column if not exists started_at timestamptz;
+
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'contracts_payment_status_check') then
     alter table public.contracts add constraint contracts_payment_status_check
@@ -252,7 +258,10 @@ returns jsonb language sql stable security definer set search_path = public as $
     select
       count(*) filter (where status = 'completed')                                        as completed,
       count(*) filter (where status = 'cancelled' and cancelled_by = 'provider')          as withdrawals,
-      count(*) filter (where dispute_resolution = 'client')                               as disputes_lost
+      count(*) filter (where dispute_resolution = 'client')                               as disputes_lost,
+      -- O'z vaqtida: aytgan vaqtidan 15 daqiqagacha kechikish kechiriladi
+      count(*) filter (where eta_at is not null and arrived_at is not null)               as arrivals,
+      count(*) filter (where eta_at is not null and arrived_at <= eta_at + interval '15 minutes') as on_time
     from contracts where provider_id = p_user_id
   ),
   r as (
@@ -266,7 +275,11 @@ returns jsonb language sql stable security definer set search_path = public as $
     'disputes_lost',  c.disputes_lost,
     'reviews_count',  r.cnt,
     'avg_rating',     r.avg,
-    'top_rated',      coalesce(r.avg >= 4.5 and c.completed >= 5, false)
+    'top_rated',      coalesce(r.avg >= 4.5 and c.completed >= 5, false),
+    -- Kamida 3 ta holatdan keyin ko'rsatiladi (bitta tasodif foizni buzmasin)
+    'on_time_rate',   case when c.arrivals >= 3 then round(100.0 * c.on_time / c.arrivals) end,
+    'reliability',    case when c.completed + c.withdrawals + c.disputes_lost >= 3
+                        then round(100.0 * c.completed / (c.completed + c.withdrawals + c.disputes_lost)) end
   )
   from c, r;
 $$;
@@ -561,6 +574,7 @@ begin
             + least((st.s->>'completed_jobs')::int, 20) * 1.5
             - (st.s->>'withdrawals')::int * 10
             - (st.s->>'disputes_lost')::int * 15
+            + (coalesce((st.s->>'on_time_rate')::numeric, 85) - 85) * 0.4
             + case when p.eta_minutes is not null then greatest(0, 30 - p.eta_minutes / 2.0) else 0 end
             + 20.0 * min(p.price) filter (where p.status = 'submitted') over () / p.price
             as score
@@ -773,6 +787,9 @@ begin
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
     'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
+    'on_the_way_at', v_k.on_the_way_at, 'eta_at', v_k.eta_at,
+    'arrived_at', v_k.arrived_at, 'started_at', v_k.started_at,
+    'work_photos', _work_photos(v_k.id),
     'price_change', case when v_k.status in ('active', 'submitted') then (
         select jsonb_build_object('id', c.id, 'old_price', c.old_price, 'new_price', c.new_price,
                                   'reason', c.reason, 'created_at', c.created_at)
@@ -1907,6 +1924,13 @@ begin
     'price',          k.price,
     'disputed_at',    k.disputed_at,
     'dispute_reason', k.dispute_reason,
+    'arrived_at',     k.arrived_at,
+    'started_at',     k.started_at,
+    'work_photos',    _work_photos(k.id),
+    'price_history',  coalesce((
+        select jsonb_agg(jsonb_build_object('old_price', c.old_price, 'new_price', c.new_price, 'reason', c.reason,
+                                            'status', c.status, 'created_at', c.created_at) order by c.created_at)
+        from price_changes c where c.contract_id = k.id and c.status in ('approved', 'declined')), '[]'::jsonb),
     'job',      jsonb_build_object('id', j.id, 'title', j.title, 'category', j.category, 'district', j.district),
     'client',   jsonb_build_object('id', cp.id, 'full_name', cp.full_name, 'phone', cu.phone),
     'provider', jsonb_build_object('id', pp.id, 'full_name', pp.full_name, 'phone', pu.phone)
@@ -2544,3 +2568,65 @@ $$;
 revoke execute on function public.delete_job_photo(uuid, text) from public, anon, authenticated;
 
 grant execute on function public.delete_job_photo(uuid, text) to authenticated;
+
+
+-- ===== usta holatlari va ish rasmlari =====
+-- Ish rasmlari: work-photos/<shartnoma id>/before-1..3.jpg (ishdan oldin), after-1..3.jpg (ishdan keyin).
+-- Faqat usta yuklaydi (internal/api/files.go), ikkala tomon va nizoda admin ko'radi.
+create or replace function public._work_photos(p_contract_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('name', n.name, 'v', (extract(epoch from f.updated_at) * 1000)::bigint)
+                            order by n.ord), '[]'::jsonb)
+  from unnest(array['before-1.jpg', 'before-2.jpg', 'before-3.jpg', 'after-1.jpg', 'after-2.jpg', 'after-3.jpg'])
+       with ordinality as n(name, ord)
+  join files f on f.bucket = 'work-photos' and f.path = p_contract_id::text || '/' || n.name;
+$$;
+
+revoke execute on function public._work_photos(uuid) from public, anon, authenticated;
+
+-- Usta ish bosqichini belgilaydi; orqaga qaytib bo'lmaydi, mijozga darhol xabar ketadi.
+--   on_the_way — yo'lga chiqdim (p_eta_minutes: necha daqiqada yetib boraman)
+--   arrived    — manzilga yetib keldim
+--   started    — ishni boshladim
+create or replace function public.set_work_stage(p_contract_id uuid, p_stage text, p_eta_minutes int default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_title text;
+  v_link text := '/contract/' || p_contract_id;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'active' then raise exception 'INVALID_STATE'; end if;
+  select title into v_title from jobs where id = v_k.job_id;
+
+  if p_stage = 'on_the_way' then
+    if v_k.on_the_way_at is not null or v_k.arrived_at is not null or v_k.started_at is not null then
+      raise exception 'INVALID_STATE';
+    end if;
+    if p_eta_minutes is null or p_eta_minutes not between 5 and 240 then raise exception 'INVALID_INPUT'; end if;
+    update contracts set on_the_way_at = now(), eta_at = now() + make_interval(mins => p_eta_minutes)
+     where id = p_contract_id;
+    perform queue_notification(v_k.client_id, format(
+      E'\U0001F697 "%s": usta yo''lga chiqdi, taxminan %s daqiqada yetib boradi.', v_title, p_eta_minutes), v_link);
+  elsif p_stage = 'arrived' then
+    if v_k.arrived_at is not null or v_k.started_at is not null then raise exception 'INVALID_STATE'; end if;
+    update contracts set arrived_at = now() where id = p_contract_id;
+    perform queue_notification(v_k.client_id, format(
+      E'\U0001F4CD "%s": usta manzilga yetib keldi.', v_title), v_link);
+  elsif p_stage = 'started' then
+    if v_k.started_at is not null then raise exception 'INVALID_STATE'; end if;
+    update contracts set started_at = now(), arrived_at = coalesce(arrived_at, now()) where id = p_contract_id;
+    perform queue_notification(v_k.client_id, format(
+      E'\U0001F527 "%s": usta ishni boshladi.', v_title), v_link);
+  else
+    raise exception 'INVALID_INPUT';
+  end if;
+end;
+$$;
+
+revoke execute on function public.set_work_stage(uuid, text, int) from public, anon, authenticated;
+
+grant execute on function public.set_work_stage(uuid, text, int) to authenticated;
