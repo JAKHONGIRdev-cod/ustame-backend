@@ -112,13 +112,25 @@ func toArg(v any) (any, error) {
 		for i, item := range x {
 			s, ok := item.(string)
 			if !ok {
-				return nil, errors.New("array of non-strings")
+				// Obyektlar massivi (masalan bosqichlar rejasi) — jsonb parametr sifatida JSON matn
+				return jsonArg(x)
 			}
 			out[i] = s
 		}
 		return out, nil
+	case map[string]any:
+		return jsonArg(x)
 	}
 	return nil, fmt.Errorf("unsupported %T", v)
+}
+
+// jsonArg murakkab qiymatni JSON matnga aylantiradi: Postgres uni funksiya parametrining turi (jsonb) bo'yicha o'qiydi.
+func jsonArg(v any) (any, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
 }
 
 // readOnly — faqat o'qiydigan funksiyalar (nomlash qoidasi bo'yicha): ular bildirishnoma yaratmaydi.

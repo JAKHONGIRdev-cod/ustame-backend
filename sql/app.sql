@@ -790,6 +790,10 @@ begin
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
     'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
+    'staged', v_k.staged,
+    'stages', case when v_k.staged then _stages_json(v_k.id) else '[]'::jsonb end,
+    'stage_plan', case when v_k.stage_plan is not null
+                    then jsonb_build_object('stages', v_k.stage_plan, 'by_me', v_k.stage_plan_by = v_uid) end,
     'on_the_way_at', v_k.on_the_way_at, 'eta_at', v_k.eta_at,
     'arrived_at', v_k.arrived_at, 'started_at', v_k.started_at,
     'work_photos', _work_photos(v_k.id),
@@ -848,6 +852,8 @@ begin
   -- Javobsiz qolgan narx o'zgartirish so'rovi endi kuchini yo'qotadi
   update price_changes set status = 'cancelled', decided_at = now()
    where contract_id = p_contract_id and status = 'pending';
+  update contract_stages set status = 'approved', approved_at = coalesce(approved_at, now())
+   where contract_id = p_contract_id and status <> 'approved';
   update jobs set status = 'completed', closed_at = now() where id = v_job_id;
 end;
 $$;
@@ -1878,7 +1884,10 @@ begin
     'pending_providers',   (select count(*) from provider_profiles where status = 'pending'),
     'disputed_contracts',  (select count(*) from contracts where status = 'disputed'),
     'payments_action',     (select count(*) from contracts
-                             where payment_status = 'held' and status in ('completed', 'cancelled')),
+                             where payment_status = 'held' and status in ('completed', 'cancelled'))
+                         + (select count(*) from contract_stages st join contracts k on k.id = st.contract_id
+                             where st.payment_status = 'held'
+                               and (st.status = 'approved' or k.status in ('completed', 'cancelled'))),
     'errors_24h',          (select count(*) from client_errors where created_at > now() - interval '24 hours'),
     'waiting_jobs',        (select count(*) from jobs j where j.status = 'open'
                              and j.created_at > now() - interval '7 days'
@@ -2456,6 +2465,7 @@ begin
     raise exception 'INVALID_PRICE';
   end if;
   if char_length(v_reason) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  if v_k.staged and _adjustable_stage(p_contract_id) is null then raise exception 'STAGES_LOCKED'; end if;
   if exists (select 1 from price_changes where contract_id = p_contract_id and status = 'pending') then
     raise exception 'PRICE_CHANGE_PENDING';
   end if;
@@ -2482,6 +2492,8 @@ declare
   v_title text;
   v_sum text;
   v_diff int;
+  v_stage uuid;
+  v_stage_amount int;
   r record;
 begin
   select * into v_c from price_changes where id = p_change_id for update;
@@ -2493,7 +2505,16 @@ begin
   update price_changes set status = case when p_approve then 'approved' else 'declined' end, decided_at = now()
    where id = p_change_id;
   if p_approve then
-    update contracts set price = v_c.new_price where id = v_k.id;
+    if v_k.staged then
+      -- Farq oxirgi hali boshlanmagan va to'lanmagan bosqichga tushadi
+      v_stage := _adjustable_stage(v_k.id);
+      if v_stage is null then raise exception 'STAGES_LOCKED'; end if;
+      update contract_stages set amount = amount + (v_c.new_price - v_k.price) where id = v_stage
+      returning amount into v_stage_amount;
+      if v_stage_amount < 10000 then raise exception 'INVALID_PRICE'; end if;
+    end if;
+    -- Taklif qilingan (hali tasdiqlanmagan) reja eski narx bo'yicha edi — bekor bo'ladi
+    update contracts set price = v_c.new_price, stage_plan = null, stage_plan_by = null where id = v_k.id;
   end if;
 
   select title into v_title from jobs where id = v_k.job_id;
@@ -2845,3 +2866,385 @@ from public, anon, authenticated;
 grant execute on function public.block_user(uuid), public.unblock_user(uuid), public.get_my_blocks(),
   public.report_content(text, uuid, text, text), public.admin_get_reports(), public.admin_resolve_report(uuid, text)
 to authenticated;
+
+
+-- ===== bosqichli to'lov =====
+-- Katta ish shartnoma summasi 2-6 bosqichga bo'linadi (masalan: material, asosiy ish, yakun). Bir tomon reja
+-- taklif qiladi, ikkinchisi tasdiqlaydi. Har bosqich puli alohida kafolatga tushadi, usta bosqichni topshiradi,
+-- mijoz qabul qiladi (48 soatda javob bo'lmasa avtomatik) — shundan keyin pul ustaga o'tkaziladi.
+-- Oxirgi bosqich qabul qilinganda shartnoma yakunlanadi.
+alter table public.contracts add column if not exists staged boolean not null default false;
+alter table public.contracts add column if not exists stage_plan jsonb;
+alter table public.contracts add column if not exists stage_plan_by uuid;
+
+create table if not exists public.contract_stages (
+  id                  uuid primary key default gen_random_uuid(),
+  contract_id         uuid not null references public.contracts (id) on delete cascade,
+  position            smallint not null,
+  title               text not null check (char_length(title) between 2 and 120),
+  amount              int not null check (amount between 1 and 100000000),
+  status              text not null default 'pending' check (status in ('pending', 'submitted', 'approved')),
+  submitted_at        timestamptz,
+  approved_at         timestamptz,
+  payment_status      text not null default 'none' check (payment_status in ('none', 'held', 'released', 'refunded')),
+  payment_held_at     timestamptz,
+  payment_released_at timestamptz,
+  payment_refunded_at timestamptz,
+  unique (contract_id, position)
+);
+
+alter table public.contract_stages enable row level security;
+
+create or replace function public._stages_json(p_contract_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', st.id, 'position', st.position, 'title', st.title, 'amount', st.amount, 'status', st.status,
+    'submitted_at', st.submitted_at, 'approved_at', st.approved_at,
+    'auto_approve_at', case when st.status = 'submitted' then st.submitted_at + interval '48 hours' end,
+    'payment_status', st.payment_status, 'payment_held_at', st.payment_held_at,
+    'payment_released_at', st.payment_released_at, 'payment_refunded_at', st.payment_refunded_at
+  ) order by st.position), '[]'::jsonb)
+  from contract_stages st where st.contract_id = p_contract_id;
+$$;
+
+-- Narx o'zgarsa farq tushadigan bosqich: oxirgi, hali boshlanmagan va puli kafolatga tushmagan
+create or replace function public._adjustable_stage(p_contract_id uuid)
+returns uuid language sql stable security definer set search_path = public as $$
+  select id from contract_stages
+   where contract_id = p_contract_id and status = 'pending' and payment_status = 'none'
+   order by position desc limit 1;
+$$;
+
+revoke execute on function public._stages_json(uuid), public._adjustable_stage(uuid) from public, anon, authenticated;
+
+create or replace function public.propose_stages(p_contract_id uuid, p_stages jsonb)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_plan jsonb;
+  v_n int;
+  v_title text;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'active' or v_k.staged or v_k.payment_status <> 'none' then raise exception 'INVALID_STATE'; end if;
+  if jsonb_typeof(p_stages) is distinct from 'array' then raise exception 'INVALID_STAGES'; end if;
+  v_n := jsonb_array_length(p_stages);
+  if v_n not between 2 and 6 then raise exception 'INVALID_STAGES'; end if;
+  if exists (select 1 from jsonb_array_elements(p_stages) e
+             where jsonb_typeof(e) <> 'object'
+                or coalesce(char_length(btrim(e->>'title')), 0) not between 2 and 120
+                -- CASE: matnli summa ::numeric da xato bermasligi uchun (OR tartibi kafolatlanmagan)
+                or case when jsonb_typeof(e->'amount') = 'number'
+                        then (e->>'amount')::numeric <> trunc((e->>'amount')::numeric)
+                             or (e->>'amount')::numeric not between 10000 and 100000000
+                        else true end) then
+    raise exception 'INVALID_STAGES';
+  end if;
+  select jsonb_agg(jsonb_build_object('title', btrim(e->>'title'), 'amount', (e->>'amount')::int) order by ord)
+    into v_plan from jsonb_array_elements(p_stages) with ordinality as t(e, ord);
+  if (select sum((e->>'amount')::bigint) from jsonb_array_elements(v_plan) e) <> v_k.price then
+    raise exception 'STAGES_SUM_MISMATCH';
+  end if;
+
+  update contracts set stage_plan = v_plan, stage_plan_by = v_uid where id = p_contract_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(case when v_uid = v_k.client_id then v_k.provider_id else v_k.client_id end,
+    format(E'\U0001F9E9 "%s": %s to''lovni %s bosqichga bo''lishni taklif qildi. Ko''rib chiqing.',
+           v_title, case when v_uid = v_k.client_id then 'mijoz' else 'usta' end, v_n),
+    '/contract/' || p_contract_id);
+end;
+$$;
+
+create or replace function public.decide_stages(p_contract_id uuid, p_approve boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_title text;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.stage_plan is null or v_k.status <> 'active' or v_k.staged or v_k.payment_status <> 'none' then
+    raise exception 'INVALID_STATE';
+  end if;
+  -- O'z taklifini faqat qaytarib olish mumkin, tasdiqlash — ikkinchi tomon
+  if v_k.stage_plan_by = v_uid and p_approve then raise exception 'NOT_ALLOWED'; end if;
+  select title into v_title from jobs where id = v_k.job_id;
+
+  if p_approve then
+    if (select sum((e->>'amount')::bigint) from jsonb_array_elements(v_k.stage_plan) e) <> v_k.price then
+      raise exception 'STAGES_SUM_MISMATCH';
+    end if;
+    insert into contract_stages (contract_id, position, title, amount)
+    select p_contract_id, t.ord, t.e->>'title', (t.e->>'amount')::int
+      from jsonb_array_elements(v_k.stage_plan) with ordinality as t(e, ord);
+    update contracts set staged = true, stage_plan = null, stage_plan_by = null where id = p_contract_id;
+    perform queue_notification(v_k.stage_plan_by, format(
+      E'✅ "%s": bosqichli to''lov rejasi tasdiqlandi. Har bosqich puli alohida kafolatga tushadi.', v_title),
+      '/contract/' || p_contract_id);
+  else
+    update contracts set stage_plan = null, stage_plan_by = null where id = p_contract_id;
+    if v_k.stage_plan_by <> v_uid then
+      perform queue_notification(v_k.stage_plan_by, format(
+        E'❌ "%s": bosqichli to''lov rejasi rad etildi. To''lov butun summa bo''yicha qoladi.', v_title),
+        '/contract/' || p_contract_id);
+    end if;
+  end if;
+end;
+$$;
+
+-- Usta navbatdagi bosqichni topshiradi (oldingi bosqichlar topshirilgan bo'lishi kerak)
+create or replace function public.submit_stage(p_stage_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_s contract_stages;
+  v_k contracts;
+  v_title text;
+begin
+  select * into v_s from contract_stages where id = p_stage_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_k from contracts where id = v_s.contract_id for update;
+  if v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'active' or v_s.status <> 'pending' then raise exception 'INVALID_STATE'; end if;
+  if exists (select 1 from contract_stages where contract_id = v_s.contract_id
+                                             and position < v_s.position and status = 'pending') then
+    raise exception 'STAGE_ORDER';
+  end if;
+
+  update contract_stages set status = 'submitted', submitted_at = now() where id = p_stage_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.client_id, format(
+    E'\U0001F4E6 "%s": usta %s-bosqichni ("%s") topshirdi. Tekshirib qabul qiling — 48 soatda javob bo''lmasa avtomatik qabul qilinadi.',
+    v_title, v_s.position, v_s.title), '/contract/' || v_k.id);
+end;
+$$;
+
+-- Bosqichni qabul qilish (mijoz yoki 48 soatdan keyin avtomatik). Hammasi qabul qilinsa — shartnoma yakunlanadi.
+create or replace function public._approve_stage(p_stage_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_s contract_stages;
+  v_k contracts;
+  v_title text;
+  v_sum text;
+  r record;
+begin
+  update contract_stages set status = 'approved', approved_at = now() where id = p_stage_id returning * into v_s;
+  select * into v_k from contracts where id = v_s.contract_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  v_sum := replace(to_char(v_s.amount, 'FM999,999,999'), ',', ' ');
+  perform queue_notification(v_k.provider_id, format(
+    E'✅ "%s": %s-bosqich ("%s") qabul qilindi.%s', v_title, v_s.position, v_s.title,
+    case when v_s.payment_status = 'held' then format(E' %s so''m sizga o''tkaziladi.', v_sum) else '' end),
+    '/contract/' || v_k.id);
+  if v_s.payment_status = 'held' then
+    for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+      perform queue_notification(r.id, format(
+        E'\U0001F4B8 "%s": %s-bosqich qabul qilindi — %s so''mni ustaga o''tkazing.', v_title, v_s.position, v_sum),
+        '/admin/payments');
+    end loop;
+  end if;
+  if not exists (select 1 from contract_stages where contract_id = v_s.contract_id and status <> 'approved') then
+    perform _complete_contract(v_s.contract_id);
+  end if;
+end;
+$$;
+
+revoke execute on function public._approve_stage(uuid) from public, anon, authenticated;
+
+create or replace function public.approve_stage(p_stage_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_s contract_stages;
+  v_k contracts;
+begin
+  select * into v_s from contract_stages where id = p_stage_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_k from contracts where id = v_s.contract_id for update;
+  if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status not in ('active', 'submitted') or v_s.status = 'approved' then raise exception 'INVALID_STATE'; end if;
+  perform _approve_stage(p_stage_id);
+end;
+$$;
+
+-- 48 soat: butun ish (eski yo'l) va bosqichlar
+create or replace function public.auto_approve_overdue()
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  r record;
+  n int := 0;
+begin
+  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '48 hours'
+  loop
+    perform _complete_contract(r.id);
+    n := n + 1;
+  end loop;
+  for r in select st.id from contract_stages st join contracts k on k.id = st.contract_id
+            where st.status = 'submitted' and st.submitted_at < now() - interval '48 hours'
+              and k.status in ('active', 'submitted')
+            order by st.contract_id, st.position
+  loop
+    -- Oldingi qadamda shartnoma yakunlangan bo'lsa bosqich allaqachon qabul qilingan
+    if (select status from contract_stages where id = r.id) = 'submitted' then
+      perform _approve_stage(r.id);
+      n := n + 1;
+    end if;
+  end loop;
+  return n;
+end;
+$$;
+
+revoke execute on function public.auto_approve_overdue() from public, anon, authenticated;
+
+-- Admin: pul harakati — butun shartnoma (bosqichsiz) va bosqichlar. action:
+--   release — pul kafolatda, ish (bosqich) qabul qilingan: ustaga o'tkazish kerak
+--   refund  — pul kafolatda, shartnoma bekor (bosqich qabul qilinmagan): mijozga qaytarish kerak
+--   held    — pul kafolatda, ish davom etmoqda
+--   hold    — kafolatsiz: mijoz to'lasa "qabul qilindi" deb belgilanadi (bosqichlarda — navbatdagisi)
+create or replace function public.admin_get_payments()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(x.row_data order by x.sort_key, x.created_at desc), '[]'::jsonb)
+  into v
+  from (
+    select y.* from (
+      select k.created_at,
+        case
+          when k.payment_status = 'held' and k.status = 'completed' then 1
+          when k.payment_status = 'held' and k.status = 'cancelled' then 2
+          when k.payment_status = 'held' then 3
+          else 4
+        end as sort_key,
+        jsonb_build_object(
+          'id', k.id, 'price', k.price, 'status', k.status, 'payment_status', k.payment_status,
+          'payment_held_at', k.payment_held_at, 'held_amount', k.payment_held_amount, 'created_at', k.created_at,
+          'action', case
+            when k.payment_status = 'held' and k.status = 'completed' then 'release'
+            when k.payment_status = 'held' and k.status = 'cancelled' then 'refund'
+            when k.payment_status = 'held' then 'held'
+            else 'hold'
+          end,
+          'job',      jsonb_build_object('id', j.id, 'title', j.title),
+          'client',   jsonb_build_object('id', cp.id, 'full_name', cp.full_name, 'phone', cu.phone),
+          'provider', jsonb_build_object('id', pp.id, 'full_name', pp.full_name, 'phone', pu.phone)
+        ) as row_data
+      from contracts k
+      join jobs j on j.id = k.job_id
+      join profiles cp on cp.id = k.client_id
+      join auth.users cu on cu.id = k.client_id
+      join profiles pp on pp.id = k.provider_id
+      join auth.users pu on pu.id = k.provider_id
+      where not k.staged
+        and (k.payment_status = 'held'
+             or (k.payment_status = 'none' and k.status in ('active', 'submitted', 'disputed')))
+      union all
+      select k.created_at,
+        case
+          when st.payment_status = 'held' and (st.status = 'approved' or k.status = 'completed') then 1
+          when st.payment_status = 'held' and k.status = 'cancelled' then 2
+          when st.payment_status = 'held' then 3
+          else 4
+        end,
+        jsonb_build_object(
+          'id', k.id, 'price', st.amount, 'status', k.status, 'payment_status', st.payment_status,
+          'payment_held_at', st.payment_held_at, 'held_amount', null, 'created_at', k.created_at,
+          'stage', jsonb_build_object('id', st.id, 'position', st.position, 'title', st.title, 'status', st.status,
+                                      'count', (select count(*) from contract_stages c where c.contract_id = k.id)),
+          'action', case
+            when st.payment_status = 'held' and (st.status = 'approved' or k.status = 'completed') then 'release'
+            when st.payment_status = 'held' and k.status = 'cancelled' then 'refund'
+            when st.payment_status = 'held' then 'held'
+            else 'hold'
+          end,
+          'job',      jsonb_build_object('id', j.id, 'title', j.title),
+          'client',   jsonb_build_object('id', cp.id, 'full_name', cp.full_name, 'phone', cu.phone),
+          'provider', jsonb_build_object('id', pp.id, 'full_name', pp.full_name, 'phone', pu.phone)
+        )
+      from contract_stages st
+      join contracts k on k.id = st.contract_id
+      join jobs j on j.id = k.job_id
+      join profiles cp on cp.id = k.client_id
+      join auth.users cu on cu.id = k.client_id
+      join profiles pp on pp.id = k.provider_id
+      join auth.users pu on pu.id = k.provider_id
+      where k.staged
+        and (st.payment_status = 'held'
+             or (st.payment_status = 'none' and st.status <> 'approved'
+                 and k.status in ('active', 'submitted', 'disputed')
+                 -- to'lanmaganlardan faqat navbatdagisi
+                 and st.position = (select min(c.position) from contract_stages c
+                                     where c.contract_id = k.id and c.payment_status = 'none' and c.status <> 'approved')))
+    ) y
+    order by y.sort_key, y.created_at desc
+    limit 100
+  ) x;
+  return v;
+end;
+$$;
+
+-- Admin: bosqich puli harakati (admin_set_payment bilan bir xil o'tishlar, bosqich darajasida)
+create or replace function public.admin_set_stage_payment(p_stage_id uuid, p_status text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_s contract_stages;
+  v_k contracts;
+  v_title text;
+  v_sum text;
+  v_link text;
+begin
+  perform require_admin();
+  select * into v_s from contract_stages where id = p_stage_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_k from contracts where id = v_s.contract_id for update;
+  if not coalesce(
+       (p_status = 'held' and v_s.payment_status = 'none' and v_k.status in ('active', 'submitted', 'disputed'))
+    or (p_status = 'released' and v_s.payment_status = 'held' and (v_s.status = 'approved' or v_k.status = 'completed'))
+    or (p_status = 'refunded' and v_s.payment_status = 'held' and v_k.status = 'cancelled' and v_s.status <> 'approved'),
+    false) then
+    raise exception 'INVALID_STATE';
+  end if;
+
+  update contract_stages set
+    payment_status      = p_status,
+    payment_held_at     = case when p_status = 'held' then now() else payment_held_at end,
+    payment_released_at = case when p_status = 'released' then now() else payment_released_at end,
+    payment_refunded_at = case when p_status = 'refunded' then now() else payment_refunded_at end
+  where id = p_stage_id;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  v_sum := replace(to_char(v_s.amount, 'FM999,999,999'), ',', ' ');
+  v_link := '/contract/' || v_k.id;
+  if p_status = 'held' then
+    perform queue_notification(v_k.provider_id, format(
+      E'\U0001F512 "%s": %s-bosqich puli (%s so''m) Ustame''da kafolatda. Bosqichni topshiring — mijoz qabul qilgach pul sizga o''tadi.',
+      v_title, v_s.position, v_sum), v_link);
+    perform queue_notification(v_k.client_id, format(
+      E'\U0001F512 "%s": %s-bosqich to''lovi (%s so''m) kafolatda. Bosqichni qabul qilganingizdan keyingina ustaga o''tkaziladi.',
+      v_title, v_s.position, v_sum), v_link);
+  elsif p_status = 'released' then
+    perform queue_notification(v_k.provider_id, format(
+      E'\U0001F4B8 "%s": %s-bosqich uchun %s so''m sizga o''tkazildi.', v_title, v_s.position, v_sum), v_link);
+  else
+    perform queue_notification(v_k.client_id, format(
+      E'↩️ "%s": %s-bosqich uchun %s so''m sizga qaytarildi.', v_title, v_s.position, v_sum), v_link);
+  end if;
+end;
+$$;
+
+revoke execute on function public.propose_stages(uuid, jsonb), public.decide_stages(uuid, boolean),
+  public.submit_stage(uuid), public.approve_stage(uuid), public.admin_set_stage_payment(uuid, text)
+from public, anon, authenticated;
+
+grant execute on function public.propose_stages(uuid, jsonb), public.decide_stages(uuid, boolean),
+  public.submit_stage(uuid), public.approve_stage(uuid), public.admin_set_stage_payment(uuid, text)
+to authenticated;
+
+grant execute on function public.admin_get_payments() to authenticated;
