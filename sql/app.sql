@@ -562,6 +562,7 @@ begin
       'id', x.id, 'price', x.price, 'message', x.message, 'status', x.status, 'created_at', x.created_at,
       'eta_minutes', x.eta_minutes, 'score', round(x.score),
       'recommended', x.status = 'submitted' and x.rank <= 3,
+      'unread', (select count(*) from messages m where m.proposal_id = x.id and m.sender_id <> v_uid and m.read_at is null),
       'provider', x.provider,
       'team', (select jsonb_build_object('id', t.id, 'name', t.name, 'kind', t.kind, 'size', t.size,
                                          'stats', team_stats(t.id))
@@ -746,7 +747,8 @@ begin
       'id', p.id, 'price', p.price, 'message', p.message, 'status', p.status, 'created_at', p.created_at,
       'job', jsonb_build_object('id', j.id, 'title', j.title, 'category', j.category,
                                 'district', j.district, 'status', j.status),
-      'contract_id', (select k.id from contracts k where k.proposal_id = p.id)
+      'contract_id', (select k.id from contracts k where k.proposal_id = p.id),
+      'unread', (select count(*) from messages m where m.proposal_id = p.id and m.sender_id <> v_uid and m.read_at is null)
     ) order by p.updated_at desc)
     from proposals p join jobs j on j.id = p.job_id
     where p.provider_id = v_uid
@@ -1101,7 +1103,7 @@ begin
       'created_at', m.created_at, 'read_at', m.read_at
     ) order by m.created_at asc)
     from messages m
-    where m.contract_id = p_contract_id
+    where (m.contract_id = p_contract_id or (v_k.proposal_id is not null and m.proposal_id = v_k.proposal_id))
       and (p_after is null or m.created_at > p_after)
   ), '[]'::jsonb);
 end;
@@ -1118,7 +1120,8 @@ begin
   if v_k.client_id <> v_uid and v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
 
   update messages set read_at = now()
-   where contract_id = p_contract_id and sender_id <> v_uid and read_at is null;
+   where (contract_id = p_contract_id or (v_k.proposal_id is not null and proposal_id = v_k.proposal_id))
+     and sender_id <> v_uid and read_at is null;
 end;
 $$;
 
@@ -2768,9 +2771,13 @@ begin
   elsif p_target_type = 'message' then
     -- Xabar ustidan faqat shu yozishma ishtirokchisi shikoyat qila oladi
     select m.sender_id, left(m.text, 80) into v_owner, v_label from messages m where m.id = p_target_id;
-    if v_owner is not null then
-      select k.* into v_k from contracts k join messages m on m.contract_id = k.id where m.id = p_target_id;
-      if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_ALLOWED'; end if;
+    if v_owner is not null and not exists (
+      select 1 from messages m
+        left join contracts k on k.id = m.contract_id
+        left join proposals pr on pr.id = m.proposal_id
+        left join jobs jb on jb.id = pr.job_id
+       where m.id = p_target_id and v_uid in (k.client_id, k.provider_id, pr.provider_id, jb.client_id)) then
+      raise exception 'NOT_ALLOWED';
     end if;
   else
     raise exception 'INVALID_INPUT';
@@ -3709,4 +3716,112 @@ from public, anon, authenticated;
 
 grant execute on function public.get_my_notifications(), public.get_unread_notifications(),
   public.mark_notifications_read()
+to authenticated;
+
+
+-- ===== taklif bo'yicha chat (yollashdan oldin) =====
+-- Mijoz ustani tanlashdan oldin unga savol bera oladi (Upwork'dagi kabi). Xabar taklifga bog'lanadi;
+-- taklif qabul qilinsa, shu yozishma shartnoma chatida davom etadi (get_messages ikkalasini qaytaradi).
+alter table public.messages add column if not exists proposal_id uuid references public.proposals (id) on delete cascade;
+alter table public.messages alter column contract_id drop not null;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'messages_target_check') then
+    alter table public.messages add constraint messages_target_check check (contract_id is not null or proposal_id is not null);
+  end if;
+end $$;
+create index if not exists messages_proposal_idx on public.messages (proposal_id, created_at) where proposal_id is not null;
+
+-- Taklif ishtirokchisini tekshiradi: usta yoki e'lon egasi. Qaytaradi: (usta, mijoz)
+create or replace function public._proposal_parties(p_proposal_id uuid, out provider_id uuid, out client_id uuid, out status text)
+language sql stable security definer set search_path = public as $$
+  select p.provider_id, j.client_id, p.status from proposals p join jobs j on j.id = p.job_id where p.id = p_proposal_id;
+$$;
+
+revoke execute on function public._proposal_parties(uuid) from public, anon, authenticated;
+
+create or replace function public.send_proposal_message(p_proposal_id uuid, p_text text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_pp record;
+  v_text text := btrim(coalesce(p_text, ''));
+  v_id uuid;
+  v_created timestamptz;
+begin
+  if char_length(v_text) < 1 or char_length(v_text) > 1000 then raise exception 'INVALID_MESSAGE'; end if;
+  select * into v_pp from _proposal_parties(p_proposal_id);
+  if v_pp.provider_id is null then raise exception 'NOT_FOUND'; end if;
+  if v_uid <> v_pp.provider_id and v_uid <> v_pp.client_id then raise exception 'NOT_ALLOWED'; end if;
+  -- Rad etilgan yoki qaytarib olingan taklif bo'yicha yozishma yopiq
+  if v_pp.status not in ('submitted', 'accepted') then raise exception 'CHAT_CLOSED'; end if;
+  if _blocked(v_pp.provider_id, v_pp.client_id) then raise exception 'USER_BLOCKED'; end if;
+
+  insert into messages (proposal_id, sender_id, text) values (p_proposal_id, v_uid, v_text)
+  returning id, created_at into v_id, v_created;
+  return jsonb_build_object('id', v_id, 'sender_id', v_uid, 'text', v_text, 'created_at', v_created, 'read_at', null);
+end;
+$$;
+
+create or replace function public.get_proposal_messages(p_proposal_id uuid, p_after timestamptz default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_pp record;
+begin
+  select * into v_pp from _proposal_parties(p_proposal_id);
+  if v_pp.provider_id is null then raise exception 'NOT_FOUND'; end if;
+  if v_uid <> v_pp.provider_id and v_uid <> v_pp.client_id then raise exception 'NOT_ALLOWED'; end if;
+  return coalesce((
+    select jsonb_agg(jsonb_build_object('id', m.id, 'sender_id', m.sender_id, 'text', m.text,
+                                        'created_at', m.created_at, 'read_at', m.read_at) order by m.created_at asc)
+    from messages m
+    where m.proposal_id = p_proposal_id and (p_after is null or m.created_at > p_after)
+  ), '[]'::jsonb);
+end;
+$$;
+
+create or replace function public.mark_proposal_messages_read(p_proposal_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_pp record;
+begin
+  select * into v_pp from _proposal_parties(p_proposal_id);
+  if v_pp.provider_id is null then raise exception 'NOT_FOUND'; end if;
+  if v_uid <> v_pp.provider_id and v_uid <> v_pp.client_id then raise exception 'NOT_ALLOWED'; end if;
+  update messages set read_at = now()
+   where proposal_id = p_proposal_id and sender_id <> v_uid and read_at is null;
+end;
+$$;
+
+-- Yangi xabar: shartnoma yoki taklif chati — qarshi tomonga bildirishnoma
+create or replace function public.notify_new_message()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_recipient uuid;
+  v_sender_name text;
+  v_link text;
+  v_pp record;
+begin
+  if new.contract_id is not null then
+    select case when client_id = new.sender_id then provider_id else client_id end
+      into v_recipient from contracts where id = new.contract_id;
+    v_link := '/chat/' || new.contract_id;
+  else
+    select * into v_pp from _proposal_parties(new.proposal_id);
+    v_recipient := case when new.sender_id = v_pp.client_id then v_pp.provider_id else v_pp.client_id end;
+    v_link := '/proposal-chat/' || new.proposal_id;
+  end if;
+  select full_name into v_sender_name from profiles where id = new.sender_id;
+  perform queue_notification(v_recipient, format(E'\U0001F4AC %s: %s', v_sender_name, left(new.text, 200)), v_link);
+  return new;
+end;
+$$;
+
+revoke execute on function public.send_proposal_message(uuid, text), public.get_proposal_messages(uuid, timestamptz),
+  public.mark_proposal_messages_read(uuid)
+from public, anon, authenticated;
+
+grant execute on function public.send_proposal_message(uuid, text), public.get_proposal_messages(uuid, timestamptz),
+  public.mark_proposal_messages_read(uuid)
 to authenticated;

@@ -115,7 +115,9 @@ begin
   v_is_party := v_is_client or (v_contract.id is not null and v_contract.provider_id = v_uid);
 
   select jsonb_build_object('id', p.id, 'price', p.price, 'message', p.message,
-                            'status', p.status, 'created_at', p.created_at)
+                            'status', p.status, 'created_at', p.created_at,
+                            'unread', (select count(*) from messages m
+                                        where m.proposal_id = p.id and m.sender_id <> v_uid and m.read_at is null))
     into v_my_proposal
     from proposals p where p.job_id = p_job_id and p.provider_id = v_uid;
 
