@@ -71,6 +71,7 @@ begin
         'id', j.id, 'title', j.title, 'description', left(j.description, 240),
         'category', j.category, 'district', j.district, 'budget', j.budget,
         'urgency', j.urgency, 'created_at', j.created_at, 'has_photo', j.has_photo,
+        'crew_needed', j.crew_needed,
         'lat', j.approx_lat, 'lng', j.approx_lng,
         'proposals_count', (select count(*) from proposals p where p.job_id = j.id and p.status = 'submitted'),
         'has_applied', exists (select 1 from proposals p where p.job_id = j.id and p.provider_id = v_uid),
@@ -130,6 +131,7 @@ begin
     'urgency', v_job.urgency, 'status', v_job.status, 'created_at', v_job.created_at,
     'has_photo', v_job.has_photo,
     'photos', _job_photos(v_job.id),
+    'crew_needed', v_job.crew_needed,
     'is_mine', v_is_client,
     'address', case when v_is_party then v_addr.address end,
     'location', case

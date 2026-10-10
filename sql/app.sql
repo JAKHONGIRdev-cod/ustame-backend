@@ -562,12 +562,15 @@ begin
       'id', x.id, 'price', x.price, 'message', x.message, 'status', x.status, 'created_at', x.created_at,
       'eta_minutes', x.eta_minutes, 'score', round(x.score),
       'recommended', x.status = 'submitted' and x.rank <= 3,
-      'provider', x.provider
+      'provider', x.provider,
+      'team', (select jsonb_build_object('id', t.id, 'name', t.name, 'kind', t.kind, 'size', t.size,
+                                         'stats', team_stats(t.id))
+               from teams t where t.id = x.team_id)
     ) order by (x.status = 'submitted') desc, x.score desc, x.created_at asc)
     from (
       select y.*, rank() over (partition by y.status = 'submitted' order by y.score desc, y.created_at) as rank
       from (
-        select p.id, p.price, p.message, p.status, p.created_at, p.eta_minutes,
+        select p.id, p.price, p.message, p.status, p.created_at, p.eta_minutes, p.team_id,
           jsonb_build_object('id', pr.id, 'full_name', pr.full_name, 'headline', pp.headline,
                              'experience_years', pp.experience_years, 'stats', st.s) as provider,
           coalesce((st.s->>'avg_rating')::numeric, 4.0) * 20
@@ -575,6 +578,7 @@ begin
             - (st.s->>'withdrawals')::int * 10
             - (st.s->>'disputes_lost')::int * 15
             + (coalesce((st.s->>'on_time_rate')::numeric, 85) - 85) * 0.4
+            + case when p.team_id is not null and (select crew_needed from jobs where id = p_job_id) then 15 else 0 end
             + case when p.eta_minutes is not null then greatest(0, 30 - p.eta_minutes / 2.0) else 0 end
             + 20.0 * min(p.price) filter (where p.status = 'submitted') over () / p.price
             as score
@@ -622,8 +626,8 @@ begin
   if not is_approved_provider(v_p.provider_id) then raise exception 'PROVIDER_NOT_AVAILABLE'; end if;
   if _blocked(v_uid, v_p.provider_id) then raise exception 'USER_BLOCKED'; end if;
 
-  insert into contracts (job_id, proposal_id, client_id, provider_id, price)
-  values (v_job.id, v_p.id, v_uid, v_p.provider_id, v_p.price)
+  insert into contracts (job_id, proposal_id, client_id, provider_id, price, team_id)
+  values (v_job.id, v_p.id, v_uid, v_p.provider_id, v_p.price, v_p.team_id)
   returning id into v_contract_id;
 
   update proposals set status = 'accepted', updated_at = now() where id = v_p.id;
@@ -671,13 +675,18 @@ $$;
 
 -- p_eta_minutes — "qancha vaqtda yetib boraman" (shoshilinch e'lonlarda tavsiya tartibiga ta'sir qiladi)
 drop function if exists public.submit_proposal(uuid, int, text);
-create or replace function public.submit_proposal(p_job_id uuid, p_price int, p_message text, p_eta_minutes int default null)
+drop function if exists public.submit_proposal(uuid, int, text, int);
+-- p_as_team: brigada boshlig'i taklifni o'z brigadasi nomidan yuboradi
+create or replace function public.submit_proposal(
+  p_job_id uuid, p_price int, p_message text, p_eta_minutes int default null, p_as_team boolean default false
+)
 returns uuid language plpgsql security definer set search_path = public as $$
 declare
   v_uid uuid := require_uid();
   v_job jobs;
   v_existing proposals;
   v_id uuid;
+  v_team uuid;
 begin
   if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
   if p_price is null or p_price not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
@@ -689,6 +698,10 @@ begin
   if v_job.client_id = v_uid then raise exception 'OWN_JOB'; end if;
   if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
   if _blocked(v_uid, v_job.client_id) then raise exception 'USER_BLOCKED'; end if;
+  if coalesce(p_as_team, false) then
+    select id into v_team from teams where owner_id = v_uid and status = 'approved';
+    if v_team is null then raise exception 'TEAM_NOT_APPROVED'; end if;
+  end if;
 
   select * into v_existing from proposals where job_id = p_job_id and provider_id = v_uid for update;
   if found then
@@ -698,13 +711,13 @@ begin
     end if;
     update proposals
        set price = p_price, message = btrim(coalesce(p_message, '')), status = 'submitted',
-           eta_minutes = p_eta_minutes, created_at = now(), updated_at = now()
+           eta_minutes = p_eta_minutes, team_id = v_team, created_at = now(), updated_at = now()
      where id = v_existing.id;
     return v_existing.id;
   end if;
 
-  insert into proposals (job_id, provider_id, price, message, eta_minutes)
-  values (p_job_id, v_uid, p_price, btrim(coalesce(p_message, '')), p_eta_minutes)
+  insert into proposals (job_id, provider_id, price, message, eta_minutes, team_id)
+  values (p_job_id, v_uid, p_price, btrim(coalesce(p_message, '')), p_eta_minutes, v_team)
   returning id into v_id;
   return v_id;
 end;
@@ -790,6 +803,7 @@ begin
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
     'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
+    'team', (select jsonb_build_object('id', t.id, 'name', t.name, 'kind', t.kind) from teams t where t.id = v_k.team_id),
     'staged', v_k.staged,
     'stages', case when v_k.staged then _stages_json(v_k.id) else '[]'::jsonb end,
     'stage_plan', case when v_k.stage_plan is not null
@@ -999,7 +1013,7 @@ grant execute on function
   public.decline_proposal(uuid),
   public.accept_proposal(uuid),
   public.find_jobs(text, text, text, int, int),
-  public.submit_proposal(uuid, int, text, int),
+  public.submit_proposal(uuid, int, text, int, boolean),
   public.withdraw_proposal(uuid),
   public.get_my_proposals(),
   public.get_my_contracts(text),
@@ -1894,6 +1908,7 @@ begin
                              and not exists (select 1 from proposals p where p.job_id = j.id and p.status = 'submitted')),
     'blocked_users',       (select count(*) from users where blocked_at is not null and deleted_at is null),
     'open_reports',        (select count(*) from reports where status = 'open'),
+    'pending_teams',       (select count(*) from teams where status = 'pending'),
     'total_users',         (select count(*) from profiles),
     'total_providers',     (select count(*) from provider_profiles where status = 'approved'),
     'open_jobs',           (select count(*) from jobs where status = 'open'),
@@ -2226,6 +2241,8 @@ begin
   delete from job_addresses where job_id in (select id from jobs where client_id = v_uid);
   delete from favorites where client_id = v_uid or provider_id = v_uid;
   delete from user_blocks where blocker_id = v_uid or blocked_id = v_uid;
+  delete from teams where owner_id = v_uid;
+  delete from team_members where user_id = v_uid;
   delete from job_invites where client_id = v_uid or provider_id = v_uid;
   delete from provider_profiles where user_id = v_uid;
   update users set
@@ -3248,3 +3265,374 @@ grant execute on function public.propose_stages(uuid, jsonb), public.decide_stag
 to authenticated;
 
 grant execute on function public.admin_get_payments() to authenticated;
+
+
+-- ===== brigadalar va usta-kompaniyalar =====
+-- Brigada (yoki usta-kompaniya) — tasdiqlangan usta (boshliq) tuzadi va boshqa ustalarni telefon raqami
+-- orqali taklif qiladi. Admin tasdiqlagach brigada katalogda ko'rinadi va boshliq takliflarni brigada nomidan
+-- yuboradi. Mijoz e'longa "brigada kerak" belgisini qo'ysa, mos brigadalarga darhol xabar boradi.
+-- Bir usta bir vaqtda faqat bitta brigadada bo'ladi.
+create table if not exists public.teams (
+  id               uuid primary key default gen_random_uuid(),
+  owner_id         uuid not null unique references public.users (id) on delete cascade,
+  kind             text not null default 'brigade' check (kind in ('brigade', 'company')),
+  name             text not null check (char_length(name) between 3 and 60),
+  description      text not null default '' check (char_length(description) <= 1000),
+  size             int not null default 2 check (size between 2 and 200),
+  categories       text[] not null check (cardinality(categories) between 1 and 6),
+  districts        text[] not null check (cardinality(districts) between 1 and 12),
+  status           text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  rejection_reason text,
+  created_at       timestamptz not null default now(),
+  reviewed_at      timestamptz
+);
+
+create table if not exists public.team_members (
+  team_id    uuid not null references public.teams (id) on delete cascade,
+  user_id    uuid not null references public.users (id) on delete cascade,
+  status     text not null default 'invited' check (status in ('invited', 'active')),
+  created_at timestamptz not null default now(),
+  joined_at  timestamptz,
+  primary key (team_id, user_id)
+);
+
+create unique index if not exists team_members_one_active on public.team_members (user_id) where status = 'active';
+create index if not exists team_members_user_idx on public.team_members (user_id);
+
+alter table public.teams enable row level security;
+alter table public.team_members enable row level security;
+
+alter table public.proposals add column if not exists team_id uuid references public.teams (id) on delete set null;
+alter table public.contracts add column if not exists team_id uuid references public.teams (id) on delete set null;
+alter table public.jobs add column if not exists crew_needed boolean not null default false;
+
+create or replace function public.team_stats(p_team_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  with c as (
+    select count(*) filter (where status = 'completed') as completed,
+           count(*) filter (where status = 'cancelled' and cancelled_by = 'provider') as withdrawals
+    from contracts where team_id = p_team_id
+  ),
+  r as (
+    select count(*) as cnt, round(avg(rv.rating)::numeric, 1) as avg
+    from reviews rv join contracts k on k.id = rv.contract_id
+    where k.team_id = p_team_id and rv.reviewee_id = k.provider_id
+  )
+  select jsonb_build_object(
+    'completed_jobs', c.completed,
+    'withdrawals',    c.withdrawals,
+    'reviews_count',  r.cnt,
+    'avg_rating',     r.avg,
+    'members',        (select count(*) from team_members m where m.team_id = p_team_id and m.status = 'active')
+  )
+  from c, r;
+$$;
+
+-- Brigada a'zolari (boshliq birinchi)
+create or replace function public._team_members_json(p_team_id uuid, p_with_invited boolean)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', p.id, 'full_name', p.full_name, 'avatar_updated_at', p.avatar_updated_at,
+    'headline', pp.headline, 'status', m.status, 'is_owner', p.id = t.owner_id,
+    'stats', provider_stats(p.id)
+  ) order by p.id = t.owner_id desc, m.status, m.joined_at nulls last, m.created_at), '[]'::jsonb)
+  from team_members m
+  join teams t on t.id = m.team_id
+  join profiles p on p.id = m.user_id
+  left join provider_profiles pp on pp.user_id = m.user_id
+  where m.team_id = p_team_id and (p_with_invited or m.status = 'active');
+$$;
+
+revoke execute on function public._team_members_json(uuid, boolean) from public, anon, authenticated;
+
+create or replace function public.save_team(
+  p_kind text, p_name text, p_description text, p_size int, p_categories text[], p_districts text[]
+)
+returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_team teams;
+  v_name text := btrim(coalesce(p_name, ''));
+  r record;
+begin
+  if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
+  if coalesce(p_kind, '') not in ('brigade', 'company') then raise exception 'INVALID_INPUT'; end if;
+  if char_length(v_name) not between 3 and 60 then raise exception 'INVALID_NAME'; end if;
+  if char_length(coalesce(p_description, '')) > 1000 then raise exception 'INVALID_BIO'; end if;
+  if p_size is null or p_size not between 2 and 200 then raise exception 'INVALID_INPUT'; end if;
+  if coalesce(cardinality(p_categories), 0) not between 1 and 6 then raise exception 'INVALID_CATEGORIES'; end if;
+  if coalesce(cardinality(p_districts), 0) not between 1 and 12 then raise exception 'INVALID_DISTRICTS'; end if;
+
+  select * into v_team from teams where owner_id = v_uid for update;
+  if not found then
+    -- Boshqa brigada a'zosi o'z brigadasini tuza olmaydi (avval chiqishi kerak)
+    if exists (select 1 from team_members where user_id = v_uid and status = 'active') then
+      raise exception 'ALREADY_IN_TEAM';
+    end if;
+    insert into teams (owner_id, kind, name, description, size, categories, districts)
+    values (v_uid, p_kind, v_name, btrim(coalesce(p_description, '')), p_size, p_categories, p_districts)
+    returning * into v_team;
+    insert into team_members (team_id, user_id, status, joined_at) values (v_team.id, v_uid, 'active', now());
+    -- Boshliqning boshqa brigadalardan kelgan takliflari endi kerak emas
+    delete from team_members where user_id = v_uid and status = 'invited';
+    for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+      perform queue_notification(r.id, format(E'\U0001F477 Yangi %s arizasi: "%s".',
+        case when p_kind = 'company' then 'usta-kompaniya' else 'brigada' end, v_name), '/admin/teams');
+    end loop;
+  else
+    update teams set
+      kind = p_kind, name = v_name, description = btrim(coalesce(p_description, '')), size = p_size,
+      categories = p_categories, districts = p_districts,
+      status = case when status = 'rejected' then 'pending' else status end,
+      rejection_reason = case when status = 'rejected' then null else rejection_reason end
+    where id = v_team.id
+    returning * into v_team;
+  end if;
+  return v_team.status;
+end;
+$$;
+
+-- Mening brigadam: o'zim boshliq yoki a'zo bo'lgan brigada + menga kelgan takliflar
+create or replace function public.get_my_team()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_team teams;
+begin
+  select t.* into v_team from teams t
+    join team_members m on m.team_id = t.id
+   where m.user_id = v_uid and m.status = 'active';
+  return jsonb_build_object(
+    'team', case when v_team.id is not null then jsonb_build_object(
+      'id', v_team.id, 'kind', v_team.kind, 'name', v_team.name, 'description', v_team.description,
+      'size', v_team.size, 'categories', v_team.categories, 'districts', v_team.districts,
+      'status', v_team.status, 'rejection_reason', v_team.rejection_reason,
+      'is_owner', v_team.owner_id = v_uid,
+      'members', _team_members_json(v_team.id, v_team.owner_id = v_uid),
+      'stats', team_stats(v_team.id)) end,
+    'invites', coalesce((
+      select jsonb_agg(jsonb_build_object('team_id', t.id, 'name', t.name, 'kind', t.kind,
+                                          'owner_name', o.full_name, 'created_at', m.created_at)
+                       order by m.created_at desc)
+      from team_members m join teams t on t.id = m.team_id join profiles o on o.id = t.owner_id
+      where m.user_id = v_uid and m.status = 'invited'), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- Boshliq ustani telefon raqami orqali brigadaga taklif qiladi
+create or replace function public.invite_team_member(p_phone text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_team teams;
+  v_digits text := regexp_replace(coalesce(p_phone, ''), '\D', '', 'g');
+  v_user uuid;
+begin
+  select * into v_team from teams where owner_id = v_uid;
+  if not found then raise exception 'NOT_ALLOWED'; end if;
+  if char_length(v_digits) = 9 then v_digits := '998' || v_digits; end if;
+  if char_length(v_digits) <> 12 then raise exception 'INVALID_PHONE'; end if;
+  select id into v_user from users where phone = v_digits and deleted_at is null and blocked_at is null;
+  if v_user is null then raise exception 'USER_NOT_FOUND'; end if;
+  if v_user = v_uid or exists (select 1 from team_members where team_id = v_team.id and user_id = v_user) then
+    raise exception 'ALREADY_IN_TEAM';
+  end if;
+  if not is_approved_provider(v_user) then raise exception 'MEMBER_NOT_PROVIDER'; end if;
+  if exists (select 1 from team_members where user_id = v_user and status = 'active') then
+    raise exception 'ALREADY_IN_TEAM';
+  end if;
+  if (select count(*) from team_members where team_id = v_team.id) >= 50 then raise exception 'TEAM_FULL'; end if;
+
+  insert into team_members (team_id, user_id) values (v_team.id, v_user);
+  perform queue_notification(v_user, format(E'\U0001F477 "%s" %s sizni a''zo bo''lishga taklif qildi. Ilovada qabul qiling yoki rad eting.',
+    v_team.name, case when v_team.kind = 'company' then 'usta-kompaniyasi' else 'brigadasi' end), '/my-team');
+end;
+$$;
+
+create or replace function public.respond_team_invite(p_team_id uuid, p_accept boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_team teams;
+  v_name text;
+begin
+  if not exists (select 1 from team_members where team_id = p_team_id and user_id = v_uid and status = 'invited') then
+    raise exception 'NOT_FOUND';
+  end if;
+  select * into v_team from teams where id = p_team_id;
+  select full_name into v_name from profiles where id = v_uid;
+  if p_accept then
+    if exists (select 1 from team_members where user_id = v_uid and status = 'active') then
+      raise exception 'ALREADY_IN_TEAM';
+    end if;
+    update team_members set status = 'active', joined_at = now() where team_id = p_team_id and user_id = v_uid;
+    -- Boshqa takliflar endi kerak emas
+    delete from team_members where user_id = v_uid and status = 'invited';
+    perform queue_notification(v_team.owner_id, format(E'✅ %s "%s" ga qo''shildi.', v_name, v_team.name), '/my-team');
+  else
+    delete from team_members where team_id = p_team_id and user_id = v_uid;
+    perform queue_notification(v_team.owner_id, format(E'❌ %s "%s" ga taklifni rad etdi.', v_name, v_team.name), '/my-team');
+  end if;
+end;
+$$;
+
+-- Boshliq a'zoni chiqaradi yoki a'zo o'zi chiqib ketadi
+create or replace function public.remove_team_member(p_user_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_m team_members;
+  v_team teams;
+begin
+  select * into v_m from team_members where user_id = p_user_id
+     and team_id = coalesce((select id from teams where owner_id = v_uid),
+                            (select team_id from team_members where user_id = v_uid and status = 'active'));
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_team from teams where id = v_m.team_id;
+  if p_user_id = v_team.owner_id then raise exception 'NOT_ALLOWED'; end if;
+  if v_uid <> v_team.owner_id and v_uid <> p_user_id then raise exception 'NOT_ALLOWED'; end if;
+  delete from team_members where team_id = v_m.team_id and user_id = p_user_id;
+  if v_uid = v_team.owner_id then
+    perform queue_notification(p_user_id, format(E'"%s" a''zoligingiz tugatildi.', v_team.name), '/my-team');
+  else
+    perform queue_notification(v_team.owner_id, format(E'%s "%s" dan chiqdi.',
+      (select full_name from profiles where id = v_uid), v_team.name), '/my-team');
+  end if;
+end;
+$$;
+
+create or replace function public.delete_my_team()
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  delete from teams where owner_id = v_uid;
+  if not found then raise exception 'NOT_FOUND'; end if;
+end;
+$$;
+
+-- Brigadaning ommaviy sahifasi (tasdiqlangan; boshliq o'z brigadasini har doim ko'radi)
+create or replace function public.get_team(p_team_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_team teams;
+begin
+  select * into v_team from teams where id = p_team_id;
+  if not found or (v_team.status <> 'approved' and v_team.owner_id <> v_uid) then raise exception 'NOT_FOUND'; end if;
+  return jsonb_build_object(
+    'id', v_team.id, 'kind', v_team.kind, 'name', v_team.name, 'description', v_team.description,
+    'size', v_team.size, 'categories', v_team.categories, 'districts', v_team.districts,
+    'status', v_team.status, 'created_at', v_team.created_at,
+    'owner', (select jsonb_build_object('id', p.id, 'full_name', p.full_name) from profiles p where p.id = v_team.owner_id),
+    'members', _team_members_json(v_team.id, false),
+    'stats', team_stats(v_team.id)
+  );
+end;
+$$;
+
+create or replace function public.search_teams(
+  p_category text default null, p_district text default null, p_limit int default 30, p_offset int default 0
+)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  return coalesce((
+    select jsonb_agg(x.item order by (x.item->'stats'->>'completed_jobs')::int desc,
+                                     (x.item->'stats'->>'avg_rating')::numeric desc nulls last, x.created_at desc)
+    from (
+      select t.created_at, jsonb_build_object(
+        'id', t.id, 'kind', t.kind, 'name', t.name, 'description', left(t.description, 200), 'size', t.size,
+        'categories', t.categories, 'districts', t.districts,
+        'owner', jsonb_build_object('id', o.id, 'full_name', o.full_name),
+        'stats', team_stats(t.id)
+      ) as item
+      from teams t join profiles o on o.id = t.owner_id
+      where t.status = 'approved'
+        and is_approved_provider(t.owner_id)
+        and not _blocked(v_uid, t.owner_id)
+        and (p_category is null or p_category = any (t.categories))
+        and (p_district is null or p_district = any (t.districts))
+      order by t.created_at desc
+      limit least(greatest(coalesce(p_limit, 30), 1), 50) offset greatest(coalesce(p_offset, 0), 0)
+    ) x
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Mijoz: e'longa "brigada kerak" belgisi. Yoqilganda mos tasdiqlangan brigadalarga darhol xabar boradi.
+create or replace function public.set_job_crew(p_job_id uuid, p_needed boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_job jobs;
+  r record;
+begin
+  select * into v_job from jobs where id = p_job_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_job.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+  update jobs set crew_needed = coalesce(p_needed, false) where id = p_job_id;
+  if coalesce(p_needed, false) and not v_job.crew_needed then
+    for r in select t.owner_id from teams t
+              where t.status = 'approved' and v_job.category = any (t.categories) and v_job.district = any (t.districts)
+                and is_approved_provider(t.owner_id) and not _blocked(t.owner_id, v_uid)
+    loop
+      perform queue_notification(r.owner_id, format(E'\U0001F477 Brigada kerak: "%s" (%s, %s). Brigadangiz nomidan taklif yuboring.',
+        v_job.title, v_job.category, v_job.district), '/job/' || p_job_id);
+    end loop;
+  end if;
+end;
+$$;
+
+-- Admin: tasdiq kutayotgan brigadalar
+create or replace function public.admin_get_pending_teams()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', t.id, 'kind', t.kind, 'name', t.name, 'description', t.description, 'size', t.size,
+      'categories', t.categories, 'districts', t.districts, 'created_at', t.created_at,
+      'owner', (select jsonb_build_object('id', u.id, 'full_name', u.full_name, 'phone', u.phone,
+                                          'stats', provider_stats(u.id)) from users u where u.id = t.owner_id),
+      'members', _team_members_json(t.id, true)
+    ) order by t.created_at)
+    from teams t where t.status = 'pending'
+  ), '[]'::jsonb);
+end;
+$$;
+
+create or replace function public.admin_review_team(p_team_id uuid, p_approve boolean, p_reason text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_team teams;
+begin
+  perform require_admin();
+  if not p_approve and char_length(btrim(coalesce(p_reason, ''))) < 3 then raise exception 'REASON_REQUIRED'; end if;
+  update teams set status = case when p_approve then 'approved' else 'rejected' end,
+                   rejection_reason = case when p_approve then null else left(btrim(p_reason), 500) end,
+                   reviewed_at = now()
+   where id = p_team_id and status = 'pending'
+  returning * into v_team;
+  if not found then raise exception 'INVALID_STATE'; end if;
+  perform queue_notification(v_team.owner_id,
+    case when p_approve
+      then format(E'✅ "%s" tasdiqlandi — endi katalogda ko''rinasiz va brigada nomidan taklif yubora olasiz.', v_team.name)
+      else format(E'❌ "%s" rad etildi. Sabab: %s', v_team.name, btrim(p_reason))
+    end, '/my-team');
+end;
+$$;
+
+revoke execute on function public.team_stats(uuid), public.save_team(text, text, text, int, text[], text[]),
+  public.get_my_team(), public.invite_team_member(text), public.respond_team_invite(uuid, boolean),
+  public.remove_team_member(uuid), public.delete_my_team(), public.get_team(uuid),
+  public.search_teams(text, text, int, int), public.set_job_crew(uuid, boolean),
+  public.admin_get_pending_teams(), public.admin_review_team(uuid, boolean, text)
+from public, anon, authenticated;
+
+grant execute on function public.team_stats(uuid), public.save_team(text, text, text, int, text[], text[]),
+  public.get_my_team(), public.invite_team_member(text), public.respond_team_invite(uuid, boolean),
+  public.remove_team_member(uuid), public.delete_my_team(), public.get_team(uuid),
+  public.search_teams(text, text, int, int), public.set_job_crew(uuid, boolean),
+  public.admin_get_pending_teams(), public.admin_review_team(uuid, boolean, text)
+to authenticated;
