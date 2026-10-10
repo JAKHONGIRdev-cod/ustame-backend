@@ -3636,3 +3636,77 @@ grant execute on function public.team_stats(uuid), public.save_team(text, text, 
   public.search_teams(text, text, int, int), public.set_job_crew(uuid, boolean),
   public.admin_get_pending_teams(), public.admin_review_team(uuid, boolean, text)
 to authenticated;
+
+
+-- ===== ilova ichidagi bildirishnomalar =====
+-- notification_outbox'dagi xabarlar (push/Telegram'ga ketganlari ham) ilovada ro'yxat bo'lib ko'rinadi.
+do $$ begin
+  if not exists (select 1 from information_schema.columns
+                 where table_schema = 'public' and table_name = 'notification_outbox' and column_name = 'read_at') then
+    alter table public.notification_outbox add column read_at timestamptz;
+    -- Bu ustun qo'shilishidan oldingi xabarlar o'qilgan hisoblanadi (birinchi ochilishda 100 ta "yangi" chiqmasin)
+    update public.notification_outbox set read_at = now();
+  end if;
+end $$;
+
+create index if not exists notification_outbox_user_idx on public.notification_outbox (user_id, created_at desc);
+
+create or replace function public.get_my_notifications()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('id', n.id, 'message', n.message, 'link', n.link,
+                                               'created_at', n.created_at, 'read', n.read_at is not null)
+                            order by n.created_at desc), '[]'::jsonb)
+  from (select * from notification_outbox
+         where user_id = auth.uid() and created_at > now() - interval '30 days'
+         order by created_at desc limit 100) n;
+$$;
+
+create or replace function public.get_unread_notifications()
+returns int language sql stable security definer set search_path = public as $$
+  select count(*)::int from notification_outbox
+   where user_id = auth.uid() and read_at is null and created_at > now() - interval '30 days';
+$$;
+
+create or replace function public.mark_notifications_read()
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  update notification_outbox set read_at = now() where user_id = v_uid and read_at is null;
+end;
+$$;
+
+-- ===== yangi e'lon — mos ustalarga xabar =====
+-- Shoshilinch e'lonlar notify_urgent_job orqali ketadi; qolganlari — kasbi va tumani mos tasdiqlangan
+-- ustalarga. Spam bo'lmasin: ustaga kuniga ko'pi bilan 10 ta shunday xabar.
+create or replace function public.notify_new_job()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare r record;
+begin
+  if new.status <> 'open' or new.urgency = 'urgent' then return new; end if;
+  for r in
+    select pp.user_id from provider_profiles pp
+     where pp.status = 'approved' and pp.user_id <> new.client_id
+       and new.category = any (pp.categories) and new.district = any (pp.districts)
+       and not _blocked(pp.user_id, new.client_id)
+       and (select count(*) from notification_outbox o
+             where o.user_id = pp.user_id and o.created_at > now() - interval '24 hours'
+               and o.message like E'\U0001F195%') < 10
+  loop
+    perform queue_notification(r.user_id, format(E'\U0001F195 Yangi e''lon: "%s" (%s, %s). Narxingizni taklif qiling.',
+      new.title, new.category, new.district), '/job/' || new.id);
+  end loop;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_notify_new_job on public.jobs;
+create trigger trg_notify_new_job after insert on public.jobs
+for each row execute function public.notify_new_job();
+
+revoke execute on function public.get_my_notifications(), public.get_unread_notifications(),
+  public.mark_notifications_read()
+from public, anon, authenticated;
+
+grant execute on function public.get_my_notifications(), public.get_unread_notifications(),
+  public.mark_notifications_read()
+to authenticated;
