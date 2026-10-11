@@ -82,6 +82,9 @@ create table if not exists public.provider_profiles (
   reviewed_at      timestamptz
 );
 
+-- Admin ustaning shaxsini (pasport/ID) ko'rib tasdiqlagan vaqt — profilda "Shaxsi tasdiqlangan" belgisi
+alter table public.provider_profiles add column if not exists id_verified_at timestamptz;
+
 create table if not exists public.jobs (
   id          uuid primary key default gen_random_uuid(),
   client_id   uuid not null references public.users (id) on delete cascade,
@@ -261,8 +264,16 @@ returns jsonb language sql stable security definer set search_path = public as $
       count(*) filter (where dispute_resolution = 'client')                               as disputes_lost,
       -- O'z vaqtida: aytgan vaqtidan 15 daqiqagacha kechikish kechiriladi
       count(*) filter (where eta_at is not null and arrived_at is not null)               as arrivals,
-      count(*) filter (where eta_at is not null and arrived_at <= eta_at + interval '15 minutes') as on_time
+      count(*) filter (where eta_at is not null and arrived_at <= eta_at + interval '15 minutes') as on_time,
+      -- Muvaffaqiyatli: yakunlangan, nizoda yutqazilmagan va mijoz bahosi 4+ (yoki baho qo'ymagan)
+      count(*) filter (where status = 'completed' and dispute_resolution is distinct from 'client'
+                         and coalesce((select r2.rating from reviews r2
+                                        where r2.contract_id = contracts.id and r2.reviewer_id = contracts.client_id), 5) >= 4)
+                                                                                          as good
     from contracts where provider_id = p_user_id
+  ),
+  pp as (
+    select status, reviewed_at, id_verified_at from provider_profiles where user_id = p_user_id
   ),
   r as (
     select count(*) as cnt, round(avg(rating)::numeric, 1) as avg
@@ -279,7 +290,15 @@ returns jsonb language sql stable security definer set search_path = public as $
     -- Kamida 3 ta holatdan keyin ko'rsatiladi (bitta tasodif foizni buzmasin)
     'on_time_rate',   case when c.arrivals >= 3 then round(100.0 * c.on_time / c.arrivals) end,
     'reliability',    case when c.completed + c.withdrawals + c.disputes_lost >= 3
-                        then round(100.0 * c.completed / (c.completed + c.withdrawals + c.disputes_lost)) end
+                        then round(100.0 * c.completed / (c.completed + c.withdrawals + c.disputes_lost)) end,
+    -- Upwork'dagi Job Success Score kabi: yakunlangan ishlarning qanchasi muvaffaqiyatli
+    'success_score',  case when c.completed + c.withdrawals + c.disputes_lost >= 3
+                        then round(100.0 * c.good / (c.completed + c.withdrawals + c.disputes_lost)) end,
+    -- Yangi iqtidor: 90 kun ichida tasdiqlangan, 1-4 ta ishni muammosiz va yaxshi baho bilan bajargan
+    'rising',         coalesce((select pp.status = 'approved' and pp.reviewed_at > now() - interval '90 days' from pp)
+                               and c.completed between 1 and 4 and c.withdrawals = 0 and c.disputes_lost = 0
+                               and coalesce(r.avg, 5) >= 4.5, false),
+    'verified',       coalesce((select pp.id_verified_at is not null from pp), false)
   )
   from c, r;
 $$;
@@ -2152,6 +2171,7 @@ begin
     'is_admin', u.is_admin, 'created_at', u.created_at,
     'blocked_at', u.blocked_at, 'block_reason', u.block_reason,
     'provider_status', (select pp.status from provider_profiles pp where pp.user_id = u.id),
+    'provider_verified', (select pp.id_verified_at is not null from provider_profiles pp where pp.user_id = u.id),
     'jobs_count', (select count(*) from jobs j where j.client_id = u.id),
     'contracts_count', (select count(*) from contracts k where k.client_id = u.id or k.provider_id = u.id)
   ) order by u.blocked_at desc nulls last, u.created_at desc), '[]'::jsonb)
@@ -2244,6 +2264,7 @@ begin
   delete from job_addresses where job_id in (select id from jobs where client_id = v_uid);
   delete from favorites where client_id = v_uid or provider_id = v_uid;
   delete from user_blocks where blocker_id = v_uid or blocked_id = v_uid;
+  delete from saved_jobs where user_id = v_uid;
   delete from teams where owner_id = v_uid;
   delete from team_members where user_id = v_uid;
   delete from job_invites where client_id = v_uid or provider_id = v_uid;
@@ -3825,3 +3846,74 @@ from public, anon, authenticated;
 grant execute on function public.send_proposal_message(uuid, text), public.get_proposal_messages(uuid, timestamptz),
   public.mark_proposal_messages_read(uuid)
 to authenticated;
+
+
+-- ===== shaxsi tasdiqlangan usta =====
+-- Admin ustaning pasport/ID'sini (uchrashuvda yoki video qo'ng'iroqda) ko'rib belgilaydi. Hujjat rasmi saqlanmaydi.
+create or replace function public.admin_set_verified(p_user_id uuid, p_verified boolean)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform require_admin();
+  update provider_profiles set id_verified_at = case when p_verified then coalesce(id_verified_at, now()) end
+   where user_id = p_user_id;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if p_verified then
+    perform queue_notification(p_user_id,
+      E'\U0001F6E1 Shaxsingiz tasdiqlandi — profilingizda "Shaxsi tasdiqlangan" belgisi chiqadi.', '/');
+  end if;
+end;
+$$;
+
+revoke execute on function public.admin_set_verified(uuid, boolean) from public, anon, authenticated;
+grant execute on function public.admin_set_verified(uuid, boolean) to authenticated;
+
+
+-- ===== saqlangan e'lonlar (Upwork'dagi Saved jobs) =====
+create table if not exists public.saved_jobs (
+  user_id    uuid not null references public.users (id) on delete cascade,
+  job_id     uuid not null references public.jobs (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, job_id)
+);
+
+alter table public.saved_jobs enable row level security;
+
+-- Saqlash yoki saqlanganlardan olib tashlash; qaytaradi: endi saqlanganmi
+create or replace function public.toggle_saved_job(p_job_id uuid)
+returns boolean language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  delete from saved_jobs where user_id = v_uid and job_id = p_job_id;
+  if found then return false; end if;
+  if not exists (select 1 from jobs where id = p_job_id) then raise exception 'NOT_FOUND'; end if;
+  insert into saved_jobs (user_id, job_id) values (v_uid, p_job_id);
+  return true;
+end;
+$$;
+
+create or replace function public.get_saved_jobs()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', j.id, 'title', j.title, 'description', left(j.description, 240),
+      'category', j.category, 'district', j.district, 'budget', j.budget,
+      'urgency', j.urgency, 'created_at', j.created_at, 'has_photo', j.has_photo,
+      'crew_needed', j.crew_needed, 'status', j.status,
+      'lat', j.approx_lat, 'lng', j.approx_lng,
+      'proposals_count', (select count(*) from proposals p where p.job_id = j.id and p.status = 'submitted'),
+      'has_applied', exists (select 1 from proposals p where p.job_id = j.id and p.provider_id = v_uid),
+      'is_saved', true,
+      'client', jsonb_build_object('full_name', c.full_name, 'stats', client_stats(c.id))
+    ) order by s.created_at desc)
+    from saved_jobs s
+    join jobs j on j.id = s.job_id
+    join profiles c on c.id = j.client_id
+    where s.user_id = v_uid and not _blocked(v_uid, j.client_id)
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function public.toggle_saved_job(uuid), public.get_saved_jobs() from public, anon, authenticated;
+grant execute on function public.toggle_saved_job(uuid), public.get_saved_jobs() to authenticated;

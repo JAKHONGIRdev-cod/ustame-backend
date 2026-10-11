@@ -63,11 +63,18 @@ returns jsonb language plpgsql stable security definer set search_path = public 
 declare
   v_uid uuid := require_uid();
   v_q text := nullif(btrim(coalesce(p_search, '')), '');
+  v_cats text[];
+  v_dists text[];
 begin
+  -- "Sizga mos" (Upwork'dagi Best matches): ustaning kasbi va tumaniga mos e'lonlar birinchi
+  select categories, districts into v_cats, v_dists from provider_profiles where user_id = v_uid;
   return coalesce((
-    select jsonb_agg(row_data order by created_at desc)
+    select jsonb_agg(row_data order by sort_key, created_at desc)
     from (
-      select j.created_at, jsonb_build_object(
+      select j.created_at,
+        (case when j.category = any (coalesce(v_cats, '{}')) then 0 else 2 end)
+          + (case when j.district = any (coalesce(v_dists, '{}')) then 0 else 1 end) as sort_key,
+        jsonb_build_object(
         'id', j.id, 'title', j.title, 'description', left(j.description, 240),
         'category', j.category, 'district', j.district, 'budget', j.budget,
         'urgency', j.urgency, 'created_at', j.created_at, 'has_photo', j.has_photo,
@@ -75,6 +82,8 @@ begin
         'lat', j.approx_lat, 'lng', j.approx_lng,
         'proposals_count', (select count(*) from proposals p where p.job_id = j.id and p.status = 'submitted'),
         'has_applied', exists (select 1 from proposals p where p.job_id = j.id and p.provider_id = v_uid),
+        'is_saved', exists (select 1 from saved_jobs sj where sj.user_id = v_uid and sj.job_id = j.id),
+        'match', j.category = any (coalesce(v_cats, '{}')) and j.district = any (coalesce(v_dists, '{}')),
         'client', jsonb_build_object('full_name', c.full_name, 'stats', client_stats(c.id))
       ) as row_data
       from jobs j join profiles c on c.id = j.client_id
@@ -84,7 +93,7 @@ begin
         and (p_category is null or j.category = p_category)
         and (p_district is null or j.district = p_district)
         and (v_q is null or j.title ilike '%' || v_q || '%' or j.description ilike '%' || v_q || '%')
-      order by j.created_at desc
+      order by 2, j.created_at desc
       limit least(greatest(coalesce(p_limit, 30), 1), 100)
       offset greatest(coalesce(p_offset, 0), 0)
     ) s
