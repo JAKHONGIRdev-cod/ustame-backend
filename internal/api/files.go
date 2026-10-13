@@ -18,7 +18,8 @@ import (
 //   DELETE /api/files?bucket=..&path=..     -> o'chirish
 // Yozish huquqi: avatars/<uid>/avatar.jpg, job-photos/<o'z e'loni id>/photo[-2..4].jpg,
 // portfolio-photos/<uid>/<fayl>, work-photos/<o'z shartnomasi id>/before-1..3.jpg | after-1..3.jpg
-// (faqat usta, shartnoma faol yoki topshirilgan paytda).
+// (faqat usta, shartnoma faol yoki topshirilgan paytda), dispute-photos/<o'z shartnomasi id>/client-1..4.jpg
+// (mijoz) | provider-1..4.jpg (usta) — faqat nizo ochiq paytda.
 
 const (
 	maxFileBytes = 3 << 20
@@ -26,14 +27,19 @@ const (
 )
 
 var (
-	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos"}
+	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos", "dispute-photos"}
 	// E'londa 4 tagacha rasm; nomlar qat'iy (sql/app.sql: _job_photos bilan bir xil)
 	jobPhotoNames = []string{"photo.jpg", "photo-2.jpg", "photo-3.jpg", "photo-4.jpg"}
 	// Ishdan oldin/keyin rasmlari (sql/app.sql: _work_photos bilan bir xil)
 	workPhotoNames = []string{"before-1.jpg", "before-2.jpg", "before-3.jpg", "after-1.jpg", "after-2.jpg", "after-3.jpg"}
-	imageTypes     = []string{"image/jpeg", "image/png", "image/webp"}
-	filePath       = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
-	uuidLike       = regexp.MustCompile(`^[0-9a-f-]{36}$`)
+	// Nizodagi dalil rasmlari, har tomonga 4 tadan (sql/app.sql: _dispute_photos bilan bir xil)
+	disputePhotoNames = map[string][]string{
+		"client":   {"client-1.jpg", "client-2.jpg", "client-3.jpg", "client-4.jpg"},
+		"provider": {"provider-1.jpg", "provider-2.jpg", "provider-3.jpg", "provider-4.jpg"},
+	}
+	imageTypes = []string{"image/jpeg", "image/png", "image/webp"}
+	filePath   = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
+	uuidLike   = regexp.MustCompile(`^[0-9a-f-]{36}$`)
 )
 
 // parsePath "<papka>/<nom>" ni ajratadi; bucket noma'lum yoki format noto'g'ri bo'lsa ok=false.
@@ -75,6 +81,24 @@ func (s *Server) canWrite(r *http.Request, u *user, bucket, folder, name string)
 			return false, nil
 		}
 		return providerID == u.ID && (status == "active" || status == "submitted"), err
+	case "dispute-photos":
+		var clientID, providerID, status string
+		err := s.db.QueryRow(r.Context(), `select client_id::text, provider_id::text, status from contracts where id = $1::uuid`,
+			folder).Scan(&clientID, &providerID, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil || status != "disputed" {
+			return false, err
+		}
+		// Har tomon faqat o'z rasmlarini yozadi/o'chiradi
+		switch u.ID {
+		case clientID:
+			return slices.Contains(disputePhotoNames["client"], name), nil
+		case providerID:
+			return slices.Contains(disputePhotoNames["provider"], name), nil
+		}
+		return false, nil
 	}
 	return false, nil
 }

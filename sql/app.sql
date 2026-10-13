@@ -164,6 +164,20 @@ alter table public.contracts add column if not exists payment_released_at timest
 alter table public.contracts add column if not exists payment_refunded_at timestamptz;
 alter table public.contracts add column if not exists payment_held_amount int;
 
+-- Nizo (Upwork usulida): usta 72 soatda javob beradi, tomonlar kelishadi yoki admin hal qiladi.
+--   payout_amount — nizo bo'yicha ustaga tegadigan summa to'liq emas bo'lsa (qisman qaytarish); null — to'liq
+--   dispute_resolution: provider/client — admin bir tomon foydasiga, split — admin bo'lib berdi,
+--                       settled — tomonlar o'zi kelishdi
+alter table public.contracts add column if not exists payout_amount int;
+alter table public.contracts add column if not exists dispute_response text;
+alter table public.contracts add column if not exists dispute_responded_at timestamptz;
+alter table public.contracts add column if not exists dispute_escalated_at timestamptz;
+alter table public.contracts add column if not exists dispute_escalated_by text;
+alter table public.contracts add column if not exists dispute_note text;
+alter table public.contracts drop constraint if exists contracts_dispute_resolution_check;
+alter table public.contracts add constraint contracts_dispute_resolution_check
+  check (dispute_resolution in ('provider', 'client', 'split', 'settled'));
+
 -- Usta holatlari: yo'lga chiqdi (va qachon yetib borishini aytdi) -> yetib keldi -> ish boshlandi
 alter table public.contracts add column if not exists on_the_way_at timestamptz;
 alter table public.contracts add column if not exists eta_at timestamptz;
@@ -261,12 +275,16 @@ returns jsonb language sql stable security definer set search_path = public as $
     select
       count(*) filter (where status = 'completed')                                        as completed,
       count(*) filter (where status = 'cancelled' and cancelled_by = 'provider')          as withdrawals,
-      count(*) filter (where dispute_resolution = 'client')                               as disputes_lost,
+      -- Yutqazilgan nizo: admin mijoz foydasiga hal qilgan yoki kelishuvda pul to'liq qaytarilgan
+      count(*) filter (where dispute_resolution = 'client'
+                         or (dispute_resolution in ('split', 'settled') and status = 'cancelled'))  as disputes_lost,
       -- O'z vaqtida: aytgan vaqtidan 15 daqiqagacha kechikish kechiriladi
       count(*) filter (where eta_at is not null and arrived_at is not null)               as arrivals,
       count(*) filter (where eta_at is not null and arrived_at <= eta_at + interval '15 minutes') as on_time,
-      -- Muvaffaqiyatli: yakunlangan, nizoda yutqazilmagan va mijoz bahosi 4+ (yoki baho qo'ymagan)
+      -- Muvaffaqiyatli: yakunlangan, nizoda yutqazilmagan, pulning bir qismi qaytarilmagan
+      -- va mijoz bahosi 4+ (yoki baho qo'ymagan)
       count(*) filter (where status = 'completed' and dispute_resolution is distinct from 'client'
+                         and payout_amount is null
                          and coalesce((select r2.rating from reviews r2
                                         where r2.contract_id = contracts.id and r2.reviewer_id = contracts.client_id), 5) >= 4)
                                                                                           as good
@@ -823,6 +841,27 @@ begin
     'cancelled_at', v_k.cancelled_at, 'cancelled_by', v_k.cancelled_by, 'cancel_reason', v_k.cancel_reason,
     'disputed_at', v_k.disputed_at, 'dispute_reason', v_k.dispute_reason,
     'dispute_resolution', v_k.dispute_resolution,
+    -- Nizo jarayoni: ustaning javobi (72 soat), admin'ga o'tganmi, kelishuv takliflari, dalil rasmlari
+    'dispute_amount', case when v_k.status = 'disputed' then _dispute_amount(v_k.id) end,
+    'dispute_response', v_k.dispute_response, 'dispute_responded_at', v_k.dispute_responded_at,
+    'dispute_response_due_at', case when v_k.status = 'disputed' and v_k.dispute_response is null
+                                     and v_k.dispute_escalated_at is null
+                                    then v_k.disputed_at + interval '72 hours' end,
+    'dispute_escalated_at', v_k.dispute_escalated_at, 'dispute_escalated_by', v_k.dispute_escalated_by,
+    'dispute_note', v_k.dispute_note,
+    'payout_amount', v_k.payout_amount,
+    'dispute_photos', case when v_k.disputed_at is not null then _dispute_photos(v_k.id) else '[]'::jsonb end,
+    'dispute_offers', case when v_k.disputed_at is not null then coalesce((
+        select jsonb_agg(jsonb_build_object('id', o.id, 'provider_amount', o.provider_amount, 'note', o.note,
+                                            'status', o.status, 'by_me', o.proposed_by = v_uid,
+                                            'created_at', o.created_at, 'decided_at', o.decided_at)
+                         order by o.created_at)
+        from dispute_offers o where o.contract_id = v_k.id and o.created_at >= v_k.disputed_at), '[]'::jsonb)
+      else '[]'::jsonb end,
+    'revisions', coalesce((
+        select jsonb_agg(jsonb_build_object('stage_id', r.stage_id, 'reason', r.reason, 'created_at', r.created_at)
+                         order by r.created_at)
+        from revision_requests r where r.contract_id = v_k.id), '[]'::jsonb),
     'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
     'team', (select jsonb_build_object('id', t.id, 'name', t.name, 'kind', t.kind) from teams t where t.id = v_k.team_id),
     'staged', v_k.staged,
@@ -918,8 +957,11 @@ begin
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
   if v_k.status not in ('active', 'submitted') then raise exception 'INVALID_STATE'; end if;
+  -- Oldin yopilgan nizoning javobi va natijasi yangisiga o'tmaydi
   update contracts
-     set status = 'disputed', disputed_at = now(), dispute_reason = left(btrim(p_reason), 1000)
+     set status = 'disputed', disputed_at = now(), dispute_reason = left(btrim(p_reason), 1000),
+         dispute_response = null, dispute_responded_at = null, dispute_escalated_at = null,
+         dispute_escalated_by = null, dispute_note = null, dispute_resolution = null, resolved_at = null
    where id = p_contract_id;
 end;
 $$;
@@ -1759,6 +1801,9 @@ returns trigger language plpgsql security definer set search_path = public as $$
 declare v_job_title text; v_msg text; v_recipient uuid;
 begin
   if new.status is not distinct from old.status then return new; end if;
+  -- Nizo yopilishi (kelishuv, admin qarori, mijoz nizoni qaytarib olishi) haqida o'sha funksiyalar
+  -- summalari bilan xabar beradi
+  if old.status = 'disputed' then return new; end if;
   select title into v_job_title from jobs where id = new.job_id;
 
   if new.status = 'submitted' then
@@ -1773,7 +1818,8 @@ begin
       '/contract/' || new.id);
   elsif new.status = 'disputed' then
     v_recipient := new.provider_id;
-    v_msg := format(E'⚠️ Mijoz "%s" shartnomasi bo''yicha nizo ochdi. Sabab: %s', v_job_title, new.dispute_reason);
+    v_msg := format(E'⚠️ Mijoz "%s" shartnomasi bo''yicha nizo ochdi. Sabab: %s. 72 soat ichida javob bering — aks holda nizo admin''ga o''tadi.',
+                    v_job_title, new.dispute_reason);
   elsif new.status = 'cancelled' then
     if new.cancelled_by = 'provider' then
       v_recipient := new.client_id;
@@ -1883,7 +1929,6 @@ returns void language plpgsql security definer set search_path = public as $$
 declare
   v_uid uuid := auth.uid();
   v_k contracts;
-  v_job_title text;
 begin
   if v_uid is not null and not coalesce((select is_admin from profiles where id = v_uid), false) then
     raise exception 'NOT_ALLOWED';
@@ -1892,22 +1937,9 @@ begin
   select * into v_k from contracts where id = p_contract_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
-  select title into v_job_title from jobs where id = v_k.job_id;
-
-  update contracts set dispute_resolution = p_winner, resolved_at = now() where id = p_contract_id;
-  if p_winner = 'provider' then
-    perform _complete_contract(p_contract_id);
-    perform queue_notification(v_k.client_id,
-      format(E'⚖️ "%s" shartnomasi bo''yicha nizo admin tomonidan usta foydasiga hal qilindi.', v_job_title),
-      '/contract/' || p_contract_id);
-  else
-    update contracts set status = 'cancelled', cancelled_at = now(), cancelled_by = 'admin'
-     where id = p_contract_id;
-    update jobs set status = 'cancelled', closed_at = now() where id = v_k.job_id;
-    perform queue_notification(v_k.client_id,
-      format(E'⚖️ "%s" shartnomasi bo''yicha nizo admin tomonidan siz foydangizga hal qilindi.', v_job_title),
-      '/contract/' || p_contract_id);
-  end if;
+  -- Butun summa bir tomonga (eski ilova); qisman yechim — admin_decide_dispute
+  perform _resolve_dispute(p_contract_id,
+    case when p_winner = 'provider' then _dispute_amount(p_contract_id) else 0 end, p_winner, null);
 end;
 $$;
 
@@ -1976,6 +2008,24 @@ begin
     'price',          k.price,
     'disputed_at',    k.disputed_at,
     'dispute_reason', k.dispute_reason,
+    -- Nizodagi summa (bosqichli shartnomada — hali qabul qilinmagan bosqichlar), ustaning javobi,
+    -- admin'ga qachon va kim yubordi, kelishuv takliflari, ikki tomonning dalil rasmlari
+    'dispute_amount',       _dispute_amount(k.id),
+    'staged',               k.staged,
+    'payment_status',       k.payment_status,
+    'dispute_response',     k.dispute_response,
+    'dispute_responded_at', k.dispute_responded_at,
+    'dispute_escalated_at', k.dispute_escalated_at,
+    'dispute_escalated_by', k.dispute_escalated_by,
+    'dispute_photos',       _dispute_photos(k.id),
+    'dispute_offers',       coalesce((
+        select jsonb_agg(jsonb_build_object('provider_amount', o.provider_amount, 'note', o.note, 'status', o.status,
+                                            'by', case when o.proposed_by = k.client_id then 'client' else 'provider' end,
+                                            'created_at', o.created_at) order by o.created_at)
+        from dispute_offers o where o.contract_id = k.id and o.created_at >= k.disputed_at), '[]'::jsonb),
+    'revisions',            coalesce((
+        select jsonb_agg(jsonb_build_object('reason', r.reason, 'created_at', r.created_at) order by r.created_at)
+        from revision_requests r where r.contract_id = k.id), '[]'::jsonb),
     'arrived_at',     k.arrived_at,
     'started_at',     k.started_at,
     'work_photos',    _work_photos(k.id),
@@ -1986,7 +2036,8 @@ begin
     'job',      jsonb_build_object('id', j.id, 'title', j.title, 'category', j.category, 'district', j.district),
     'client',   jsonb_build_object('id', cp.id, 'full_name', cp.full_name, 'phone', cu.phone),
     'provider', jsonb_build_object('id', pp.id, 'full_name', pp.full_name, 'phone', pu.phone)
-  ) order by k.disputed_at asc), '[]'::jsonb)
+  -- Admin'ga yuborilganlar birinchi (ular qaror kutyapti), qolganlari — tomonlar hali gaplashyapti
+  ) order by k.dispute_escalated_at is null, coalesce(k.dispute_escalated_at, k.disputed_at) asc), '[]'::jsonb)
   into v
   from contracts k
   join jobs j on j.id = k.job_id
@@ -2049,7 +2100,8 @@ $$;
 
 -- Admin: pul harakatini belgilash. Faqat shu o'tishlar mumkin:
 --   none -> held      (shartnoma active / submitted / disputed — mijoz pulni o'tkazdi)
---   held -> released  (shartnoma completed — pul ustaga o'tkazildi)
+--   held -> released  (shartnoma completed — pul ustaga o'tkazildi; nizoda qisman yechim bo'lsa
+--                      ustaga payout_amount, qolgani mijozga qaytariladi)
 --   held -> refunded  (shartnoma cancelled — pul mijozga qaytarildi)
 create or replace function public.admin_set_payment(p_contract_id uuid, p_status text)
 returns void language plpgsql security definer set search_path = public as $$
@@ -2057,6 +2109,7 @@ declare
   v_k contracts;
   v_title text;
   v_sum text;
+  v_back int;
   v_link text := '/contract/' || p_contract_id;
 begin
   perform require_admin();
@@ -2068,17 +2121,21 @@ begin
     or (p_status = 'refunded' and v_k.payment_status = 'held' and v_k.status = 'cancelled'), false) then
     raise exception 'INVALID_STATE';
   end if;
+  -- Qisman yechimda mijozga qaytadigan qism (kafolatdagi summadan)
+  v_back := case when p_status = 'released' and v_k.payout_amount is not null
+                 then greatest(coalesce(v_k.payment_held_amount, v_k.price) - v_k.payout_amount, 0) else 0 end;
 
   update contracts set
     payment_status      = p_status,
     payment_held_at     = case when p_status = 'held' then now() else payment_held_at end,
     payment_held_amount = case when p_status = 'held' then price else payment_held_amount end,
     payment_released_at = case when p_status = 'released' then now() else payment_released_at end,
-    payment_refunded_at = case when p_status = 'refunded' then now() else payment_refunded_at end
+    payment_refunded_at = case when p_status = 'refunded' or v_back > 0 then now() else payment_refunded_at end
   where id = p_contract_id;
 
   select title into v_title from jobs where id = v_k.job_id;
-  v_sum := replace(to_char(v_k.price, 'FM999,999,999'), ',', ' ');
+  v_sum := replace(to_char(case when p_status = 'released' then coalesce(v_k.payout_amount, v_k.price) else v_k.price end,
+                           'FM999,999,999'), ',', ' ');
   if p_status = 'held' then
     perform queue_notification(v_k.provider_id, format(
       E'\U0001F512 "%s": mijoz puli (%s so''m) Ustame''da kafolatda. Ishni qabul qilgach pul sizga o''tkaziladi.',
@@ -2089,6 +2146,11 @@ begin
   elsif p_status = 'released' then
     perform queue_notification(v_k.provider_id, format(
       E'\U0001F4B8 "%s": %s so''m sizga o''tkazildi.', v_title, v_sum), v_link);
+    if v_back > 0 then
+      perform queue_notification(v_k.client_id, format(
+        E'↩️ "%s": nizo yechimiga ko''ra %s so''m sizga qaytarildi.', v_title,
+        replace(to_char(v_back, 'FM999,999,999'), ',', ' ')), v_link);
+    end if;
   else
     perform queue_notification(v_k.client_id, format(
       E'↩️ "%s": %s so''m sizga qaytarildi.', v_title, v_sum), v_link);
@@ -2940,10 +3002,14 @@ create table if not exists public.contract_stages (
 
 alter table public.contract_stages enable row level security;
 
+-- Nizo qisman hal qilinsa bosqich bo'yicha ustaga tegadigan summa (null — to'liq, 0 — hammasi qaytariladi)
+alter table public.contract_stages add column if not exists payout_amount int;
+
 create or replace function public._stages_json(p_contract_id uuid)
 returns jsonb language sql stable security definer set search_path = public as $$
   select coalesce(jsonb_agg(jsonb_build_object(
     'id', st.id, 'position', st.position, 'title', st.title, 'amount', st.amount, 'status', st.status,
+    'payout_amount', st.payout_amount,
     'submitted_at', st.submitted_at, 'approved_at', st.approved_at,
     'auto_approve_at', case when st.status = 'submitted' then st.submitted_at + interval '48 hours' end,
     'payment_status', st.payment_status, 'payment_held_at', st.payment_held_at,
@@ -3141,6 +3207,14 @@ begin
       n := n + 1;
     end if;
   end loop;
+  -- Usta 72 soatda nizoga javob bermasa — nizo admin'ga o'tadi
+  for r in select id from contracts
+            where status = 'disputed' and dispute_escalated_at is null and dispute_response is null
+              and disputed_at < now() - interval '72 hours'
+  loop
+    perform _escalate_dispute(r.id, 'auto');
+    n := n + 1;
+  end loop;
   return n;
 end;
 $$;
@@ -3171,6 +3245,8 @@ begin
         jsonb_build_object(
           'id', k.id, 'price', k.price, 'status', k.status, 'payment_status', k.payment_status,
           'payment_held_at', k.payment_held_at, 'held_amount', k.payment_held_amount, 'created_at', k.created_at,
+          -- Nizo qisman hal qilingan: ustaga shuncha, qolgani mijozga
+          'payout', k.payout_amount,
           'action', case
             when k.payment_status = 'held' and k.status = 'completed' then 'release'
             when k.payment_status = 'held' and k.status = 'cancelled' then 'refund'
@@ -3193,6 +3269,7 @@ begin
       union all
       select k.created_at,
         case
+          when st.payment_status = 'held' and st.status = 'approved' and st.payout_amount = 0 then 2
           when st.payment_status = 'held' and (st.status = 'approved' or k.status = 'completed') then 1
           when st.payment_status = 'held' and k.status = 'cancelled' then 2
           when st.payment_status = 'held' then 3
@@ -3201,9 +3278,12 @@ begin
         jsonb_build_object(
           'id', k.id, 'price', st.amount, 'status', k.status, 'payment_status', st.payment_status,
           'payment_held_at', st.payment_held_at, 'held_amount', null, 'created_at', k.created_at,
+          'payout', st.payout_amount,
           'stage', jsonb_build_object('id', st.id, 'position', st.position, 'title', st.title, 'status', st.status,
                                       'count', (select count(*) from contract_stages c where c.contract_id = k.id)),
           'action', case
+            -- Nizo yechimida bu bosqich puli to'liq mijozga qaytadi
+            when st.payment_status = 'held' and st.status = 'approved' and st.payout_amount = 0 then 'refund'
             when st.payment_status = 'held' and (st.status = 'approved' or k.status = 'completed') then 'release'
             when st.payment_status = 'held' and k.status = 'cancelled' then 'refund'
             when st.payment_status = 'held' then 'held'
@@ -3243,29 +3323,37 @@ declare
   v_k contracts;
   v_title text;
   v_sum text;
+  v_back int;
   v_link text;
 begin
   perform require_admin();
   select * into v_s from contract_stages where id = p_stage_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
   select * into v_k from contracts where id = v_s.contract_id for update;
+  -- Nizo yechimida bosqichga payout_amount belgilangan bo'lishi mumkin: 0 — puli to'liq mijozga qaytadi,
+  -- summadan kam — ustaga shuncha o'tkaziladi, qolgani qaytariladi
   if not coalesce(
        (p_status = 'held' and v_s.payment_status = 'none' and v_k.status in ('active', 'submitted', 'disputed'))
-    or (p_status = 'released' and v_s.payment_status = 'held' and (v_s.status = 'approved' or v_k.status = 'completed'))
-    or (p_status = 'refunded' and v_s.payment_status = 'held' and v_k.status = 'cancelled' and v_s.status <> 'approved'),
+    or (p_status = 'released' and v_s.payment_status = 'held' and (v_s.status = 'approved' or v_k.status = 'completed')
+        and coalesce(v_s.payout_amount, v_s.amount) > 0)
+    or (p_status = 'refunded' and v_s.payment_status = 'held'
+        and ((v_k.status = 'cancelled' and v_s.status <> 'approved') or (v_s.status = 'approved' and v_s.payout_amount = 0))),
     false) then
     raise exception 'INVALID_STATE';
   end if;
+  v_back := case when p_status = 'released' and v_s.payout_amount is not null
+                 then v_s.amount - v_s.payout_amount else 0 end;
 
   update contract_stages set
     payment_status      = p_status,
     payment_held_at     = case when p_status = 'held' then now() else payment_held_at end,
     payment_released_at = case when p_status = 'released' then now() else payment_released_at end,
-    payment_refunded_at = case when p_status = 'refunded' then now() else payment_refunded_at end
+    payment_refunded_at = case when p_status = 'refunded' or v_back > 0 then now() else payment_refunded_at end
   where id = p_stage_id;
 
   select title into v_title from jobs where id = v_k.job_id;
-  v_sum := replace(to_char(v_s.amount, 'FM999,999,999'), ',', ' ');
+  v_sum := replace(to_char(case when p_status = 'released' then coalesce(v_s.payout_amount, v_s.amount) else v_s.amount end,
+                           'FM999,999,999'), ',', ' ');
   v_link := '/contract/' || v_k.id;
   if p_status = 'held' then
     perform queue_notification(v_k.provider_id, format(
@@ -3277,6 +3365,11 @@ begin
   elsif p_status = 'released' then
     perform queue_notification(v_k.provider_id, format(
       E'\U0001F4B8 "%s": %s-bosqich uchun %s so''m sizga o''tkazildi.', v_title, v_s.position, v_sum), v_link);
+    if v_back > 0 then
+      perform queue_notification(v_k.client_id, format(
+        E'↩️ "%s": nizo yechimiga ko''ra %s-bosqich uchun %s so''m sizga qaytarildi.', v_title, v_s.position,
+        replace(to_char(v_back, 'FM999,999,999'), ',', ' ')), v_link);
+    end if;
   else
     perform queue_notification(v_k.client_id, format(
       E'↩️ "%s": %s-bosqich uchun %s so''m sizga qaytarildi.', v_title, v_s.position, v_sum), v_link);
@@ -3917,3 +4010,383 @@ $$;
 
 revoke execute on function public.toggle_saved_job(uuid), public.get_saved_jobs() from public, anon, authenticated;
 grant execute on function public.toggle_saved_job(uuid), public.get_saved_jobs() to authenticated;
+
+
+-- ===== nizolarni hal qilish (Upwork usulida) =====
+-- 1. Mijoz topshirilgan ishni (yoki bosqichni) nizo ochmasdan tuzatishga qaytaradi — sababi bilan, 3 martagacha.
+-- 2. Nizo ochilsa usta 72 soat ichida javob beradi (izoh va dalil rasmlari); javob bermasa nizo admin'ga o'tadi.
+-- 3. Tomonlar kelishuv taklif qiladi: "ustaga X so'm, qolgani mijozga". Ikkinchi tomon qabul qilsa nizo yopiladi.
+--    Ikkinchi tomon foydasiga to'liq taklif (usta pulni to'liq qaytaradi / mijoz to'liq to'laydi) darhol kuchga kiradi.
+-- 4. Usta javob bergach istalgan tomon nizoni admin'ga yuboradi; admin summani bo'lib hal qiladi (sababi bilan).
+-- 5. Mijoz nizoni qaytarib olishi mumkin — ish davom etadi.
+create table if not exists public.revision_requests (
+  id          uuid primary key default gen_random_uuid(),
+  contract_id uuid not null references public.contracts (id) on delete cascade,
+  stage_id    uuid references public.contract_stages (id) on delete cascade,
+  reason      text not null check (char_length(reason) between 5 and 1000),
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists revision_requests_contract_idx on public.revision_requests (contract_id);
+
+alter table public.revision_requests enable row level security;
+
+create table if not exists public.dispute_offers (
+  id              uuid primary key default gen_random_uuid(),
+  contract_id     uuid not null references public.contracts (id) on delete cascade,
+  proposed_by     uuid not null references public.users (id) on delete cascade,
+  provider_amount int not null check (provider_amount >= 0),
+  note            text not null default '' check (char_length(note) <= 500),
+  status          text not null default 'pending' check (status in ('pending', 'accepted', 'declined', 'cancelled')),
+  created_at      timestamptz not null default now(),
+  decided_at      timestamptz
+);
+
+create unique index if not exists dispute_offers_one_pending on public.dispute_offers (contract_id) where status = 'pending';
+
+alter table public.dispute_offers enable row level security;
+
+-- Nizodagi summa: bosqichli shartnomada — hali qabul qilinmagan bosqichlar, aks holda butun narx
+create or replace function public._dispute_amount(p_contract_id uuid)
+returns int language sql stable security definer set search_path = public as $$
+  select case when k.staged
+              then (select coalesce(sum(st.amount), 0)::int from contract_stages st
+                     where st.contract_id = k.id and st.status <> 'approved')
+              else k.price end
+  from contracts k where k.id = p_contract_id;
+$$;
+
+-- Dalil rasmlari: dispute-photos/<shartnoma id>/client-1..4.jpg (mijoz), provider-1..4.jpg (usta).
+-- Har tomon nizo ochiq paytda o'zinikini yuklaydi (internal/api/files.go), ikkala tomon va admin ko'radi.
+create or replace function public._dispute_photos(p_contract_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('name', n.name, 'v', (extract(epoch from f.updated_at) * 1000)::bigint)
+                            order by n.ord), '[]'::jsonb)
+  from unnest(array['client-1.jpg', 'client-2.jpg', 'client-3.jpg', 'client-4.jpg',
+                    'provider-1.jpg', 'provider-2.jpg', 'provider-3.jpg', 'provider-4.jpg'])
+       with ordinality as n(name, ord)
+  join files f on f.bucket = 'dispute-photos' and f.path = p_contract_id::text || '/' || n.name;
+$$;
+
+-- 1250000 -> "1 250 000"
+create or replace function public._som(p int)
+returns text language sql stable as $$
+  select replace(to_char(p, 'FM999,999,999'), ',', ' ');
+$$;
+
+create or replace function public._notify_admins(p_message text, p_link text)
+returns void language plpgsql security definer set search_path = public as $$
+declare r record;
+begin
+  for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+    perform queue_notification(r.id, p_message, p_link);
+  end loop;
+end;
+$$;
+
+-- Nizoni yopish: ustaga p_payout so'm (nizodagi summadan), qolgani mijozga.
+--   0           — shartnoma bekor, pul to'liq mijozga qaytadi
+--   to'liq summa — shartnoma yakunlanadi
+--   oraliq       — shartnoma yakunlanadi, payout_amount yoziladi (bosqichlarda — tartib bo'yicha taqsimlanadi)
+-- p_kind: provider / client / split — admin qarori, settled — tomonlar kelishdi.
+create or replace function public._resolve_dispute(p_contract_id uuid, p_payout int, p_kind text, p_note text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_k contracts;
+  v_amount int;
+  v_payout int;
+  v_left int;
+  v_give int;
+  v_note text := nullif(btrim(coalesce(p_note, '')), '');
+  v_title text;
+  v_msg text;
+  v_link text := '/contract/' || p_contract_id;
+  r record;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+  v_amount := _dispute_amount(p_contract_id);
+  v_payout := greatest(0, least(coalesce(p_payout, 0), v_amount));
+
+  update dispute_offers set status = 'cancelled', decided_at = now()
+   where contract_id = p_contract_id and status = 'pending';
+  update contracts
+     set dispute_resolution = p_kind, resolved_at = now(), dispute_note = v_note,
+         payout_amount = case when v_payout > 0 and v_payout < v_amount then v_payout end
+   where id = p_contract_id;
+
+  if v_payout = 0 then
+    update contracts set status = 'cancelled', cancelled_at = now(), cancelled_by = 'admin' where id = p_contract_id;
+    update jobs set status = 'cancelled', closed_at = now() where id = v_k.job_id;
+  else
+    if v_k.staged and v_payout < v_amount then
+      -- Ustaga tegadigan summa qabul qilinmagan bosqichlarga tartib bo'yicha taqsimlanadi
+      v_left := v_payout;
+      for r in select id, amount from contract_stages
+                where contract_id = p_contract_id and status <> 'approved' order by position loop
+        v_give := least(v_left, r.amount);
+        update contract_stages set payout_amount = case when v_give < r.amount then v_give end where id = r.id;
+        v_left := v_left - v_give;
+      end loop;
+    end if;
+    perform _complete_contract(p_contract_id);
+  end if;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  v_msg := format(E'⚖️ "%s": nizo %s yopildi — ustaga %s so''m%s.', v_title,
+             case when p_kind = 'settled' then 'kelishuv bilan' else 'admin qarori bilan' end, _som(v_payout),
+             case when v_amount > v_payout then format(E', mijozga %s so''m qaytariladi', _som(v_amount - v_payout)) else '' end)
+        || case when v_note is not null then format(E' Izoh: %s', left(v_note, 300)) else '' end;
+  perform queue_notification(v_k.client_id, v_msg, v_link);
+  perform queue_notification(v_k.provider_id, v_msg, v_link);
+  if v_k.payment_status = 'held'
+     or exists (select 1 from contract_stages where contract_id = p_contract_id and payment_status = 'held') then
+    perform _notify_admins(format(E'\U0001F4B8 "%s": nizo yopildi — kafolatdagi pulni yechimga ko''ra o''tkazing.', v_title),
+                           '/admin/payments');
+  end if;
+end;
+$$;
+
+-- Nizoni admin'ga o'tkazish. p_by: client / provider — o'sha tomon yubordi, auto — usta 72 soatda javob bermadi.
+create or replace function public._escalate_dispute(p_contract_id uuid, p_by text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_k contracts;
+  v_title text;
+  v_msg text;
+  v_link text := '/contract/' || p_contract_id;
+begin
+  update contracts set dispute_escalated_at = now(), dispute_escalated_by = p_by
+   where id = p_contract_id and status = 'disputed' and dispute_escalated_at is null
+  returning * into v_k;
+  if not found then raise exception 'INVALID_STATE'; end if;
+  select title into v_title from jobs where id = v_k.job_id;
+  v_msg := format(E'⚖️ "%s": nizo admin''ga o''tdi%s. Admin ikkala tomonning dalillarini ko''rib qaror chiqaradi — shu paytgacha o''zingiz kelishib olsangiz ham bo''ladi.',
+             v_title, case when p_by = 'auto' then ' (usta 72 soat ichida javob bermadi)' else '' end);
+  if p_by <> 'client' then perform queue_notification(v_k.client_id, v_msg, v_link); end if;
+  if p_by <> 'provider' then perform queue_notification(v_k.provider_id, v_msg, v_link); end if;
+  perform _notify_admins(format(E'⚖️ "%s": nizo qaroringizni kutmoqda.', v_title), '/admin/disputes');
+end;
+$$;
+
+-- Mijoz: topshirilgan ish (yoki bosqich) yoqmasa — nizo ochmasdan tuzatishga qaytaradi (3 martagacha).
+-- Usta tuzatib qayta topshirgach 48 soatlik muddat yangidan boshlanadi.
+create or replace function public.request_revision(p_contract_id uuid, p_reason text, p_stage_id uuid default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_s contract_stages;
+  v_title text;
+begin
+  if char_length(btrim(coalesce(p_reason, ''))) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if p_stage_id is null then
+    if v_k.staged or v_k.status <> 'submitted' then raise exception 'INVALID_STATE'; end if;
+  else
+    select * into v_s from contract_stages where id = p_stage_id and contract_id = p_contract_id for update;
+    if not found then raise exception 'NOT_FOUND'; end if;
+    if v_k.status <> 'active' or v_s.status <> 'submitted' then raise exception 'INVALID_STATE'; end if;
+  end if;
+  if (select count(*) from revision_requests
+       where contract_id = p_contract_id and stage_id is not distinct from p_stage_id) >= 3 then
+    raise exception 'REVISION_LIMIT';
+  end if;
+
+  insert into revision_requests (contract_id, stage_id, reason)
+  values (p_contract_id, p_stage_id, left(btrim(p_reason), 1000));
+  if p_stage_id is null then
+    update contracts set status = 'active', submitted_at = null where id = p_contract_id;
+  else
+    update contract_stages set status = 'pending', submitted_at = null where id = p_stage_id;
+  end if;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.provider_id, format(
+    E'\U0001F501 "%s": mijoz %stuzatishni so''radi. Sabab: %s. Tuzatib, qayta topshiring.', v_title,
+    case when p_stage_id is null then 'ishni ' else format(E'%s-bosqichni ', v_s.position) end,
+    left(btrim(p_reason), 300)), '/contract/' || p_contract_id);
+end;
+$$;
+
+-- Usta: nizo bo'yicha o'z javobi (qayta yozsa yangilanadi). Javob berilgach istalgan tomon nizoni admin'ga yuboradi.
+create or replace function public.respond_dispute(p_contract_id uuid, p_text text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_title text;
+begin
+  if char_length(btrim(coalesce(p_text, ''))) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+  update contracts set dispute_response = left(btrim(p_text), 1000), dispute_responded_at = now()
+   where id = p_contract_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.client_id, format(
+    E'\U0001F4AC "%s": usta nizo bo''yicha javob berdi: %s', v_title, left(btrim(p_text), 300)),
+    '/contract/' || p_contract_id);
+end;
+$$;
+
+-- Istalgan tomon: nizoni admin'ga yuborish (usta javob bergandan keyin; javob bo'lmasa 72 soatdan keyin o'zi o'tadi)
+create or replace function public.escalate_dispute(p_contract_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_FOUND'; end if;
+  if v_k.status <> 'disputed' or v_k.dispute_escalated_at is not null or v_k.dispute_response is null then
+    raise exception 'INVALID_STATE';
+  end if;
+  perform _escalate_dispute(p_contract_id, case when v_uid = v_k.client_id then 'client' else 'provider' end);
+end;
+$$;
+
+-- Istalgan tomon: kelishuv taklifi — ustaga p_provider_amount so'm (nizodagi summadan), qolgani mijozga qaytadi.
+-- Yangi taklif oldingi javobsiz taklifni bekor qiladi.
+create or replace function public.propose_settlement(p_contract_id uuid, p_provider_amount int, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_amount int;
+  v_title text;
+  v_note text := btrim(coalesce(p_note, ''));
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_FOUND'; end if;
+  if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+  if char_length(v_note) > 500 then raise exception 'INVALID_INPUT'; end if;
+  v_amount := _dispute_amount(p_contract_id);
+  if p_provider_amount is null or p_provider_amount < 0 or p_provider_amount > v_amount then
+    raise exception 'INVALID_AMOUNT';
+  end if;
+
+  update dispute_offers set status = 'cancelled', decided_at = now()
+   where contract_id = p_contract_id and status = 'pending';
+
+  -- Ikkinchi tomon foydasiga to'liq taklif tasdiq kutmaydi
+  if (v_uid = v_k.provider_id and p_provider_amount = 0) or (v_uid = v_k.client_id and p_provider_amount = v_amount) then
+    insert into dispute_offers (contract_id, proposed_by, provider_amount, note, status, decided_at)
+    values (p_contract_id, v_uid, p_provider_amount, v_note, 'accepted', now());
+    perform _resolve_dispute(p_contract_id, p_provider_amount, 'settled', v_note);
+    return;
+  end if;
+
+  insert into dispute_offers (contract_id, proposed_by, provider_amount, note)
+  values (p_contract_id, v_uid, p_provider_amount, v_note);
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(case when v_uid = v_k.client_id then v_k.provider_id else v_k.client_id end, format(
+    E'\U0001F91D "%s": %s kelishuv taklif qildi — ustaga %s so''m, mijozga %s so''m qaytadi. Ko''rib chiqing.',
+    v_title, case when v_uid = v_k.client_id then 'mijoz' else 'usta' end,
+    _som(p_provider_amount), _som(v_amount - p_provider_amount)), '/contract/' || p_contract_id);
+end;
+$$;
+
+-- Ikkinchi tomon kelishuvni qabul qiladi yoki rad etadi; taklif egasi faqat qaytarib oladi (p_accept = false)
+create or replace function public.respond_settlement(p_offer_id uuid, p_accept boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_o dispute_offers;
+  v_k contracts;
+  v_title text;
+begin
+  select * into v_o from dispute_offers where id = p_offer_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_k from contracts where id = v_o.contract_id for update;
+  if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_FOUND'; end if;
+  if v_o.status <> 'pending' or v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+
+  if v_o.proposed_by = v_uid then
+    if p_accept then raise exception 'NOT_ALLOWED'; end if;
+    update dispute_offers set status = 'cancelled', decided_at = now() where id = p_offer_id;
+    return;
+  end if;
+
+  if p_accept then
+    update dispute_offers set status = 'accepted', decided_at = now() where id = p_offer_id;
+    perform _resolve_dispute(v_k.id, v_o.provider_amount, 'settled', v_o.note);
+  else
+    update dispute_offers set status = 'declined', decided_at = now() where id = p_offer_id;
+    select title into v_title from jobs where id = v_k.job_id;
+    perform queue_notification(v_o.proposed_by, format(
+      E'❌ "%s": kelishuv taklifingiz rad etildi. Boshqa summa taklif qiling yoki nizoni admin''ga yuboring.', v_title),
+      '/contract/' || v_k.id);
+  end if;
+end;
+$$;
+
+-- Mijoz: nizoni qaytarib oladi — ish davom etadi. Topshirilgan ish yana "topshirilgan" holatga qaytadi
+-- va mijozda yana 48 soat bo'ladi (bosqichlarda ham).
+create or replace function public.withdraw_dispute(p_contract_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_title text;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+
+  update dispute_offers set status = 'cancelled', decided_at = now()
+   where contract_id = p_contract_id and status = 'pending';
+  update contracts
+     set status = case when not staged and submitted_at is not null then 'submitted' else 'active' end,
+         submitted_at = case when not staged and submitted_at is not null then now() else submitted_at end,
+         dispute_escalated_at = null, dispute_escalated_by = null
+   where id = p_contract_id;
+  update contract_stages set submitted_at = now() where contract_id = p_contract_id and status = 'submitted';
+
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.provider_id, format(
+    E'↩️ "%s": mijoz nizoni yopdi — ish davom etadi.', v_title), '/contract/' || p_contract_id);
+end;
+$$;
+
+-- Admin: nizoni summani bo'lib hal qiladi — ustaga p_provider_amount (0..nizodagi summa), qolgani mijozga.
+-- Sabab majburiy: ikkala tomon ko'radi.
+create or replace function public.admin_decide_dispute(p_contract_id uuid, p_provider_amount int, p_note text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_k contracts;
+  v_amount int;
+begin
+  perform require_admin();
+  if char_length(btrim(coalesce(p_note, ''))) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+  v_amount := _dispute_amount(p_contract_id);
+  if p_provider_amount is null or p_provider_amount < 0 or p_provider_amount > v_amount then
+    raise exception 'INVALID_AMOUNT';
+  end if;
+  perform _resolve_dispute(p_contract_id, p_provider_amount,
+    case when p_provider_amount = v_amount then 'provider' when p_provider_amount = 0 then 'client' else 'split' end,
+    p_note);
+end;
+$$;
+
+revoke execute on function public._dispute_amount(uuid), public._dispute_photos(uuid), public._som(int),
+  public._notify_admins(text, text), public._resolve_dispute(uuid, int, text, text),
+  public._escalate_dispute(uuid, text), public.request_revision(uuid, text, uuid), public.respond_dispute(uuid, text),
+  public.escalate_dispute(uuid), public.propose_settlement(uuid, int, text), public.respond_settlement(uuid, boolean),
+  public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text)
+from public, anon, authenticated;
+
+grant execute on function public.request_revision(uuid, text, uuid), public.respond_dispute(uuid, text),
+  public.escalate_dispute(uuid), public.propose_settlement(uuid, int, text), public.respond_settlement(uuid, boolean),
+  public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text)
+to authenticated;
