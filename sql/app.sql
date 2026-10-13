@@ -4390,3 +4390,81 @@ grant execute on function public.request_revision(uuid, text, uuid), public.resp
   public.escalate_dispute(uuid), public.propose_settlement(uuid, int, text), public.respond_settlement(uuid, boolean),
   public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text)
 to authenticated;
+
+
+-- ===== usta statistikasi (Upwork'dagi My Stats) =====
+-- Daromad — qabul qilingan ishlar (bosqichli shartnomada — qabul qilingan bosqichlar); nizo qisman hal
+-- qilingan bo'lsa ustaga tekkan qismi. Pul Ustame orqali yoki naqd to'langanidan qat'i nazar hisoblanadi.
+-- Oylar Toshkent vaqti bo'yicha, oxirgi 6 oy. Yutish foizi = yollangan / javob olgan takliflar
+-- (kutilayotgan va qaytarib olinganlar hisobga kirmaydi), kamida 3 ta bo'lsa ko'rsatiladi.
+create or replace function public.get_my_provider_stats()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_month timestamptz := date_trunc('month', now() at time zone 'Asia/Tashkent') at time zone 'Asia/Tashkent';
+begin
+  if not exists (select 1 from provider_profiles where user_id = v_uid) then raise exception 'NOT_FOUND'; end if;
+  return (
+    with earn as (
+      select coalesce(k.payout_amount, k.price)::bigint as amount, k.completed_at as at, j.category
+        from contracts k join jobs j on j.id = k.job_id
+       where k.provider_id = v_uid and not k.staged and k.status = 'completed'
+      union all
+      select coalesce(st.payout_amount, st.amount)::bigint, st.approved_at, j.category
+        from contract_stages st
+        join contracts k on k.id = st.contract_id
+        join jobs j on j.id = k.job_id
+       where k.provider_id = v_uid and k.staged and st.status = 'approved'
+    ),
+    pr as (
+      select status, created_at from proposals where provider_id = v_uid
+    ),
+    pc as (
+      select count(*) filter (where status = 'accepted')                         as won,
+             count(*) filter (where status in ('accepted', 'declined', 'closed')) as decided
+        from pr
+    ),
+    -- Oylar Toshkent vaqtida hisoblanadi (UTC'da qo'shilsa oy chegaralari siljiydi)
+    months as (
+      select to_char(gs, 'YYYY-MM') as label,
+             gs at time zone 'Asia/Tashkent' as m,
+             (gs + interval '1 month') at time zone 'Asia/Tashkent' as m_end
+        from generate_series(date_trunc('month', now() at time zone 'Asia/Tashkent') - interval '5 months',
+                             date_trunc('month', now() at time zone 'Asia/Tashkent'), interval '1 month') gs
+    )
+    select jsonb_build_object(
+      'earned_total', coalesce((select sum(amount) from earn), 0),
+      'earned_month', coalesce((select sum(amount) from earn where at >= v_month), 0),
+      -- Ish davom etayotgan shartnomalar (bosqichlida — hali qabul qilinmagan bosqichlar)
+      'in_progress',  coalesce((select sum(k.price) from contracts k
+                                 where k.provider_id = v_uid and not k.staged
+                                   and k.status in ('active', 'submitted', 'disputed')), 0)
+                    + coalesce((select sum(st.amount) from contract_stages st join contracts k on k.id = st.contract_id
+                                 where k.provider_id = v_uid and k.staged
+                                   and k.status in ('active', 'submitted', 'disputed') and st.status <> 'approved'), 0),
+      'jobs_active',  (select count(*) from contracts
+                        where provider_id = v_uid and status in ('active', 'submitted', 'disputed')),
+      'proposals_sent',    (select count(*) from pr),
+      'proposals_30d',     (select count(*) from pr where created_at > now() - interval '30 days'),
+      'proposals_pending', (select count(*) from pr where status = 'submitted'),
+      'proposals_won',     (select won from pc),
+      'win_rate',          (select case when decided >= 3 then round(100.0 * won / decided) end from pc),
+      'months', (select jsonb_agg(jsonb_build_object(
+                   'month',  mm.label,
+                   'earned', coalesce((select sum(e.amount) from earn e where e.at >= mm.m and e.at < mm.m_end), 0),
+                   'jobs',   (select count(*) from contracts k
+                               where k.provider_id = v_uid and k.status = 'completed'
+                                 and k.completed_at >= mm.m and k.completed_at < mm.m_end)
+                 ) order by mm.m) from months mm),
+      'top_categories', coalesce((select jsonb_agg(jsonb_build_object('category', c.category, 'earned', c.s, 'jobs', c.n)
+                                                   order by c.s desc)
+                                   from (select category, sum(amount) as s, count(*) as n
+                                           from earn group by category order by 2 desc limit 3) c), '[]'::jsonb),
+      'stats', provider_stats(v_uid)
+    )
+  );
+end;
+$$;
+
+revoke execute on function public.get_my_provider_stats() from public, anon, authenticated;
+grant execute on function public.get_my_provider_stats() to authenticated;
