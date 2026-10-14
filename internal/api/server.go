@@ -31,6 +31,8 @@ type Server struct {
 	funcs *funcCache
 
 	errLimit hourLimiter // POST /api/client-errors cheklovi
+	smsLimit hourLimiter // POST /api/auth/send-code: bitta IP'dan soatiga
+	smsAlert smsAlert    // kunlik SMS chegarasiga yaqinlashganda adminlarga xabar
 
 	// Outbox — yozuvchi RPC'dan keyin: navbatga bildirishnoma tushgan bo'lishi mumkin.
 	// Activity — har qanday RPC'dan keyin: baza hozir uyg'oq (davriy ishlar shu paytda ishlaydi).
@@ -45,7 +47,8 @@ func New(cfg *config.Config, db *pgxpool.Pool) *Server {
 			DB: db, Email: cfg.EskizEmail, Password: cfg.EskizPassword, From: cfg.EskizFrom,
 			TestMode: cfg.EskizTestMode, HTTP: &http.Client{Timeout: 20 * time.Second},
 		},
-		funcs: &funcCache{},
+		funcs:    &funcCache{},
+		smsLimit: hourLimiter{max: smsPerIPPerHour},
 	}
 }
 

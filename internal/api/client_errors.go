@@ -15,7 +15,9 @@ const (
 )
 
 // hourLimiter — IP bo'yicha soatlik oddiy hisoblagich (xotirada; server qayta ishga tushsa nollanadi).
+// max — soatiga ruxsat etilgan so'rovlar (0 — clientErrorsPerHour).
 type hourLimiter struct {
+	max         int
 	mu          sync.Mutex
 	hits        map[string]*hourWindow
 	lastCleanup time.Time // eski xatolarni bazadan tozalash (kuniga ko'pi bilan bir marta)
@@ -38,7 +40,11 @@ func (l *hourLimiter) allow(key string, now time.Time) bool {
 		l.hits[key] = h
 	}
 	h.n++
-	return h.n <= clientErrorsPerHour
+	max := l.max
+	if max == 0 {
+		max = clientErrorsPerHour
+	}
+	return h.n <= max
 }
 
 func (l *hourLimiter) cleanupDue(now time.Time) bool {

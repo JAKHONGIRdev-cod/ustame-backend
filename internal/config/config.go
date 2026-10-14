@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -27,6 +28,9 @@ type Config struct {
 	ExpoAccessToken string
 	// Web-sayt manzillari (CORS). "*" — hammasiga ruxsat (faqat lokal sinov uchun).
 	AllowedOrigins []string
+	// SMS_DAILY_LIMIT — 24 soatda yuboriladigan kod SMS'lari chegarasi (test raqamlarsiz). Bot ko'p
+	// raqamga kod so'rab Eskiz balansini bo'shatmasligi uchun; yetganda faqat Telegram orqali kirish qoladi.
+	SMSDailyLimit int
 }
 
 func Load() (*Config, error) {
@@ -46,6 +50,12 @@ func Load() (*Config, error) {
 
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		ExpoAccessToken:  os.Getenv("EXPO_ACCESS_TOKEN"),
+		SMSDailyLimit:    300,
+	}
+	if v := os.Getenv("SMS_DAILY_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.SMSDailyLimit = n
+		}
 	}
 	for _, o := range strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",") {
 		if o = strings.TrimSpace(o); o != "" {

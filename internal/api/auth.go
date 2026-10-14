@@ -46,6 +46,30 @@ func (s *Server) sendCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	_, isTestPhone := s.cfg.TestPhones[phone]
+
+	// SMS hujumidan himoya: bitta IP'dan soatiga cheklangan so'rov va 24 soatlik umumiy chegara.
+	// Test raqamlarga SMS ketmaydi, ular hisobga kirmaydi (Google tekshiruvchisi to'xtamasin).
+	if !isTestPhone {
+		if !s.smsLimit.allow(clientIP(r), time.Now()) {
+			writeError(w, http.StatusTooManyRequests, "Juda ko'p urinish. Keyinroq urinib ko'ring yoki Telegram orqali kiring")
+			return
+		}
+		var sent int
+		if err := s.db.QueryRow(ctx, `
+			select count(*)::int from otp_codes
+			where created_at > now() - interval '24 hours' and phone <> all($1)`, s.testPhoneList()).Scan(&sent); err != nil {
+			s.fail(w, "send-code", err)
+			return
+		}
+		if sent >= s.cfg.SMSDailyLimit*8/10 {
+			s.alertSMSLimit(sent)
+		}
+		if sent >= s.cfg.SMSDailyLimit {
+			writeError(w, http.StatusServiceUnavailable, "Hozir SMS yuborib bo'lmaydi. Telegram orqali kiring")
+			return
+		}
+	}
 
 	var last time.Time
 	err = s.db.QueryRow(ctx, `select created_at from otp_codes where phone = $1 order by created_at desc limit 1`, phone).Scan(&last)

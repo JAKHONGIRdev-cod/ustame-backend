@@ -42,6 +42,7 @@ create table if not exists otp_codes (
 );
 
 create index if not exists otp_codes_phone_idx on otp_codes (phone);
+create index if not exists otp_codes_created_idx on otp_codes (created_at);
 
 -- Eskiz tokeni va boshqa sozlamalar (key = 'eskiz_token', ...).
 create table if not exists app_settings (

@@ -4468,3 +4468,8 @@ $$;
 
 revoke execute on function public.get_my_provider_stats() from public, anon, authenticated;
 grant execute on function public.get_my_provider_stats() to authenticated;
+
+
+-- ===== SMS hujumidan himoya =====
+-- send-code har so'rovda 24 soatlik kod sonini sanaydi (internal/api/sms_guard.go) — vaqt bo'yicha indeks
+create index if not exists otp_codes_created_idx on public.otp_codes (created_at);
