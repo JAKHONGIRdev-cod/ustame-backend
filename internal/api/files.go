@@ -19,7 +19,9 @@ import (
 // Yozish huquqi: avatars/<uid>/avatar.jpg, job-photos/<o'z e'loni id>/photo[-2..4].jpg,
 // portfolio-photos/<uid>/<fayl>, work-photos/<o'z shartnomasi id>/before-1..3.jpg | after-1..3.jpg
 // (faqat usta, shartnoma faol yoki topshirilgan paytda), dispute-photos/<o'z shartnomasi id>/client-1..4.jpg
-// (mijoz) | provider-1..4.jpg (usta) — faqat nizo ochiq paytda.
+// (mijoz) | provider-1..4.jpg (usta) — faqat nizo ochiq paytda, id-docs/<uid>/passport.jpg | selfie.jpg — usta
+// shaxsi tasdiqlanguncha.
+// id-docs yopiq: o'qish va ro'yxat faqat egasiga va admin'ga, keshlanmaydi. Admin qaroridan keyin SQL o'chiradi.
 
 const (
 	maxFileBytes = 3 << 20
@@ -27,7 +29,10 @@ const (
 )
 
 var (
-	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos", "dispute-photos"}
+	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos", "dispute-photos", "id-docs"}
+	// Pasport rasmlari (sql/app.sql: _id_docs, admin_review_provider bilan bir xil)
+	idDocNames     = []string{"passport.jpg", "selfie.jpg"}
+	privateBuckets = []string{"id-docs"}
 	// E'londa 4 tagacha rasm; nomlar qat'iy (sql/app.sql: _job_photos bilan bir xil)
 	jobPhotoNames = []string{"photo.jpg", "photo-2.jpg", "photo-3.jpg", "photo-4.jpg"}
 	// Ishdan oldin/keyin rasmlari (sql/app.sql: _work_photos bilan bir xil)
@@ -99,8 +104,26 @@ func (s *Server) canWrite(r *http.Request, u *user, bucket, folder, name string)
 			return slices.Contains(disputePhotoNames["provider"], name), nil
 		}
 		return false, nil
+	case "id-docs":
+		if folder != u.ID || !slices.Contains(idDocNames, name) {
+			return false, nil
+		}
+		// Shaxsi tasdiqlangan usta qayta yuklamaydi; usta profili hali yo'q bo'lsa ham (ariza bilan birga) mumkin
+		var verified bool
+		err := s.db.QueryRow(r.Context(), `select id_verified_at is not null from provider_profiles where user_id = $1::uuid`,
+			folder).Scan(&verified)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+		return !verified, err
 	}
 	return false, nil
+}
+
+// canReadPrivate: yopiq papkadagi faylni faqat egasi va admin o'qiydi.
+func (s *Server) canReadPrivate(r *http.Request, folder string) bool {
+	u := s.requireUser(r.Context(), r)
+	return u != nil && !u.Blocked && (u.ID == folder || u.IsAdmin)
 }
 
 func (s *Server) getFiles(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +134,10 @@ func (s *Server) getFiles(w http.ResponseWriter, r *http.Request) {
 		prefix := q.Get("prefix")
 		if !slices.Contains(buckets, bucket) || !uuidLike.MatchString(prefix) {
 			writeError(w, http.StatusBadRequest, "INVALID_INPUT")
+			return
+		}
+		if slices.Contains(privateBuckets, bucket) && !s.canReadPrivate(r, prefix) {
+			writeError(w, http.StatusForbidden, "NOT_ALLOWED")
 			return
 		}
 		rows, err := s.db.Query(r.Context(), `
@@ -141,8 +168,14 @@ func (s *Server) getFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := q.Get("path")
-	if _, _, ok := parsePath(bucket, path); !ok {
+	folder, _, ok := parsePath(bucket, path)
+	if !ok {
 		writeError(w, http.StatusBadRequest, "INVALID_INPUT")
+		return
+	}
+	private := slices.Contains(privateBuckets, bucket)
+	if private && !s.canReadPrivate(r, folder) {
+		writeError(w, http.StatusForbidden, "NOT_ALLOWED")
 		return
 	}
 	var contentType string
@@ -158,8 +191,13 @@ func (s *Server) getFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", contentType)
-	// URL'da ?v=<vaqt> bo'lgani uchun uzoq keshlash xavfsiz
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if private {
+		// Pasport rasmi hech qayerda (brauzer, CDN) saqlanib qolmasin
+		w.Header().Set("Cache-Control", "private, no-store")
+	} else {
+		// URL'da ?v=<vaqt> bo'lgani uchun uzoq keshlash xavfsiz
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+	}
 	w.Write(data)
 }
 

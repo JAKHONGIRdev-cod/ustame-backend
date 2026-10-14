@@ -178,6 +178,59 @@ alter table public.contracts drop constraint if exists contracts_dispute_resolut
 alter table public.contracts add constraint contracts_dispute_resolution_check
   check (dispute_resolution in ('provider', 'client', 'split', 'settled'));
 
+-- Mijoz usta yo'lga chiqqandan (yoki yetib kelgandan) keyin bekor qilgan — mijoz statistikasida ko'rinadi
+alter table public.contracts add column if not exists late_cancel boolean not null default false;
+
+-- Kafolat davri: ish yakunlangach 30 kun ichida mijoz nuqson bo'yicha murojaat qiladi, usta bepul tuzatadi.
+--   open → fixed (usta tuzatdim dedi) → resolved (mijoz tasdiqladi) | unresolved (hal bo'lmadi yoki usta
+--   3 kun javob bermadi — ustaning statistikasiga yoziladi)
+create table if not exists public.warranty_claims (
+  id            uuid primary key default gen_random_uuid(),
+  contract_id   uuid not null references public.contracts (id) on delete cascade,
+  reason        text not null check (char_length(reason) between 5 and 1000),
+  status        text not null default 'open' check (status in ('open', 'fixed', 'resolved', 'unresolved')),
+  provider_note text,
+  created_at    timestamptz not null default now(),
+  fixed_at      timestamptz,
+  closed_at     timestamptz
+);
+
+create index if not exists warranty_claims_contract_idx on public.warranty_claims (contract_id);
+create unique index if not exists warranty_claims_one_active
+  on public.warranty_claims (contract_id) where status in ('open', 'fixed');
+
+alter table public.warranty_claims enable row level security;
+
+-- Nizo (Upwork usulida), 2-bosqich — mediatsiya: admin murosa summasini taklif qiladi, ikkala tomon 72 soat ichida
+-- qabul qiladi yoki rad etadi (javob bermagan — qabul qilgan hisoblanadi). Kimdir rad etsa — 3-bosqich, arbitraj:
+-- admin yakuniy qaror chiqaradi (admin_decide_dispute).
+alter table public.contracts add column if not exists mediation_amount int;
+alter table public.contracts add column if not exists mediation_note text;
+alter table public.contracts add column if not exists mediation_at timestamptz;
+alter table public.contracts add column if not exists mediation_client_ok boolean;
+alter table public.contracts add column if not exists mediation_provider_ok boolean;
+alter table public.contracts add column if not exists arbitration_at timestamptz;
+
+-- Mijoz usta yo'lga chiqqach bekor qilsa, kafolatdagi puldan ustaga o'tadigan chaqiruv haqi (so'm)
+create or replace function public._callout_fee() returns int language sql immutable as $$ select 50000 $$;
+
+-- Shartnomagacha kontakt almashish taqiqlanadi (Upwork: platformani chetlab o'tish): telefon yoki karta raqami,
+-- Telegram/WhatsApp havolasi, @username yoki e-pochta. Shartnoma tuzilgach telefon raqami o'zi ko'rinadi.
+create or replace function public._has_contact(p text) returns boolean language sql immutable as $$
+  select coalesce(p, '') ~ '(?<![0-9])(\+?998[ -]?)?\(?(20|33|50|55|7[0-9]|88|9[0-9])\)?[ .-]?[0-9]{3}[ .-]?[0-9]{2}[ .-]?[0-9]{2}(?![0-9])'
+      or coalesce(p, '') ~ '(?<![0-9])[0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4}(?![0-9])'
+      or coalesce(p, '') ~* '(t\.me/|telegram\.me/|wa\.me/|whatsapp|@[a-z][a-z0-9_.]{3,})'
+$$;
+
+-- Usta yuklagan pasport rasmlari (id-docs/<uid>/passport.jpg, selfie.jpg). Faqat egasi va admin ko'radi,
+-- admin qaroridan keyin darhol o'chiriladi (internal/api/files.go).
+create or replace function public._id_docs(p_user_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('name', substr(f.path, 38), 'v', (extract(epoch from f.updated_at) * 1000)::bigint)
+                            order by f.path), '[]'::jsonb)
+  from files f where f.bucket = 'id-docs' and f.path like p_user_id::text || '/%';
+$$;
+
 -- Usta holatlari: yo'lga chiqdi (va qachon yetib borishini aytdi) -> yetib keldi -> ish boshlandi
 alter table public.contracts add column if not exists on_the_way_at timestamptz;
 alter table public.contracts add column if not exists eta_at timestamptz;
@@ -269,6 +322,14 @@ begin
 end;
 $$;
 
+-- Baho (Upwork usulida) ikkala tomon baho qo'ygach yoki baholash muddati (yakunlangandan 14 kun) tugagach ochiladi
+create or replace function public.review_is_public(p_contract_id uuid, p_reviewer_id uuid, p_created_at timestamptz)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select k.completed_at from contracts k where k.id = p_contract_id), p_created_at) < now() - interval '14 days'
+      or exists (select 1 from reviews o
+                 where o.contract_id = p_contract_id and o.reviewer_id <> p_reviewer_id);
+$$;
+
 create or replace function public.provider_stats(p_user_id uuid)
 returns jsonb language sql stable security definer set search_path = public as $$
   with c as (
@@ -280,13 +341,19 @@ returns jsonb language sql stable security definer set search_path = public as $
                          or (dispute_resolution in ('split', 'settled') and status = 'cancelled'))  as disputes_lost,
       -- O'z vaqtida: aytgan vaqtidan 15 daqiqagacha kechikish kechiriladi
       count(*) filter (where eta_at is not null and arrived_at is not null)               as arrivals,
+      count(*) filter (where exists (select 1 from warranty_claims w
+                                      where w.contract_id = contracts.id and w.status = 'unresolved'))
+                                                                                          as warranty_unresolved,
       count(*) filter (where eta_at is not null and arrived_at <= eta_at + interval '15 minutes') as on_time,
       -- Muvaffaqiyatli: yakunlangan, nizoda yutqazilmagan, pulning bir qismi qaytarilmagan
       -- va mijoz bahosi 4+ (yoki baho qo'ymagan)
       count(*) filter (where status = 'completed' and dispute_resolution is distinct from 'client'
                          and payout_amount is null
+                         and not exists (select 1 from warranty_claims w
+                                          where w.contract_id = contracts.id and w.status = 'unresolved')
                          and coalesce((select r2.rating from reviews r2
-                                        where r2.contract_id = contracts.id and r2.reviewer_id = contracts.client_id), 5) >= 4)
+                                        where r2.contract_id = contracts.id and r2.reviewer_id = contracts.client_id
+                                          and review_is_public(r2.contract_id, r2.reviewer_id, r2.created_at)), 5) >= 4)
                                                                                           as good
     from contracts where provider_id = p_user_id
   ),
@@ -297,11 +364,13 @@ returns jsonb language sql stable security definer set search_path = public as $
     select count(*) as cnt, round(avg(rating)::numeric, 1) as avg
     from reviews where reviewee_id = p_user_id
       and exists (select 1 from contracts k where k.id = reviews.contract_id and k.provider_id = p_user_id)
+      and review_is_public(reviews.contract_id, reviews.reviewer_id, reviews.created_at)
   )
   select jsonb_build_object(
     'completed_jobs', c.completed,
     'withdrawals',    c.withdrawals,
     'disputes_lost',  c.disputes_lost,
+    'warranty_unresolved', c.warranty_unresolved,
     'reviews_count',  r.cnt,
     'avg_rating',     r.avg,
     'top_rated',      coalesce(r.avg >= 4.5 and c.completed >= 5, false),
@@ -328,29 +397,25 @@ returns jsonb language sql stable security definer set search_path = public as $
   ),
   c as (
     select count(*) as hires,
-           count(*) filter (where status = 'completed') as completed
+           count(*) filter (where status = 'completed') as completed,
+           count(*) filter (where status = 'cancelled' and cancelled_by = 'client' and late_cancel) as late_cancels
     from contracts where client_id = p_user_id
   ),
   r as (
     select count(*) as cnt, round(avg(rating)::numeric, 1) as avg
     from reviews where reviewee_id = p_user_id
       and exists (select 1 from contracts k where k.id = reviews.contract_id and k.client_id = p_user_id)
+      and review_is_public(reviews.contract_id, reviews.reviewer_id, reviews.created_at)
   )
   select jsonb_build_object(
     'jobs_posted',    j.posted,
     'hires',          c.hires,
     'completed_jobs', c.completed,
+    'late_cancellations', c.late_cancels,
     'reviews_count',  r.cnt,
     'avg_rating',     r.avg
   )
   from j, c, r;
-$$;
-
-create or replace function public.review_is_public(p_contract_id uuid, p_reviewer_id uuid, p_created_at timestamptz)
-returns boolean language sql stable security definer set search_path = public as $$
-  select p_created_at < now() - interval '7 days'
-      or exists (select 1 from reviews o
-                 where o.contract_id = p_contract_id and o.reviewer_id <> p_reviewer_id);
 $$;
 
 create or replace function public.is_approved_provider(p_user_id uuid)
@@ -417,6 +482,7 @@ begin
   if coalesce(cardinality(p_districts), 0) not between 1 and 12 then raise exception 'INVALID_DISTRICTS'; end if;
   if p_experience_years is null or p_experience_years not between 0 and 60 then raise exception 'INVALID_EXPERIENCE'; end if;
   if char_length(coalesce(p_bio, '')) > 1000 then raise exception 'INVALID_BIO'; end if;
+  if _has_contact(p_headline) or _has_contact(p_bio) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
 
   insert into provider_profiles (user_id, headline, bio, categories, districts, experience_years)
   values (v_uid, btrim(p_headline), btrim(coalesce(p_bio, '')), p_categories, p_districts, p_experience_years)
@@ -492,6 +558,7 @@ begin
   if char_length(btrim(coalesce(p_address, ''))) not between 5 and 300 then raise exception 'INVALID_ADDRESS'; end if;
   if p_budget is not null and p_budget not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
   if coalesce(p_urgency, 'flexible') not in ('urgent', 'today', 'this_week', 'flexible') then raise exception 'INVALID_INPUT'; end if;
+  if _has_contact(p_title) or _has_contact(p_description) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
 
   insert into jobs (client_id, category, district, title, description, budget, urgency)
   values (v_uid, btrim(p_category), btrim(p_district), btrim(p_title), btrim(p_description),
@@ -727,8 +794,11 @@ declare
   v_team uuid;
 begin
   if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
+  -- Taklif yuborish uchun shaxs pasport bilan tasdiqlangan bo'lishi shart
+  if (select id_verified_at from provider_profiles where user_id = v_uid) is null then raise exception 'ID_NOT_VERIFIED'; end if;
   if p_price is null or p_price not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
   if char_length(coalesce(p_message, '')) > 1000 then raise exception 'INVALID_MESSAGE'; end if;
+  if _has_contact(p_message) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
   if p_eta_minutes is not null and p_eta_minutes not between 5 and 600 then raise exception 'INVALID_INPUT'; end if;
 
   select * into v_job from jobs where id = p_job_id for update;
@@ -862,7 +932,17 @@ begin
         select jsonb_agg(jsonb_build_object('stage_id', r.stage_id, 'reason', r.reason, 'created_at', r.created_at)
                          order by r.created_at)
         from revision_requests r where r.contract_id = v_k.id), '[]'::jsonb),
-    'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '48 hours' end,
+    'auto_approve_at', case when v_k.status = 'submitted' then v_k.submitted_at + interval '72 hours' end,
+    'late_cancel', v_k.late_cancel,
+    -- Kafolat davri: yakunlangandan 30 kun
+    'warranty_until', case when v_k.status = 'completed' then v_k.completed_at + interval '30 days' end,
+    'warranty_claims', coalesce((
+        select jsonb_agg(jsonb_build_object('id', w.id, 'reason', w.reason, 'status', w.status,
+                                            'provider_note', w.provider_note, 'created_at', w.created_at,
+                                            'fixed_at', w.fixed_at, 'closed_at', w.closed_at,
+                                            'respond_until', case when w.status = 'open' then w.created_at + interval '72 hours' end)
+                         order by w.created_at)
+        from warranty_claims w where w.contract_id = v_k.id), '[]'::jsonb),
     'team', (select jsonb_build_object('id', t.id, 'name', t.name, 'kind', t.kind) from teams t where t.id = v_k.team_id),
     'staged', v_k.staged,
     'stages', case when v_k.staged then _stages_json(v_k.id) else '[]'::jsonb end,
@@ -897,8 +977,17 @@ begin
                           and review_is_public(v_their_review.contract_id, v_their_review.reviewer_id,
                                                v_their_review.created_at) then
                       jsonb_build_object('rating', v_their_review.rating, 'comment', v_their_review.comment,
-                                         'created_at', v_their_review.created_at) end,
-    'can_review', v_k.status = 'completed' and v_my_review.id is null
+                                         'created_at', v_their_review.created_at) end
+  -- jsonb_build_object 100 tadan ortiq argument qabul qilmaydi — qolgani alohida
+  ) || jsonb_build_object(
+    'can_review', v_k.status = 'completed' and v_my_review.id is null and v_k.completed_at > now() - interval '14 days',
+    'review_until', case when v_k.status = 'completed' then v_k.completed_at + interval '14 days' end,
+    -- Nizo 2-bosqichi: admin murosa taklifi (72 soat) va arbitraj (rad etilgach admin yakuniy qaror chiqaradi)
+    'mediation', case when v_k.mediation_at is not null and v_k.disputed_at is not null then jsonb_build_object(
+        'provider_amount', v_k.mediation_amount, 'note', v_k.mediation_note, 'created_at', v_k.mediation_at,
+        'respond_until', v_k.mediation_at + interval '72 hours',
+        'client_ok', v_k.mediation_client_ok, 'provider_ok', v_k.mediation_provider_ok) end,
+    'arbitration_at', v_k.arbitration_at
   );
 end;
 $$;
@@ -961,7 +1050,9 @@ begin
   update contracts
      set status = 'disputed', disputed_at = now(), dispute_reason = left(btrim(p_reason), 1000),
          dispute_response = null, dispute_responded_at = null, dispute_escalated_at = null,
-         dispute_escalated_by = null, dispute_note = null, dispute_resolution = null, resolved_at = null
+         dispute_escalated_by = null, dispute_note = null, dispute_resolution = null, resolved_at = null,
+         mediation_amount = null, mediation_note = null, mediation_at = null, mediation_client_ok = null,
+         mediation_provider_ok = null, arbitration_at = null
    where id = p_contract_id;
 end;
 $$;
@@ -1005,6 +1096,8 @@ begin
   else raise exception 'NOT_ALLOWED';
   end if;
   if v_k.status <> 'completed' then raise exception 'INVALID_STATE'; end if;
+  -- Baholash muddati — yakunlangandan 14 kun (Upwork)
+  if v_k.completed_at < now() - interval '14 days' then raise exception 'REVIEW_WINDOW_CLOSED'; end if;
 
   insert into reviews (contract_id, reviewer_id, reviewee_id, rating, comment)
   values (p_contract_id, v_uid, v_reviewee, p_rating, btrim(coalesce(p_comment, '')))
@@ -1051,7 +1144,7 @@ declare
   r record;
   n int := 0;
 begin
-  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '48 hours'
+  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '72 hours'
   loop
     perform _complete_contract(r.id);
     n := n + 1;
@@ -1197,7 +1290,7 @@ begin
       'submitted_at', k.submitted_at, 'completed_at', k.completed_at,
       'job_title', j.title, 'job_category', j.category,
       'counterpart_name', o.full_name,
-      'needs_my_review', k.status = 'completed'
+      'needs_my_review', k.status = 'completed' and k.completed_at > now() - interval '14 days'
                          and not exists (select 1 from reviews r where r.contract_id = k.id and r.reviewer_id = v_uid),
       'unread_count', (
         select count(*) from messages m
@@ -1808,11 +1901,11 @@ begin
 
   if new.status = 'submitted' then
     v_recipient := new.client_id;
-    v_msg := format(E'\U0001F4E6 Usta "%s" ishini tugatdi deb belgiladi. 48 soat ichida ishni qabul qiling yoki e''tiroz bildiring — javob bo''lmasa, ish avtomatik qabul qilinadi.', v_job_title);
+    v_msg := format(E'\U0001F4E6 Usta "%s" ishini tugatdi deb belgiladi. 72 soat ichida ishni qabul qiling yoki e''tiroz bildiring — javob bo''lmasa, ish avtomatik qabul qilinadi.', v_job_title);
   elsif new.status = 'completed' then
     v_recipient := new.provider_id;
     v_msg := format(E'\U0001F389 "%s" shartnomasi yakunlandi.', v_job_title);
-    -- Mijoz ham bilsin (ayniqsa 48 soatdan keyin avtomatik qabul qilinganda) va ustani baholasin
+    -- Mijoz ham bilsin (ayniqsa 72 soatdan keyin avtomatik qabul qilinganda) va ustani baholasin
     perform queue_notification(new.client_id,
       format(E'✅ "%s" ishi yakunlandi. Ilovada ustani baholashni unutmang.', v_job_title),
       '/contract/' || new.id);
@@ -1900,24 +1993,36 @@ begin
 end;
 $$;
 
+-- Usta arizasi (yoki tasdiqlangan ustaning pasporti): admin pasport rasmi va selfini ko'rib tasdiqlaydi yoki rad etadi.
+-- Tasdiqlash pasportsiz bo'lmaydi; rasmlar qarordan keyin darhol o'chiriladi (faqat "tasdiqlangan" belgisi qoladi).
 create or replace function public.admin_review_provider(p_user_id uuid, p_approve boolean, p_reason text default null)
 returns void language plpgsql security definer set search_path = public as $$
-declare v_uid uuid := auth.uid();
+declare
+  v_uid uuid := auth.uid();
+  v_pp provider_profiles;
 begin
   if v_uid is not null and not coalesce((select is_admin from profiles where id = v_uid), false) then
     raise exception 'NOT_ALLOWED';
+  end if;
+  select * into v_pp from provider_profiles where user_id = p_user_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if p_approve and v_pp.id_verified_at is null and jsonb_array_length(_id_docs(p_user_id)) < 2 then
+    raise exception 'ID_DOCS_REQUIRED';
   end if;
 
   update provider_profiles
      set status = case when p_approve then 'approved' else 'rejected' end,
          rejection_reason = case when p_approve then null else p_reason end,
-         reviewed_at = now()
+         reviewed_at = now(),
+         id_verified_at = case when p_approve then coalesce(id_verified_at, now()) else id_verified_at end
    where user_id = p_user_id;
-  if not found then raise exception 'NOT_FOUND'; end if;
+  delete from files where bucket = 'id-docs' and path like p_user_id::text || '/%';
 
   perform queue_notification(p_user_id,
-    case when p_approve
-      then E'✅ Tabriklaymiz! Usta profilingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
+    case when p_approve and v_pp.status = 'approved'
+      then E'\U0001F6E1 Shaxsingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
+    when p_approve
+      then E'✅ Tabriklaymiz! Usta profilingiz va shaxsingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
       else format(E'❌ Usta profilingiz rad etildi. Sabab: %s', coalesce(p_reason, '-'))
     end,
     case when p_approve then '/' else '/become-provider' end);
@@ -1937,6 +2042,8 @@ begin
   select * into v_k from contracts where id = p_contract_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+  -- Admin yakuniy qarorni faqat mediatsiya rad etilgach chiqaradi (tizim chaqiruvi — istisno)
+  if v_uid is not null and v_k.arbitration_at is null then raise exception 'MEDIATION_REQUIRED'; end if;
   -- Butun summa bir tomonga (eski ilova); qisman yechim — admin_decide_dispute
   perform _resolve_dispute(p_contract_id,
     case when p_winner = 'provider' then _dispute_amount(p_contract_id) else 0 end, p_winner, null);
@@ -1949,7 +2056,10 @@ declare v jsonb;
 begin
   perform require_admin();
   select jsonb_build_object(
-    'pending_providers',   (select count(*) from provider_profiles where status = 'pending'),
+    'pending_providers',   (select count(*) from provider_profiles
+                             where status = 'pending'
+                                or (status = 'approved' and id_verified_at is null
+                                    and jsonb_array_length(_id_docs(user_id)) > 0)),
     'disputed_contracts',  (select count(*) from contracts where status = 'disputed'),
     'payments_action',     (select count(*) from contracts
                              where payment_status = 'held' and status in ('completed', 'cancelled'))
@@ -1987,13 +2097,16 @@ begin
     'categories',       pp.categories,
     'districts',        pp.districts,
     'experience_years', pp.experience_years,
-    'created_at',       pp.created_at
+    'created_at',       pp.created_at,
+    'status',           pp.status,
+    'id_docs',          _id_docs(pp.user_id)
   ) order by pp.created_at asc), '[]'::jsonb)
   into v
   from provider_profiles pp
   join profiles p on p.id = pp.user_id
   join auth.users u on u.id = pp.user_id
-  where pp.status = 'pending';
+  where pp.status = 'pending'
+     or (pp.status = 'approved' and pp.id_verified_at is null and jsonb_array_length(_id_docs(pp.user_id)) > 0);
   return v;
 end;
 $$;
@@ -2017,6 +2130,11 @@ begin
     'dispute_responded_at', k.dispute_responded_at,
     'dispute_escalated_at', k.dispute_escalated_at,
     'dispute_escalated_by', k.dispute_escalated_by,
+    'mediation',            case when k.mediation_at is not null then jsonb_build_object(
+        'provider_amount', k.mediation_amount, 'note', k.mediation_note, 'created_at', k.mediation_at,
+        'respond_until', k.mediation_at + interval '72 hours',
+        'client_ok', k.mediation_client_ok, 'provider_ok', k.mediation_provider_ok) end,
+    'arbitration_at',       k.arbitration_at,
     'dispute_photos',       _dispute_photos(k.id),
     'dispute_offers',       coalesce((
         select jsonb_agg(jsonb_build_object('provider_amount', o.provider_amount, 'note', o.note, 'status', o.status,
@@ -2036,8 +2154,9 @@ begin
     'job',      jsonb_build_object('id', j.id, 'title', j.title, 'category', j.category, 'district', j.district),
     'client',   jsonb_build_object('id', cp.id, 'full_name', cp.full_name, 'phone', cu.phone),
     'provider', jsonb_build_object('id', pp.id, 'full_name', pp.full_name, 'phone', pu.phone)
-  -- Admin'ga yuborilganlar birinchi (ular qaror kutyapti), qolganlari — tomonlar hali gaplashyapti
-  ) order by k.dispute_escalated_at is null, coalesce(k.dispute_escalated_at, k.disputed_at) asc), '[]'::jsonb)
+  -- Yakuniy qaror kutayotganlar, keyin admin'ga yuborilganlar (murosa kerak), oxirida — tomonlar hali gaplashyapti
+  ) order by k.arbitration_at is null, k.dispute_escalated_at is null,
+             coalesce(k.arbitration_at, k.dispute_escalated_at, k.disputed_at) asc), '[]'::jsonb)
   into v
   from contracts k
   join jobs j on j.id = k.job_id
@@ -2117,11 +2236,12 @@ begin
   if not found then raise exception 'NOT_FOUND'; end if;
   if not coalesce(
        (p_status = 'held' and v_k.payment_status = 'none' and v_k.status in ('active', 'submitted', 'disputed'))
-    or (p_status = 'released' and v_k.payment_status = 'held' and v_k.status = 'completed')
-    or (p_status = 'refunded' and v_k.payment_status = 'held' and v_k.status = 'cancelled'), false) then
+    or (p_status = 'released' and v_k.payment_status = 'held'
+        and (v_k.status = 'completed' or (v_k.status = 'cancelled' and v_k.payout_amount is not null)))
+    or (p_status = 'refunded' and v_k.payment_status = 'held' and v_k.status = 'cancelled' and v_k.payout_amount is null), false) then
     raise exception 'INVALID_STATE';
   end if;
-  -- Qisman yechimda mijozga qaytadigan qism (kafolatdagi summadan)
+  -- Qisman yechimda (nizo yoki kech bekor qilishdagi chaqiruv haqi) mijozga qaytadigan qism (kafolatdagi summadan)
   v_back := case when p_status = 'released' and v_k.payout_amount is not null
                  then greatest(coalesce(v_k.payment_held_amount, v_k.price) - v_k.payout_amount, 0) else 0 end;
 
@@ -2148,7 +2268,8 @@ begin
       E'\U0001F4B8 "%s": %s so''m sizga o''tkazildi.', v_title, v_sum), v_link);
     if v_back > 0 then
       perform queue_notification(v_k.client_id, format(
-        E'↩️ "%s": nizo yechimiga ko''ra %s so''m sizga qaytarildi.', v_title,
+        E'↩️ "%s": %s %s so''m sizga qaytarildi.', v_title,
+        case when v_k.status = 'cancelled' then 'chaqiruv haqi ushlab qolinib,' else 'nizo yechimiga ko''ra' end,
         replace(to_char(v_back, 'FM999,999,999'), ',', ' ')), v_link);
     end if;
   else
@@ -2173,7 +2294,9 @@ begin
     'avatar_updated_at', p.avatar_updated_at,
     'telegram_linked',   p.telegram_chat_id is not null,
     'is_admin',          p.is_admin,
-    'provider',          (select to_jsonb(pp) - 'user_id' from provider_profiles pp where pp.user_id = p.id)
+    'provider',          (select to_jsonb(pp) - 'user_id' from provider_profiles pp where pp.user_id = p.id),
+    -- Tekshiruvni kutayotgan pasport rasmlari (tasdiqlangach o'chiriladi)
+    'id_docs',           _id_docs(p.id)
   )
   into v
   from profiles p join auth.users u on u.id = p.id
@@ -2832,6 +2955,11 @@ create unique index if not exists reports_one_open
   on public.reports (reporter_id, target_type, target_id) where status = 'open';
 create index if not exists reports_open_idx on public.reports (created_at) where status = 'open';
 
+-- off_platform — ilovadan tashqarida kelishish yoki to'lashni taklif qildi (Upwork: platformani chetlab o'tish)
+alter table public.reports drop constraint if exists reports_reason_check;
+alter table public.reports add constraint reports_reason_check
+  check (reason in ('fraud', 'abuse', 'spam', 'fake', 'off_platform', 'other'));
+
 alter table public.reports enable row level security;
 
 create or replace function public.report_content(p_target_type text, p_target_id uuid, p_reason text, p_comment text default null)
@@ -2844,7 +2972,7 @@ declare
   v_label text;
   r record;
 begin
-  if p_reason is null or p_reason not in ('fraud', 'abuse', 'spam', 'fake', 'other') then raise exception 'INVALID_INPUT'; end if;
+  if p_reason is null or p_reason not in ('fraud', 'abuse', 'spam', 'fake', 'off_platform', 'other') then raise exception 'INVALID_INPUT'; end if;
   if char_length(coalesce(p_comment, '')) > 500 then raise exception 'INVALID_INPUT'; end if;
 
   if p_target_type = 'job' then
@@ -2928,22 +3056,29 @@ $$;
 
 -- Admin: shikoyatni hal qilish. p_action:
 --   dismiss        — asossiz, rad etiladi
+--   confirm        — tasdiqlandi, kontentga chora kerak emas (masalan foydalanuvchi ustidan shikoyat)
 --   remove_job     — e'lon olib tashlanadi (faqat ochiq e'lon)
 --   hide_message   — xabar matni yashiriladi
 --   block_user     — shikoyat qilingan foydalanuvchi bloklanadi (barcha faoliyati yopiladi)
 -- Shu narsaga tushgan boshqa ochiq shikoyatlar ham birga yopiladi.
+-- Bloklash qoidasi: firibgarlik yoki ilovadan tashqariga chiqish tasdiqlansa — darhol, ogohlantirishsiz;
+-- boshqa sabablar bo'yicha oxirgi 12 oyda 3 ta tasdiqlangan holat (har xil e'lon/xabar/profil) — avtomatik.
 create or replace function public.admin_resolve_report(p_report_id uuid, p_action text)
 returns void language plpgsql security definer set search_path = public as $$
 declare
   v_admin uuid := require_admin();
   v_r reports;
+  v_word text;
   v_reason text;
+  v_strikes int;
 begin
   select * into v_r from reports where id = p_report_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_r.status <> 'open' then raise exception 'INVALID_STATE'; end if;
-  v_reason := 'Shikoyat: ' || case v_r.reason when 'fraud' then 'firibgarlik' when 'abuse' then 'haqorat'
-                                              when 'spam' then 'spam' when 'fake' then 'soxta ma''lumot' else 'qoidabuzarlik' end;
+  v_word := case v_r.reason when 'fraud' then 'firibgarlik' when 'abuse' then 'haqorat' when 'spam' then 'spam'
+                            when 'fake' then 'soxta ma''lumot' when 'off_platform' then 'ilovadan tashqarida kelishish'
+                            else 'qoidabuzarlik' end;
+  v_reason := 'Shikoyat: ' || v_word;
 
   if p_action = 'remove_job' then
     if v_r.target_type <> 'job' then raise exception 'INVALID_INPUT'; end if;
@@ -2953,7 +3088,7 @@ begin
     update messages set text = '[Xabar moderator tomonidan yashirildi]' where id = v_r.target_id;
   elsif p_action = 'block_user' then
     perform admin_block_user(v_r.reported_user_id, v_reason);
-  elsif p_action <> 'dismiss' then
+  elsif p_action not in ('dismiss', 'confirm') then
     raise exception 'INVALID_INPUT';
   end if;
 
@@ -2963,6 +3098,25 @@ begin
      and (id = p_report_id
           or (target_type = v_r.target_type and target_id = v_r.target_id)
           or (p_action = 'block_user' and reported_user_id = v_r.reported_user_id));
+
+  if p_action in ('confirm', 'remove_job', 'hide_message')
+     and exists (select 1 from users where id = v_r.reported_user_id
+                   and blocked_at is null and deleted_at is null and not is_admin) then
+    if v_r.reason in ('fraud', 'off_platform') then
+      perform admin_block_user(v_r.reported_user_id, v_reason);
+    else
+      select count(distinct (target_type, target_id)) into v_strikes
+        from reports where reported_user_id = v_r.reported_user_id and status = 'resolved'
+                       and resolved_at > now() - interval '12 months';
+      if v_strikes >= 3 then
+        perform admin_block_user(v_r.reported_user_id, format('%s (%s ta tasdiqlangan shikoyat)', v_reason, v_strikes));
+      else
+        perform queue_notification(v_r.reported_user_id, format(
+          E'⚠️ Sizga nisbatan shikoyat tasdiqlandi (%s/3): %s. 12 oy ichida 3 ta tasdiqlangan shikoyatda hisob bloklanadi.',
+          v_strikes, v_word), '/');
+      end if;
+    end if;
+  end if;
 end;
 $$;
 
@@ -2978,7 +3132,7 @@ to authenticated;
 -- ===== bosqichli to'lov =====
 -- Katta ish shartnoma summasi 2-6 bosqichga bo'linadi (masalan: material, asosiy ish, yakun). Bir tomon reja
 -- taklif qiladi, ikkinchisi tasdiqlaydi. Har bosqich puli alohida kafolatga tushadi, usta bosqichni topshiradi,
--- mijoz qabul qiladi (48 soatda javob bo'lmasa avtomatik) — shundan keyin pul ustaga o'tkaziladi.
+-- mijoz qabul qiladi (72 soatda javob bo'lmasa avtomatik) — shundan keyin pul ustaga o'tkaziladi.
 -- Oxirgi bosqich qabul qilinganda shartnoma yakunlanadi.
 alter table public.contracts add column if not exists staged boolean not null default false;
 alter table public.contracts add column if not exists stage_plan jsonb;
@@ -3011,7 +3165,7 @@ returns jsonb language sql stable security definer set search_path = public as $
     'id', st.id, 'position', st.position, 'title', st.title, 'amount', st.amount, 'status', st.status,
     'payout_amount', st.payout_amount,
     'submitted_at', st.submitted_at, 'approved_at', st.approved_at,
-    'auto_approve_at', case when st.status = 'submitted' then st.submitted_at + interval '48 hours' end,
+    'auto_approve_at', case when st.status = 'submitted' then st.submitted_at + interval '72 hours' end,
     'payment_status', st.payment_status, 'payment_held_at', st.payment_held_at,
     'payment_released_at', st.payment_released_at, 'payment_refunded_at', st.payment_refunded_at
   ) order by st.position), '[]'::jsonb)
@@ -3130,12 +3284,12 @@ begin
   update contract_stages set status = 'submitted', submitted_at = now() where id = p_stage_id;
   select title into v_title from jobs where id = v_k.job_id;
   perform queue_notification(v_k.client_id, format(
-    E'\U0001F4E6 "%s": usta %s-bosqichni ("%s") topshirdi. Tekshirib qabul qiling — 48 soatda javob bo''lmasa avtomatik qabul qilinadi.',
+    E'\U0001F4E6 "%s": usta %s-bosqichni ("%s") topshirdi. Tekshirib qabul qiling — 72 soatda javob bo''lmasa avtomatik qabul qilinadi.',
     v_title, v_s.position, v_s.title), '/contract/' || v_k.id);
 end;
 $$;
 
--- Bosqichni qabul qilish (mijoz yoki 48 soatdan keyin avtomatik). Hammasi qabul qilinsa — shartnoma yakunlanadi.
+-- Bosqichni qabul qilish (mijoz yoki 72 soatdan keyin avtomatik). Hammasi qabul qilinsa — shartnoma yakunlanadi.
 create or replace function public._approve_stage(p_stage_id uuid)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -3184,20 +3338,20 @@ begin
 end;
 $$;
 
--- 48 soat: butun ish (eski yo'l) va bosqichlar
+-- 72 soat: butun ish (eski yo'l) va bosqichlar
 create or replace function public.auto_approve_overdue()
 returns int language plpgsql security definer set search_path = public as $$
 declare
   r record;
   n int := 0;
 begin
-  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '48 hours'
+  for r in select id from contracts where status = 'submitted' and submitted_at < now() - interval '72 hours'
   loop
     perform _complete_contract(r.id);
     n := n + 1;
   end loop;
   for r in select st.id from contract_stages st join contracts k on k.id = st.contract_id
-            where st.status = 'submitted' and st.submitted_at < now() - interval '48 hours'
+            where st.status = 'submitted' and st.submitted_at < now() - interval '72 hours'
               and k.status in ('active', 'submitted')
             order by st.contract_id, st.position
   loop
@@ -3206,6 +3360,22 @@ begin
       perform _approve_stage(r.id);
       n := n + 1;
     end if;
+  end loop;
+  -- Kafolat: usta 3 kunda tuzatmasa — hal bo'lmagan; usta tuzatdi deganidan 7 kun o'tib mijoz jim bo'lsa — hal bo'lgan
+  for r in select id from warranty_claims where status = 'open' and created_at < now() - interval '72 hours' loop
+    perform _close_warranty(r.id, false, true);
+    n := n + 1;
+  end loop;
+  for r in select id from warranty_claims where status = 'fixed' and fixed_at < now() - interval '7 days' loop
+    perform _close_warranty(r.id, true, true);
+    n := n + 1;
+  end loop;
+  -- Mediatsiya taklifiga 72 soatda hech kim rad javob bermasa — qabul qilingan hisoblanadi
+  for r in select id from contracts
+            where status = 'disputed' and mediation_at < now() - interval '72 hours' and arbitration_at is null
+  loop
+    perform _accept_mediation(r.id);
+    n := n + 1;
   end loop;
   -- Usta 72 soatda nizoga javob bermasa — nizo admin'ga o'tadi
   for r in select id from contracts
@@ -3238,6 +3408,7 @@ begin
       select k.created_at,
         case
           when k.payment_status = 'held' and k.status = 'completed' then 1
+          when k.payment_status = 'held' and k.status = 'cancelled' and k.payout_amount is not null then 1
           when k.payment_status = 'held' and k.status = 'cancelled' then 2
           when k.payment_status = 'held' then 3
           else 4
@@ -3247,8 +3418,11 @@ begin
           'payment_held_at', k.payment_held_at, 'held_amount', k.payment_held_amount, 'created_at', k.created_at,
           -- Nizo qisman hal qilingan: ustaga shuncha, qolgani mijozga
           'payout', k.payout_amount,
+          -- Mijoz usta yo'lga chiqqach bekor qilgan: payout — ustaga chaqiruv haqi, qolgani mijozga
+          'late_cancel', k.late_cancel,
           'action', case
             when k.payment_status = 'held' and k.status = 'completed' then 'release'
+            when k.payment_status = 'held' and k.status = 'cancelled' and k.payout_amount is not null then 'release'
             when k.payment_status = 'held' and k.status = 'cancelled' then 'refund'
             when k.payment_status = 'held' then 'held'
             else 'hold'
@@ -3438,6 +3612,7 @@ returns jsonb language sql stable security definer set search_path = public as $
     select count(*) as cnt, round(avg(rv.rating)::numeric, 1) as avg
     from reviews rv join contracts k on k.id = rv.contract_id
     where k.team_id = p_team_id and rv.reviewee_id = k.provider_id
+      and review_is_public(rv.contract_id, rv.reviewer_id, rv.created_at)
   )
   select jsonb_build_object(
     'completed_jobs', c.completed,
@@ -3869,6 +4044,8 @@ begin
   -- Rad etilgan yoki qaytarib olingan taklif bo'yicha yozishma yopiq
   if v_pp.status not in ('submitted', 'accepted') then raise exception 'CHAT_CLOSED'; end if;
   if _blocked(v_pp.provider_id, v_pp.client_id) then raise exception 'USER_BLOCKED'; end if;
+  -- Shartnomagacha kontakt almashib bo'lmaydi; tuzilgach telefon raqami o'zi ko'rinadi
+  if v_pp.status = 'submitted' and _has_contact(v_text) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
 
   insert into messages (proposal_id, sender_id, text) values (p_proposal_id, v_uid, v_text)
   returning id, created_at into v_id, v_created;
@@ -3942,7 +4119,8 @@ to authenticated;
 
 
 -- ===== shaxsi tasdiqlangan usta =====
--- Admin ustaning pasport/ID'sini (uchrashuvda yoki video qo'ng'iroqda) ko'rib belgilaydi. Hujjat rasmi saqlanmaydi.
+-- Odatda pasport ilovada yuklanadi va admin_review_provider bilan tasdiqlanadi. Bu yerda — qo'lda: admin pasportni
+-- uchrashuvda yoki video qo'ng'iroqda ko'rgan bo'lsa, yoki soxta hujjat aniqlanib tasdiqni bekor qilsa.
 create or replace function public.admin_set_verified(p_user_id uuid, p_verified boolean)
 returns void language plpgsql security definer set search_path = public as $$
 begin
@@ -3950,6 +4128,7 @@ begin
   update provider_profiles set id_verified_at = case when p_verified then coalesce(id_verified_at, now()) end
    where user_id = p_user_id;
   if not found then raise exception 'NOT_FOUND'; end if;
+  delete from files where bucket = 'id-docs' and path like p_user_id::text || '/%';
   if p_verified then
     perform queue_notification(p_user_id,
       E'\U0001F6E1 Shaxsingiz tasdiqlandi — profilingizda "Shaxsi tasdiqlangan" belgisi chiqadi.', '/');
@@ -4162,7 +4341,7 @@ begin
   returning * into v_k;
   if not found then raise exception 'INVALID_STATE'; end if;
   select title into v_title from jobs where id = v_k.job_id;
-  v_msg := format(E'⚖️ "%s": nizo admin''ga o''tdi%s. Admin ikkala tomonning dalillarini ko''rib qaror chiqaradi — shu paytgacha o''zingiz kelishib olsangiz ham bo''ladi.',
+  v_msg := format(E'⚖️ "%s": nizo admin''ga o''tdi%s. Admin ikkala tomonning dalillarini ko''rib murosa taklif qiladi, uni rad etsangiz — yakuniy qaror chiqaradi. Shu paytgacha o''zingiz kelishib olsangiz ham bo''ladi.',
              v_title, case when p_by = 'auto' then ' (usta 72 soat ichida javob bermadi)' else '' end);
   if p_by <> 'client' then perform queue_notification(v_k.client_id, v_msg, v_link); end if;
   if p_by <> 'provider' then perform queue_notification(v_k.provider_id, v_msg, v_link); end if;
@@ -4171,7 +4350,7 @@ end;
 $$;
 
 -- Mijoz: topshirilgan ish (yoki bosqich) yoqmasa — nizo ochmasdan tuzatishga qaytaradi (3 martagacha).
--- Usta tuzatib qayta topshirgach 48 soatlik muddat yangidan boshlanadi.
+-- Usta tuzatib qayta topshirgach 72 soatlik muddat yangidan boshlanadi.
 create or replace function public.request_revision(p_contract_id uuid, p_reason text, p_stage_id uuid default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -4328,7 +4507,7 @@ end;
 $$;
 
 -- Mijoz: nizoni qaytarib oladi — ish davom etadi. Topshirilgan ish yana "topshirilgan" holatga qaytadi
--- va mijozda yana 48 soat bo'ladi (bosqichlarda ham).
+-- va mijozda yana 72 soat bo'ladi (bosqichlarda ham).
 create or replace function public.withdraw_dispute(p_contract_id uuid)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -4346,7 +4525,9 @@ begin
   update contracts
      set status = case when not staged and submitted_at is not null then 'submitted' else 'active' end,
          submitted_at = case when not staged and submitted_at is not null then now() else submitted_at end,
-         dispute_escalated_at = null, dispute_escalated_by = null
+         dispute_escalated_at = null, dispute_escalated_by = null,
+         mediation_amount = null, mediation_note = null, mediation_at = null, mediation_client_ok = null,
+         mediation_provider_ok = null, arbitration_at = null
    where id = p_contract_id;
   update contract_stages set submitted_at = now() where contract_id = p_contract_id and status = 'submitted';
 
@@ -4356,8 +4537,99 @@ begin
 end;
 $$;
 
--- Admin: nizoni summani bo'lib hal qiladi — ustaga p_provider_amount (0..nizodagi summa), qolgani mijozga.
--- Sabab majburiy: ikkala tomon ko'radi.
+-- Nizo 2-bosqichi (Upwork'dagi mediatsiya): admin murosa summasini taklif qiladi — ustaga p_provider_amount,
+-- qolgani mijozga. Ikkala tomon 72 soat ichida javob beradi; javob bermagan — qabul qilgan hisoblanadi.
+create or replace function public.admin_propose_mediation(p_contract_id uuid, p_provider_amount int, p_note text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_k contracts;
+  v_amount int;
+  v_title text;
+  v_msg text;
+begin
+  perform require_admin();
+  if char_length(btrim(coalesce(p_note, ''))) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.status <> 'disputed' or v_k.mediation_at is not null then raise exception 'INVALID_STATE'; end if;
+  v_amount := _dispute_amount(p_contract_id);
+  if p_provider_amount is null or p_provider_amount < 0 or p_provider_amount > v_amount then
+    raise exception 'INVALID_AMOUNT';
+  end if;
+
+  update dispute_offers set status = 'cancelled', decided_at = now()
+   where contract_id = p_contract_id and status = 'pending';
+  update contracts
+     set mediation_amount = p_provider_amount, mediation_note = left(btrim(p_note), 1000), mediation_at = now(),
+         mediation_client_ok = null, mediation_provider_ok = null
+   where id = p_contract_id;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  v_msg := format(E'⚖️ "%s": admin murosa taklif qildi — ustaga %s so''m, mijozga %s so''m qaytadi. Izoh: %s. 72 soat ichida qabul qiling yoki rad eting (javob bermasangiz — qabul qilingan hisoblanadi). Kimdir rad etsa, admin yakuniy qaror chiqaradi.',
+             v_title, _som(p_provider_amount), _som(v_amount - p_provider_amount), left(btrim(p_note), 300));
+  perform queue_notification(v_k.client_id, v_msg, '/contract/' || p_contract_id);
+  perform queue_notification(v_k.provider_id, v_msg, '/contract/' || p_contract_id);
+end;
+$$;
+
+-- Mediatsiya taklifini ikkala tomon qabul qildi (yoki 72 soat jim turdi) — nizo shu summa bilan yopiladi
+create or replace function public._accept_mediation(p_contract_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_k contracts;
+begin
+  select * into v_k from contracts where id = p_contract_id for update;
+  if v_k.status <> 'disputed' or v_k.mediation_at is null or v_k.arbitration_at is not null then
+    raise exception 'INVALID_STATE';
+  end if;
+  perform _resolve_dispute(p_contract_id, v_k.mediation_amount, 'settled', v_k.mediation_note);
+end;
+$$;
+
+-- Tomon mediatsiya taklifiga javob beradi. Rad etsa — arbitraj: admin yakuniy qaror chiqaradi.
+create or replace function public.respond_mediation(p_contract_id uuid, p_accept boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_title text;
+  v_other uuid;
+begin
+  if p_accept is null then raise exception 'INVALID_INPUT'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_uid not in (v_k.client_id, v_k.provider_id) then raise exception 'NOT_FOUND'; end if;
+  if v_k.status <> 'disputed' or v_k.mediation_at is null or v_k.arbitration_at is not null then
+    raise exception 'INVALID_STATE';
+  end if;
+  if (v_uid = v_k.client_id and v_k.mediation_client_ok is not null)
+     or (v_uid = v_k.provider_id and v_k.mediation_provider_ok is not null) then
+    raise exception 'INVALID_STATE';
+  end if;
+
+  update contracts
+     set mediation_client_ok = case when v_uid = client_id then p_accept else mediation_client_ok end,
+         mediation_provider_ok = case when v_uid = provider_id then p_accept else mediation_provider_ok end,
+         arbitration_at = case when not p_accept then now() end
+   where id = p_contract_id
+  returning * into v_k;
+
+  if v_k.mediation_client_ok and v_k.mediation_provider_ok then
+    perform _accept_mediation(p_contract_id);
+    return;
+  end if;
+  if not p_accept then
+    select title into v_title from jobs where id = v_k.job_id;
+    v_other := case when v_uid = v_k.client_id then v_k.provider_id else v_k.client_id end;
+    perform queue_notification(v_other, format(
+      E'⚖️ "%s": %s admin murosa taklifini rad etdi — endi admin yakuniy qaror chiqaradi.', v_title,
+      case when v_uid = v_k.client_id then 'mijoz' else 'usta' end), '/contract/' || p_contract_id);
+    perform _notify_admins(format(E'⚖️ "%s": murosa rad etildi — yakuniy qaroringizni kutmoqda.', v_title), '/admin/disputes');
+  end if;
+end;
+$$;
+
+-- Nizo 3-bosqichi (arbitraj): mediatsiya rad etilgach admin yakuniy qaror chiqaradi — ustaga p_provider_amount
+-- (0..nizodagi summa), qolgani mijozga. Sabab majburiy: ikkala tomon ko'radi.
 create or replace function public.admin_decide_dispute(p_contract_id uuid, p_provider_amount int, p_note text)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -4369,6 +4641,7 @@ begin
   select * into v_k from contracts where id = p_contract_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
   if v_k.status <> 'disputed' then raise exception 'INVALID_STATE'; end if;
+  if v_k.arbitration_at is null then raise exception 'MEDIATION_REQUIRED'; end if;
   v_amount := _dispute_amount(p_contract_id);
   if p_provider_amount is null or p_provider_amount < 0 or p_provider_amount > v_amount then
     raise exception 'INVALID_AMOUNT';
@@ -4383,12 +4656,14 @@ revoke execute on function public._dispute_amount(uuid), public._dispute_photos(
   public._notify_admins(text, text), public._resolve_dispute(uuid, int, text, text),
   public._escalate_dispute(uuid, text), public.request_revision(uuid, text, uuid), public.respond_dispute(uuid, text),
   public.escalate_dispute(uuid), public.propose_settlement(uuid, int, text), public.respond_settlement(uuid, boolean),
-  public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text)
+  public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text),
+  public.admin_propose_mediation(uuid, int, text), public._accept_mediation(uuid), public.respond_mediation(uuid, boolean)
 from public, anon, authenticated;
 
 grant execute on function public.request_revision(uuid, text, uuid), public.respond_dispute(uuid, text),
   public.escalate_dispute(uuid), public.propose_settlement(uuid, int, text), public.respond_settlement(uuid, boolean),
-  public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text)
+  public.withdraw_dispute(uuid), public.admin_decide_dispute(uuid, int, text),
+  public.admin_propose_mediation(uuid, int, text), public.respond_mediation(uuid, boolean)
 to authenticated;
 
 
@@ -4473,3 +4748,212 @@ grant execute on function public.get_my_provider_stats() to authenticated;
 -- ===== SMS hujumidan himoya =====
 -- send-code har so'rovda 24 soatlik kod sonini sanaydi (internal/api/sms_guard.go) — vaqt bo'yicha indeks
 create index if not exists otp_codes_created_idx on public.otp_codes (created_at);
+
+
+-- ===== mijoz shartnomani bekor qilishi, kafolat davri, admin amallari jurnali =====
+
+-- Mijoz: ish boshlanmagan faol shartnomani bekor qiladi. Usta yo'lga chiqqan yoki yetib kelgan bo'lsa —
+-- "kech bekor qilish" (mijoz statistikasida ko'rinadi, chaqiruv haqini usta bilan kelishish tavsiya etiladi).
+-- Ish boshlangan yoki bosqich topshirilgan bo'lsa — faqat nizo orqali. E'lon qayta ochiladi: mijoz boshqa
+-- ustani tanlaydi yoki e'lonni yopadi.
+create or replace function public.client_cancel_contract(p_contract_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_late boolean;
+  v_fee int;
+  v_title text;
+begin
+  if char_length(btrim(coalesce(p_reason, ''))) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'active' or v_k.started_at is not null
+     or exists (select 1 from contract_stages where contract_id = v_k.id and status <> 'pending') then
+    raise exception 'INVALID_STATE';
+  end if;
+  v_late := v_k.on_the_way_at is not null or v_k.arrived_at is not null;
+  -- Pul kafolatda bo'lsa chaqiruv haqi ustaga o'tadi, qolgani mijozga qaytadi (bosqichsiz shartnomada)
+  v_fee := case when v_late and v_k.payment_status = 'held' and not v_k.staged
+                then least(_callout_fee(), coalesce(v_k.payment_held_amount, v_k.price)) end;
+
+  update contracts
+     set status = 'cancelled', cancelled_at = now(), cancelled_by = 'client',
+         cancel_reason = left(btrim(p_reason), 1000), late_cancel = v_late, payout_amount = v_fee
+   where id = p_contract_id;
+  update price_changes set status = 'cancelled', decided_at = now()
+   where contract_id = p_contract_id and status = 'pending';
+  update proposals set status = 'submitted', updated_at = now() where job_id = v_k.job_id and status = 'closed';
+  update jobs set status = 'open' where id = v_k.job_id;
+
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.provider_id, format(
+    case when v_fee is not null
+      then E'⚠️ Mijoz "%s" shartnomasini siz yo''lga chiqqaningizdan keyin bekor qildi. Sabab: %s. Kafolatdagi puldan chaqiruv haqi — %s so''m sizga o''tkaziladi.'
+    when v_late
+      then E'⚠️ Mijoz "%s" shartnomasini siz yo''lga chiqqaningizdan keyin bekor qildi. Sabab: %s. Chaqiruv haqini mijoz bilan kelishing.'
+      else E'⚠️ Mijoz "%s" shartnomasini bekor qildi. Sabab: %s' end,
+    v_title, left(btrim(p_reason), 300), _som(coalesce(v_fee, 0))), '/contract/' || p_contract_id);
+  if v_k.payment_status = 'held' then
+    perform _notify_admins(format(E'\U0001F4B8 "%s": mijoz shartnomani bekor qildi — kafolatdagi pulni %s.', v_title,
+      case when v_fee is not null
+        then format(E'taqsimlang: ustaga %s so''m chaqiruv haqi, qolgani mijozga', _som(v_fee))
+        else 'mijozga qaytaring' end), '/admin/payments');
+  end if;
+end;
+$$;
+
+-- Kafolat murojaatini yopish: p_ok — hal bo'ldi, p_auto — muddat o'tgani uchun (davriy ish)
+create or replace function public._close_warranty(p_claim_id uuid, p_ok boolean, p_auto boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_w warranty_claims;
+  v_k contracts;
+  v_title text;
+  v_link text;
+  v_n int;
+begin
+  update warranty_claims set status = case when p_ok then 'resolved' else 'unresolved' end, closed_at = now()
+   where id = p_claim_id and status in ('open', 'fixed')
+  returning * into v_w;
+  if not found then raise exception 'INVALID_STATE'; end if;
+  select * into v_k from contracts where id = v_w.contract_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  v_link := '/contract/' || v_k.id;
+  if p_ok then
+    perform queue_notification(v_k.provider_id, format(
+      E'✅ "%s": kafolat murojaati hal bo''ldi.', v_title), v_link);
+  else
+    perform queue_notification(v_k.provider_id, format(
+      E'⚠️ "%s": kafolat murojaati hal bo''lmadi%s — bu statistikangizda ko''rinadi.', v_title,
+      case when p_auto then ' (3 kun ichida tuzatilmadi)' else '' end), v_link);
+    perform queue_notification(v_k.client_id, format(
+      E'⚠️ "%s": kafolat murojaati hal bo''lmadi deb belgilandi. Admin ko''rib chiqadi.', v_title), v_link);
+    select count(*) into v_n from warranty_claims w join contracts k on k.id = w.contract_id
+     where k.provider_id = v_k.provider_id and w.status = 'unresolved';
+    perform _notify_admins(format(E'\U0001F6E0 "%s": kafolat murojaati hal bo''lmadi (ustada jami %s ta)%s', v_title, v_n,
+      case when v_n >= 3 then E' — 3 tadan oshdi: ustani tekshiring, kerak bo''lsa bloklang.' else ' — ustani ko''rib chiqing.' end),
+      v_link);
+  end if;
+end;
+$$;
+
+-- Mijoz: yakunlangan ish bo'yicha kafolat murojaati (30 kun ichida, bitta ochiq, jami 3 tagacha)
+create or replace function public.open_warranty_claim(p_contract_id uuid, p_reason text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_k contracts;
+  v_id uuid;
+  v_title text;
+begin
+  if char_length(btrim(coalesce(p_reason, ''))) < 5 then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_k from contracts where id = p_contract_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_k.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_k.status <> 'completed' then raise exception 'INVALID_STATE'; end if;
+  if v_k.completed_at < now() - interval '30 days' then raise exception 'WARRANTY_EXPIRED'; end if;
+  if exists (select 1 from warranty_claims where contract_id = p_contract_id and status in ('open', 'fixed')) then
+    raise exception 'INVALID_STATE';
+  end if;
+  if (select count(*) from warranty_claims where contract_id = p_contract_id) >= 3 then
+    raise exception 'WARRANTY_LIMIT';
+  end if;
+
+  insert into warranty_claims (contract_id, reason) values (p_contract_id, left(btrim(p_reason), 1000))
+  returning id into v_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.provider_id, format(
+    E'\U0001F6E0 "%s": mijoz kafolat bo''yicha murojaat qildi: %s. 3 kun ichida bog''lanib, bepul tuzating va ilovada "Tuzatdim"ni bosing.',
+    v_title, left(btrim(p_reason), 300)), '/contract/' || p_contract_id);
+  return v_id;
+end;
+$$;
+
+-- Usta: nuqsonni tuzatdim (izoh bilan)
+create or replace function public.mark_warranty_fixed(p_claim_id uuid, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_w warranty_claims;
+  v_k contracts;
+  v_title text;
+begin
+  if char_length(coalesce(p_note, '')) > 1000 then raise exception 'INVALID_INPUT'; end if;
+  select * into v_w from warranty_claims where id = p_claim_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_k from contracts where id = v_w.contract_id;
+  if v_k.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_w.status <> 'open' then raise exception 'INVALID_STATE'; end if;
+  update warranty_claims set status = 'fixed', fixed_at = now(), provider_note = nullif(btrim(coalesce(p_note, '')), '')
+   where id = p_claim_id;
+  select title into v_title from jobs where id = v_k.job_id;
+  perform queue_notification(v_k.client_id, format(
+    E'\U0001F6E0 "%s": usta nuqsonni tuzatganini aytdi. Tekshirib, natijani belgilang — 7 kunda javob bo''lmasa hal bo''lgan hisoblanadi.',
+    v_title), '/contract/' || v_k.id);
+end;
+$$;
+
+-- Mijoz: natija — hal bo'ldi (istalgan paytda) yoki hal bo'lmadi (usta "tuzatdim" degandan keyin)
+create or replace function public.confirm_warranty(p_claim_id uuid, p_resolved boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_w warranty_claims;
+begin
+  select * into v_w from warranty_claims where id = p_claim_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if (select client_id from contracts where id = v_w.contract_id) <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_w.status not in ('open', 'fixed') or (not p_resolved and v_w.status <> 'fixed') then
+    raise exception 'INVALID_STATE';
+  end if;
+  perform _close_warranty(p_claim_id, p_resolved, false);
+end;
+$$;
+
+-- Admin amallari jurnali: kim, qachon, qaysi amal va qanday qiymatlar bilan. Server (internal/api/rpc.go)
+-- har bir o'zgartiruvchi admin_* chaqiruvini shu tranzaksiyaning o'zida yozadi — amal bajarilmasa yozuv ham yo'q.
+create table if not exists public.admin_actions (
+  id         bigserial primary key,
+  admin_id   uuid references public.users (id) on delete set null,
+  action     text not null,
+  args       jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists admin_actions_created_idx on public.admin_actions (created_at desc);
+
+alter table public.admin_actions enable row level security;
+
+create or replace function public.admin_get_actions()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', a.id, 'action', a.action, 'args', a.args, 'created_at', a.created_at,
+      'admin', jsonb_build_object('id', p.id, 'full_name', p.full_name),
+      -- Qaysi e'lon / foydalanuvchi haqida — o'qish oson bo'lsin
+      'job_title', (select j.title from jobs j where j.id = coalesce(
+          safe_uuid(a.args->>'p_job_id'),
+          (select k.job_id from contracts k where k.id = safe_uuid(a.args->>'p_contract_id')),
+          (select k.job_id from contract_stages st join contracts k on k.id = st.contract_id
+            where st.id = safe_uuid(a.args->>'p_stage_id')))),
+      'user_name', (select u.full_name from profiles u where u.id = safe_uuid(a.args->>'p_user_id')),
+      'team_name', (select t.name from teams t where t.id = safe_uuid(a.args->>'p_team_id'))
+    ) order by a.created_at desc)
+    from (select * from admin_actions order by created_at desc limit 300) a
+    left join profiles p on p.id = a.admin_id
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function public.client_cancel_contract(uuid, text), public._close_warranty(uuid, boolean, boolean),
+  public.open_warranty_claim(uuid, text), public.mark_warranty_fixed(uuid, text), public.confirm_warranty(uuid, boolean),
+  public.admin_get_actions()
+from public, anon, authenticated;
+
+grant execute on function public.client_cancel_contract(uuid, text), public.open_warranty_claim(uuid, text),
+  public.mark_warranty_fixed(uuid, text), public.confirm_warranty(uuid, boolean), public.admin_get_actions()
+to authenticated;

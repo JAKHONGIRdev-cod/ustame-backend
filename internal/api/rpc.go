@@ -135,7 +135,7 @@ func jsonArg(v any) (any, error) {
 
 // readOnly — faqat o'qiydigan funksiyalar (nomlash qoidasi bo'yicha): ular bildirishnoma yaratmaydi.
 func readOnly(fn string) bool {
-	for _, p := range []string{"get_", "find_", "search_", "admin_get_"} {
+	for _, p := range []string{"get_", "find_", "search_", "admin_get_", "admin_search_"} {
 		if strings.HasPrefix(fn, p) {
 			return true
 		}
@@ -201,6 +201,13 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		b.Queue("select "+call+"::text", args...).QueryRow(scan)
 	default:
 		b.Queue("select to_jsonb("+call+")::text", args...).QueryRow(scan)
+	}
+	// Admin amallari jurnali: o'zgartiruvchi admin_* chaqiruvi shu paketning o'zida yoziladi — funksiya xato
+	// bersa (masalan admin emas) paket bekor bo'ladi va yozuv ham qolmaydi.
+	if strings.HasPrefix(fn, "admin_") && !readOnly(fn) {
+		logArgs, _ := json.Marshal(body)
+		b.Queue(`insert into public.admin_actions (admin_id, action, args) values ($1::uuid, $2, $3::jsonb)`,
+			uid, fn, string(logArgs))
 	}
 	start := time.Now()
 	err = s.db.SendBatch(ctx, b).Close()
