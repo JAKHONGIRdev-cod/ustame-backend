@@ -5088,3 +5088,68 @@ revoke execute on function public._proposals_this_month(uuid), public._subscript
 from public, anon, authenticated;
 
 grant execute on function public.get_my_subscription(), public.admin_extend_subscription(uuid, int) to authenticated;
+
+
+-- ===== xabarlar ro'yxati (Upwork'dagi Messages) =====
+-- Foydalanuvchining barcha yozishmalari bitta so'rovda: shartnoma chatlari va kutilayotgan takliflar bo'yicha
+-- (yollashdan oldingi) chatlar — qarshi tomon, bog'liq e'lon, oxirgi xabar va o'qilmaganlar soni.
+-- Shartnoma chati taklif paytidagi xabarlarni ham o'z ichiga oladi (get_messages bilan bir xil).
+create or replace function public.get_my_conversations(p_role text)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if p_role not in ('client', 'provider') then raise exception 'INVALID_INPUT'; end if;
+  return coalesce((
+    select jsonb_agg(c.item order by c.sort_at desc)
+    from (
+      -- Shartnomalar
+      select coalesce(lm.created_at, k.created_at) as sort_at,
+        jsonb_build_object(
+          'kind', 'contract', 'id', k.id, 'created_at', k.created_at,
+          'counterpart', jsonb_build_object('id', o.id, 'full_name', o.full_name, 'avatar_updated_at', o.avatar_updated_at),
+          'job_id', j.id, 'job_title', j.title, 'contract_status', k.status,
+          'last_message', case when lm.id is not null
+            then jsonb_build_object('text', lm.text, 'created_at', lm.created_at, 'mine', lm.sender_id = v_uid) end,
+          'unread', (select count(*) from messages m
+                      where (m.contract_id = k.id or (k.proposal_id is not null and m.proposal_id = k.proposal_id))
+                        and m.sender_id <> v_uid and m.read_at is null)
+        ) as item
+      from contracts k
+      join jobs j on j.id = k.job_id
+      join profiles o on o.id = case when p_role = 'client' then k.provider_id else k.client_id end
+      left join lateral (
+        select m.id, m.text, m.created_at, m.sender_id from messages m
+         where m.contract_id = k.id or (k.proposal_id is not null and m.proposal_id = k.proposal_id)
+         order by m.created_at desc limit 1
+      ) lm on true
+      where (p_role = 'client' and k.client_id = v_uid) or (p_role = 'provider' and k.provider_id = v_uid)
+
+      union all
+
+      -- Kutilayotgan takliflar (qabul qilingani shartnoma chatida davom etadi)
+      select coalesce(lm.created_at, p.created_at),
+        jsonb_build_object(
+          'kind', 'proposal', 'id', p.id, 'created_at', p.created_at,
+          'counterpart', jsonb_build_object('id', o.id, 'full_name', o.full_name, 'avatar_updated_at', o.avatar_updated_at),
+          'job_id', j.id, 'job_title', j.title, 'contract_status', null,
+          'last_message', case when lm.id is not null
+            then jsonb_build_object('text', lm.text, 'created_at', lm.created_at, 'mine', lm.sender_id = v_uid) end,
+          'unread', (select count(*) from messages m
+                      where m.proposal_id = p.id and m.sender_id <> v_uid and m.read_at is null)
+        )
+      from proposals p
+      join jobs j on j.id = p.job_id
+      join profiles o on o.id = case when p_role = 'client' then p.provider_id else j.client_id end
+      left join lateral (
+        select m.id, m.text, m.created_at, m.sender_id from messages m
+         where m.proposal_id = p.id order by m.created_at desc limit 1
+      ) lm on true
+      where p.status = 'submitted'
+        and ((p_role = 'client' and j.client_id = v_uid) or (p_role = 'provider' and p.provider_id = v_uid))
+    ) c
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function public.get_my_conversations(text) from public, anon, authenticated;
+grant execute on function public.get_my_conversations(text) to authenticated;
