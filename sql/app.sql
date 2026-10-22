@@ -796,6 +796,8 @@ begin
   if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
   -- Taklif yuborish uchun shaxs pasport bilan tasdiqlangan bo'lishi shart
   if (select id_verified_at from provider_profiles where user_id = v_uid) is null then raise exception 'ID_NOT_VERIFIED'; end if;
+  -- Oylik obuna: bepul davrdan keyin obunasiz usta oyiga cheklangan taklif yuboradi (pastda, "oylik obuna")
+  perform _check_proposal_quota(v_uid);
   if p_price is null or p_price not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
   if char_length(coalesce(p_message, '')) > 1000 then raise exception 'INVALID_MESSAGE'; end if;
   if _has_contact(p_message) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
@@ -2296,7 +2298,10 @@ begin
     'is_admin',          p.is_admin,
     'provider',          (select to_jsonb(pp) - 'user_id' from provider_profiles pp where pp.user_id = p.id),
     -- Tekshiruvni kutayotgan pasport rasmlari (tasdiqlangach o'chiriladi)
-    'id_docs',           _id_docs(p.id)
+    'id_docs',           _id_docs(p.id),
+    -- Oylik obuna holati — faqat ustalarga
+    'subscription',      case when exists (select 1 from provider_profiles pp where pp.user_id = p.id)
+                              then _subscription_json(p.id) end
   )
   into v
   from profiles p join auth.users u on u.id = p.id
@@ -2357,6 +2362,7 @@ begin
     'blocked_at', u.blocked_at, 'block_reason', u.block_reason,
     'provider_status', (select pp.status from provider_profiles pp where pp.user_id = u.id),
     'provider_verified', (select pp.id_verified_at is not null from provider_profiles pp where pp.user_id = u.id),
+    'paid_until', (select s.paid_until from provider_subscriptions s where s.user_id = u.id),
     'jobs_count', (select count(*) from jobs j where j.client_id = u.id),
     'contracts_count', (select count(*) from contracts k where k.client_id = u.id or k.provider_id = u.id)
   ) order by u.blocked_at desc nulls last, u.created_at desc), '[]'::jsonb)
@@ -4957,3 +4963,128 @@ from public, anon, authenticated;
 grant execute on function public.client_cancel_contract(uuid, text), public.open_warranty_claim(uuid, text),
   public.mark_warranty_fixed(uuid, text), public.confirm_warranty(uuid, boolean), public.admin_get_actions()
 to authenticated;
+
+
+-- ===== oylik obuna (komissiya o'rniga) =====
+-- Ustame mijozdan ham, ustadan ham komissiya olmaydi. Ustalar oylik obuna to'laydi:
+--   * bepul davr (free_until gacha) — hamma narsa hamma uchun cheklovsiz;
+--   * keyin obunasiz usta oyiga free_proposals ta taklif yuboradi (Toshkent vaqti bo'yicha kalendar oy),
+--     obunasi bor usta — cheklovsiz.
+-- To'lov hozircha qo'lda: usta pul o'tkazadi, admin admin_extend_subscription bilan muddatni uzaytiradi.
+create table if not exists public.subscription_settings (
+  id             int primary key default 1 check (id = 1),
+  -- Ilovaning birinchi 3 oyi to'liq bepul
+  free_until     timestamptz not null,
+  free_proposals int not null check (free_proposals >= 0),
+  price          int not null check (price > 0)
+);
+
+insert into public.subscription_settings (id, free_until, free_proposals, price)
+values (1, '2027-01-22 00:00:00+05', 5, 79000)
+on conflict (id) do nothing;
+
+alter table public.subscription_settings enable row level security;
+
+create table if not exists public.provider_subscriptions (
+  user_id    uuid primary key references public.users (id) on delete cascade,
+  paid_until timestamptz not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.provider_subscriptions enable row level security;
+
+-- Har bir uzaytirish (kim, kimga, necha oy, qancha) — hisob-kitob uchun
+create table if not exists public.subscription_payments (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references public.users (id) on delete cascade,
+  admin_id   uuid references public.users (id) on delete set null,
+  months     int not null check (months between 1 and 12),
+  amount     int not null check (amount >= 0),
+  paid_until timestamptz not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists subscription_payments_user_idx on public.subscription_payments (user_id, created_at desc);
+
+alter table public.subscription_payments enable row level security;
+
+-- Shu kalendar oyda (Toshkent vaqti) yuborilgan takliflar soni
+create or replace function public._proposals_this_month(p_user_id uuid)
+returns int language sql stable security definer set search_path = public as $$
+  select count(*)::int from proposals
+   where provider_id = p_user_id
+     and created_at >= date_trunc('month', now() at time zone 'Asia/Tashkent') at time zone 'Asia/Tashkent'
+$$;
+
+create or replace function public._subscription_json(p_user_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_set subscription_settings;
+  v_paid timestamptz;
+  v_used int := _proposals_this_month(p_user_id);
+begin
+  select * into v_set from subscription_settings where id = 1;
+  select paid_until into v_paid from provider_subscriptions where user_id = p_user_id;
+  return jsonb_build_object(
+    'free_until',     v_set.free_until,
+    'free_period',    now() < v_set.free_until,
+    'paid_until',     v_paid,
+    'active',         now() < v_set.free_until or coalesce(v_paid > now(), false),
+    'price',          v_set.price,
+    'free_proposals', v_set.free_proposals,
+    'used',           v_used
+  );
+end;
+$$;
+
+-- submit_proposal chaqiradi: obuna yoki bepul davr bo'lmasa, oylik bepul limit tugaganda SUBSCRIPTION_REQUIRED
+create or replace function public._check_proposal_quota(p_user_id uuid)
+returns void language plpgsql stable security definer set search_path = public as $$
+declare v_set subscription_settings;
+begin
+  select * into v_set from subscription_settings where id = 1;
+  if now() < v_set.free_until then return; end if;
+  if exists (select 1 from provider_subscriptions where user_id = p_user_id and paid_until > now()) then return; end if;
+  if _proposals_this_month(p_user_id) >= v_set.free_proposals then raise exception 'SUBSCRIPTION_REQUIRED'; end if;
+end;
+$$;
+
+create or replace function public.get_my_subscription()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  return _subscription_json(v_uid);
+end;
+$$;
+
+-- Admin: usta to'lov qilgach obunani uzaytiradi. Muddat qolgan obuna yoki bepul davr oxiridan boshlab
+-- qo'shiladi — bepul davrda to'lagan usta oylarini yo'qotmaydi.
+create or replace function public.admin_extend_subscription(p_user_id uuid, p_months int)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_admin uuid := require_admin();
+  v_set subscription_settings;
+  v_until timestamptz;
+begin
+  if p_months is null or p_months not between 1 and 12 then raise exception 'INVALID_INPUT'; end if;
+  if not exists (select 1 from provider_profiles where user_id = p_user_id) then raise exception 'NOT_FOUND'; end if;
+  select * into v_set from subscription_settings where id = 1;
+  select greatest(now(), v_set.free_until, (select paid_until from provider_subscriptions where user_id = p_user_id))
+         + make_interval(months => p_months)
+    into v_until;
+  insert into provider_subscriptions (user_id, paid_until) values (p_user_id, v_until)
+  on conflict (user_id) do update set paid_until = excluded.paid_until, updated_at = now();
+  insert into subscription_payments (user_id, admin_id, months, amount, paid_until)
+  values (p_user_id, v_admin, p_months, v_set.price * p_months, v_until);
+  perform queue_notification(p_user_id, format(
+    E'✅ Obunangiz %s gacha faollashtirildi — takliflar cheklovsiz.',
+    to_char(v_until at time zone 'Asia/Tashkent', 'DD.MM.YYYY')), '/subscription');
+  return _subscription_json(p_user_id);
+end;
+$$;
+
+revoke execute on function public._proposals_this_month(uuid), public._subscription_json(uuid),
+  public._check_proposal_quota(uuid), public.get_my_subscription(), public.admin_extend_subscription(uuid, int)
+from public, anon, authenticated;
+
+grant execute on function public.get_my_subscription(), public.admin_extend_subscription(uuid, int) to authenticated;
