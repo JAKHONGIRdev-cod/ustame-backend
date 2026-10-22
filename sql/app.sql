@@ -1256,7 +1256,7 @@ begin
   return coalesce((
     select jsonb_agg(jsonb_build_object(
       'id', m.id, 'sender_id', m.sender_id, 'text', m.text,
-      'created_at', m.created_at, 'read_at', m.read_at
+      'created_at', m.created_at, 'read_at', m.read_at, 'kind', m.kind, 'agreement_id', m.agreement_id
     ) order by m.created_at asc)
     from messages m
     where (m.contract_id = p_contract_id or (v_k.proposal_id is not null and m.proposal_id = v_k.proposal_id))
@@ -2301,7 +2301,11 @@ begin
     'id_docs',           _id_docs(p.id),
     -- Oylik obuna holati — faqat ustalarga
     'subscription',      case when exists (select 1 from provider_profiles pp where pp.user_id = p.id)
-                              then _subscription_json(p.id) end
+                              then _subscription_json(p.id) end,
+    -- Mijoz profili: shaxsiy yoki tashkilot, buyurtmalar statistikasi
+    'account_type',      (select x.account_type from users x where x.id = p.id),
+    'organization_name', (select x.organization_name from users x where x.id = p.id),
+    'client_stats',      client_stats(p.id)
   )
   into v
   from profiles p join auth.users u on u.id = p.id
@@ -4070,7 +4074,8 @@ begin
   if v_uid <> v_pp.provider_id and v_uid <> v_pp.client_id then raise exception 'NOT_ALLOWED'; end if;
   return coalesce((
     select jsonb_agg(jsonb_build_object('id', m.id, 'sender_id', m.sender_id, 'text', m.text,
-                                        'created_at', m.created_at, 'read_at', m.read_at) order by m.created_at asc)
+                                        'created_at', m.created_at, 'read_at', m.read_at,
+                                        'kind', m.kind, 'agreement_id', m.agreement_id) order by m.created_at asc)
     from messages m
     where m.proposal_id = p_proposal_id and (p_after is null or m.created_at > p_after)
   ), '[]'::jsonb);
@@ -4100,6 +4105,8 @@ declare
   v_link text;
   v_pp record;
 begin
+  -- Kelishuv tizim xabari: bildirishnomani _agreement_event o'zi yuboradi (takror bo'lmasin)
+  if new.kind = 'system' then return new; end if;
   if new.contract_id is not null then
     select case when client_id = new.sender_id then provider_id else client_id end
       into v_recipient from contracts where id = new.contract_id;
@@ -5153,3 +5160,819 @@ $$;
 
 revoke execute on function public.get_my_conversations(text) from public, anon, authenticated;
 grant execute on function public.get_my_conversations(text) to authenticated;
+
+
+-- ===== mijoz tomoni: buyurtma tafsilotlari, holati, murojaatlar =====
+-- Buyurtmaning qo'shimcha maydonlari (3 bosqichli e'lon formasi). post_job o'zgarmaydi — eski ilova ham ishlaydi;
+-- yangi ilova post_job dan keyin set_job_details ni chaqiradi.
+create table if not exists public.job_details (
+  job_id       uuid primary key references public.jobs (id) on delete cascade,
+  skills       text check (char_length(skills) <= 300),        -- kerakli tajriba va malaka
+  requirements text check (char_length(requirements) <= 1000), -- qo'shimcha talablar
+  budget_type  text check (budget_type in ('fixed', 'range', 'negotiable')),
+  budget_max   int check (budget_max between 10000 and 100000000),
+  start_date   date,
+  duration     text check (char_length(duration) <= 100),      -- taxminiy davomiylik ("2 kun")
+  deadline     date,                                             -- topshirish sanasi
+  materials    text check (materials in ('client', 'provider', 'agreed')),
+  conditions   text check (char_length(conditions) <= 1000),   -- ishni bajarish shartlari
+  notes        text check (char_length(notes) <= 1000),        -- mijozning qo'shimcha izohi
+  updated_at   timestamptz not null default now()
+);
+
+alter table public.job_details enable row level security;
+
+create or replace function public._job_details_json(p_job_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select to_jsonb(d) - 'job_id' from job_details d where d.job_id = p_job_id;
+$$;
+
+-- Bo'sh matn — null; uzunlik cheklovi oshsa INVALID_INPUT
+create or replace function public._opt_text(p jsonb, p_key text, p_max int)
+returns text language plpgsql immutable as $$
+declare v text := nullif(btrim(coalesce(p ->> p_key, '')), '');
+begin
+  if v is not null and char_length(v) > p_max then raise exception 'INVALID_INPUT'; end if;
+  return v;
+end;
+$$;
+
+create or replace function public._opt_date(p jsonb, p_key text)
+returns date language plpgsql immutable as $$
+begin
+  return nullif(p ->> p_key, '')::date;
+exception when others then
+  raise exception 'INVALID_DATE';
+end;
+$$;
+
+-- Buyurtma tafsilotlari: faqat e'lon egasi, e'lon ochiq bo'lganda. Narx oralig'i: jobs.budget — pastki chegara.
+create or replace function public.set_job_details(p_job_id uuid, p_details jsonb)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_job jobs;
+  v_type text := nullif(p_details ->> 'budget_type', '');
+  v_max int;
+  v_start date := _opt_date(p_details, 'start_date');
+  v_deadline date := _opt_date(p_details, 'deadline');
+  v_materials text := nullif(p_details ->> 'materials', '');
+begin
+  begin
+    v_max := nullif(p_details ->> 'budget_max', '')::int;
+  exception when others then
+    raise exception 'INVALID_PRICE';
+  end;
+  select * into v_job from jobs where id = p_job_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_job.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+  if v_type is not null and v_type not in ('fixed', 'range', 'negotiable') then raise exception 'INVALID_INPUT'; end if;
+  if v_type = 'range' and (v_max is null or v_job.budget is null or v_max < v_job.budget) then raise exception 'INVALID_PRICE'; end if;
+  if v_max is not null and v_max not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
+  if v_start is not null and v_deadline is not null and v_deadline < v_start then raise exception 'INVALID_DATE'; end if;
+  if v_materials is not null and v_materials not in ('client', 'provider', 'agreed') then raise exception 'INVALID_INPUT'; end if;
+  if _has_contact(concat_ws(' ', p_details ->> 'skills', p_details ->> 'requirements', p_details ->> 'conditions',
+                            p_details ->> 'notes')) then
+    raise exception 'CONTACT_NOT_ALLOWED';
+  end if;
+
+  insert into job_details (job_id, skills, requirements, budget_type, budget_max, start_date, duration, deadline,
+                           materials, conditions, notes, updated_at)
+  values (p_job_id, _opt_text(p_details, 'skills', 300), _opt_text(p_details, 'requirements', 1000), v_type,
+          case when v_type = 'range' then v_max end, v_start, _opt_text(p_details, 'duration', 100), v_deadline,
+          v_materials, _opt_text(p_details, 'conditions', 1000), _opt_text(p_details, 'notes', 1000), now())
+  on conflict (job_id) do update set
+    skills = excluded.skills, requirements = excluded.requirements, budget_type = excluded.budget_type,
+    budget_max = excluded.budget_max, start_date = excluded.start_date, duration = excluded.duration,
+    deadline = excluded.deadline, materials = excluded.materials, conditions = excluded.conditions,
+    notes = excluded.notes, updated_at = now();
+end;
+$$;
+
+-- E'lonni tahrirlash: faqat egasi, e'lon ochiq (usta hali tanlanmagan) bo'lsa; post_job bilan bir xil tekshiruvlar
+create or replace function public.update_job(
+  p_job_id uuid, p_category text, p_district text, p_title text, p_description text,
+  p_address text, p_budget int, p_urgency text
+)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_job jobs;
+begin
+  select * into v_job from jobs where id = p_job_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_job.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+  if coalesce(btrim(p_category), '') = '' or coalesce(btrim(p_district), '') = '' then raise exception 'INVALID_INPUT'; end if;
+  if char_length(btrim(coalesce(p_title, ''))) not between 5 and 80 then raise exception 'INVALID_TITLE'; end if;
+  if char_length(btrim(coalesce(p_description, ''))) not between 10 and 2000 then raise exception 'INVALID_DESCRIPTION'; end if;
+  if char_length(btrim(coalesce(p_address, ''))) not between 5 and 300 then raise exception 'INVALID_ADDRESS'; end if;
+  if p_budget is not null and p_budget not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
+  if coalesce(p_urgency, 'flexible') not in ('urgent', 'today', 'this_week', 'flexible') then raise exception 'INVALID_INPUT'; end if;
+  if _has_contact(p_title) or _has_contact(p_description) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
+
+  update jobs set category = btrim(p_category), district = btrim(p_district), title = btrim(p_title),
+                  description = btrim(p_description), budget = p_budget, urgency = coalesce(p_urgency, 'flexible')
+   where id = p_job_id;
+  insert into job_addresses (job_id, address) values (p_job_id, btrim(p_address))
+  on conflict (job_id) do update set address = excluded.address;
+end;
+$$;
+
+-- Buyurtmaning ko'rinadigan holati (mavjud e'lon va shartnoma ma'lumotlaridan hisoblanadi, alohida saqlanmaydi):
+--   new · awaiting_proposals · provider_selected · awaiting_start · in_progress · awaiting_completion ·
+--   completed · cancelled · disputed
+create or replace function public._order_status(p_job_id uuid)
+returns text language sql stable security definer set search_path = public as $$
+  select case
+    when k.status = 'disputed' then 'disputed'
+    when k.status = 'completed' or j.status = 'completed' then 'completed'
+    when j.status = 'cancelled' then 'cancelled'
+    when k.status = 'submitted' then 'awaiting_completion'
+    when k.status = 'active' and k.started_at is not null then 'in_progress'
+    when k.status = 'active' and (k.on_the_way_at is not null or k.arrived_at is not null) then 'awaiting_start'
+    when k.status = 'active' then 'provider_selected'
+    when j.created_at > now() - interval '24 hours'
+         and not exists (select 1 from proposals p where p.job_id = j.id and p.status = 'submitted') then 'new'
+    else 'awaiting_proposals'
+  end
+  from jobs j
+  left join lateral (
+    select * from contracts c where c.job_id = j.id and c.status <> 'cancelled' order by c.created_at desc limit 1
+  ) k on true
+  where j.id = p_job_id;
+$$;
+
+-- Murojaat: ustaning ish boshlash imkoniyati va taxminiy davomiylik; mijoz ko'rib chiqqan vaqt
+alter table public.proposals add column if not exists available_from date;
+alter table public.proposals add column if not exists duration text check (char_length(duration) <= 100);
+alter table public.proposals add column if not exists client_viewed_at timestamptz;
+
+create or replace function public.set_proposal_terms(p_proposal_id uuid, p_available_from date, p_duration text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_p proposals;
+  v_duration text := nullif(btrim(coalesce(p_duration, '')), '');
+begin
+  select * into v_p from proposals where id = p_proposal_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_p.provider_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_p.status <> 'submitted' then raise exception 'INVALID_STATE'; end if;
+  if char_length(coalesce(v_duration, '')) > 100 then raise exception 'INVALID_INPUT'; end if;
+  if _has_contact(v_duration) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
+  update proposals set available_from = p_available_from, duration = v_duration, updated_at = now()
+   where id = p_proposal_id;
+end;
+$$;
+
+-- Mijoz murojaatni ochib ko'rdi ("Yangi" -> "Ko'rib chiqilgan")
+create or replace function public.mark_proposal_viewed(p_proposal_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_p proposals;
+begin
+  select * into v_p from proposals where id = p_proposal_id;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if job_client_id(v_p.job_id) is distinct from v_uid then raise exception 'NOT_ALLOWED'; end if;
+  update proposals set client_viewed_at = now() where id = p_proposal_id and client_viewed_at is null;
+end;
+$$;
+
+-- Ustaning portfolio rasmlari (eng yangi 4 tasi) — murojaat kartasi uchun
+create or replace function public._portfolio_json(p_user_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('path', f.path, 'updated_at', f.updated_at) order by f.updated_at desc), '[]'::jsonb)
+  from (select path, updated_at from files
+         where bucket = 'portfolio-photos' and path like p_user_id::text || '/%'
+         order by updated_at desc limit 4) f;
+$$;
+
+-- get_my_jobs: + ko'rinadigan holat, yangi (ko'rilmagan) murojaatlar, manzil, tafsilotlar
+create or replace function public.get_my_jobs()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', j.id, 'title', j.title, 'category', j.category, 'district', j.district,
+      'budget', j.budget, 'urgency', j.urgency, 'status', j.status, 'created_at', j.created_at,
+      'has_photo', j.has_photo,
+      'order_status', _order_status(j.id),
+      'address', (select a.address from job_addresses a where a.job_id = j.id),
+      'details', _job_details_json(j.id),
+      'proposals_count', (select count(*) from proposals p where p.job_id = j.id and p.status = 'submitted'),
+      'new_proposals', (select count(*) from proposals p
+                         where p.job_id = j.id and p.status = 'submitted' and p.client_viewed_at is null),
+      'contract', (
+        select jsonb_build_object('id', k.id, 'status', k.status, 'provider_name', pr.full_name, 'price', k.price)
+        from contracts k join profiles pr on pr.id = k.provider_id
+        where k.job_id = j.id order by k.created_at desc limit 1
+      )
+    ) order by j.created_at desc)
+    from jobs j where j.client_id = v_uid
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Mijozning ochiq e'lonlariga yaqinda murojaat qilgan ustalar (bosh sahifa)
+create or replace function public.get_recent_applicants(p_limit int default 10)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  return coalesce((
+    select jsonb_agg(x.item order by x.created_at desc)
+    from (
+      select p.created_at, jsonb_build_object(
+        'proposal_id', p.id, 'price', p.price, 'created_at', p.created_at, 'viewed', p.client_viewed_at is not null,
+        'job', jsonb_build_object('id', j.id, 'title', j.title),
+        'provider', jsonb_build_object('id', pr.id, 'full_name', pr.full_name, 'avatar_updated_at', pr.avatar_updated_at,
+                                       'stats', provider_stats(pr.id))
+      ) as item
+      from proposals p
+      join jobs j on j.id = p.job_id
+      join profiles pr on pr.id = p.provider_id
+      where j.client_id = v_uid and j.status = 'open' and p.status = 'submitted' and not _blocked(v_uid, p.provider_id)
+      order by p.created_at desc
+      limit least(greatest(coalesce(p_limit, 10), 1), 30)
+    ) x
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- get_job_proposals: + rasm, shaxsi tasdiqlanganmi, mutaxassisliklar, portfolio, ish boshlash va davomiylik,
+-- mijoz ko'rib chiqqanmi. Saralash va "tavsiya" avvalgidek.
+create or replace function public.get_job_proposals(p_job_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if job_client_id(p_job_id) is distinct from v_uid then raise exception 'NOT_ALLOWED'; end if;
+
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', x.id, 'price', x.price, 'message', x.message, 'status', x.status, 'created_at', x.created_at,
+      'eta_minutes', x.eta_minutes, 'score', round(x.score),
+      'available_from', x.available_from, 'duration', x.duration, 'viewed', x.client_viewed_at is not null,
+      'recommended', x.status = 'submitted' and x.rank <= 3,
+      'unread', (select count(*) from messages m where m.proposal_id = x.id and m.sender_id <> v_uid and m.read_at is null),
+      'provider', x.provider,
+      'team', (select jsonb_build_object('id', t.id, 'name', t.name, 'kind', t.kind, 'size', t.size,
+                                         'stats', team_stats(t.id))
+               from teams t where t.id = x.team_id)
+    ) order by (x.status = 'submitted') desc, x.score desc, x.created_at asc)
+    from (
+      select y.*, rank() over (partition by y.status = 'submitted' order by y.score desc, y.created_at) as rank
+      from (
+        select p.id, p.price, p.message, p.status, p.created_at, p.eta_minutes, p.team_id,
+          p.available_from, p.duration, p.client_viewed_at,
+          jsonb_build_object('id', pr.id, 'full_name', pr.full_name, 'headline', pp.headline,
+                             'avatar_updated_at', pr.avatar_updated_at, 'categories', pp.categories,
+                             'verified', pp.id_verified_at is not null, 'portfolio', _portfolio_json(pr.id),
+                             'experience_years', pp.experience_years, 'stats', st.s) as provider,
+          coalesce((st.s->>'avg_rating')::numeric, 4.0) * 20
+            + least((st.s->>'completed_jobs')::int, 20) * 1.5
+            - (st.s->>'withdrawals')::int * 10
+            - (st.s->>'disputes_lost')::int * 15
+            + (coalesce((st.s->>'on_time_rate')::numeric, 85) - 85) * 0.4
+            + case when p.team_id is not null and (select crew_needed from jobs where id = p_job_id) then 15 else 0 end
+            + case when p.eta_minutes is not null then greatest(0, 30 - p.eta_minutes / 2.0) else 0 end
+            + 20.0 * min(p.price) filter (where p.status = 'submitted') over () / p.price
+            as score
+        from proposals p
+        join profiles pr on pr.id = p.provider_id
+        left join provider_profiles pp on pp.user_id = p.provider_id
+        cross join lateral (select provider_stats(pr.id) as s) st
+        where p.job_id = p_job_id and p.status in ('submitted', 'declined', 'accepted')
+          and (p.status = 'accepted' or not _blocked(v_uid, p.provider_id))
+      ) y
+    ) x
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Yangi baho haqida bildirishnoma (baho matni 14 kun yoki ikkala tomon baho qo'yguncha yashirin)
+create or replace function public.notify_new_review()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_name text;
+begin
+  select full_name into v_name from profiles where id = new.reviewer_id;
+  perform queue_notification(new.reviewee_id, format(
+    E'⭐ %s sizga baho qo''ydi. Baholar ikkala tomon baho qo''ygach yoki 14 kundan keyin ochiladi.', v_name),
+    '/contract/' || new.contract_id);
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_notify_new_review on public.reviews;
+create trigger trg_notify_new_review after insert on public.reviews
+for each row execute function public.notify_new_review();
+
+-- Mijoz profili: shaxsiy yoki tashkilot
+alter table public.users add column if not exists account_type text not null default 'personal';
+alter table public.users add column if not exists organization_name text;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'users_account_type_check') then
+    alter table public.users add constraint users_account_type_check check (account_type in ('personal', 'organization'));
+  end if;
+end $$;
+
+create or replace function public.set_account_type(p_type text, p_organization_name text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_org text := nullif(btrim(coalesce(p_organization_name, '')), '');
+begin
+  if p_type is null or p_type not in ('personal', 'organization') then raise exception 'INVALID_INPUT'; end if;
+  if p_type = 'organization' and char_length(coalesce(v_org, '')) not between 2 and 120 then raise exception 'INVALID_NAME'; end if;
+  update users set account_type = p_type, organization_name = case when p_type = 'organization' then v_org end
+   where id = v_uid;
+end;
+$$;
+
+
+-- ===== ixtiyoriy kelishuv =====
+-- Mijoz va usta ishni boshlashdan oldin muhim shartlarni ilova ichida sodda shaklda qayd etadi. Butunlay ixtiyoriy:
+-- buyurtma, murojaat, shartnoma va yozishmalar kelishuvsiz ham avvalgidek ishlaydi; rad etish e'lonni bekor qilmaydi.
+-- Mavjud to'liq shartnoma (contracts) alohida qoladi — kelishuv uning narxi yoki to'loviga ta'sir qilmaydi.
+--
+-- Qoidalar (server tomonida majburiy):
+--   * kelishuv buyurtma egasi (mijoz) va shu e'longa murojaat qilgan usta o'rtasida; ko'radi va o'zgartiradi
+--     faqat shu ikkisi; yuborilmagan qoralamani (sent_at is null) — faqat muallifi;
+--   * shartlarning har bir o'zgarishi — yangi versiya; yuborgan tomon o'z versiyasini tasdiqlagan hisoblanadi,
+--     oldingi versiya tasdiqlari yangisiga o'tmaydi;
+--   * kelishuv faqat ikkala tomon AYNAN BIR versiyani tasdiqlaganda "accepted" bo'ladi; tasdiqlangan
+--     kelishuvga o'zgartirish taklif qilinsa, yangi versiya tasdiqlanguncha eskisi amalda qoladi (accepted_version);
+--   * har bir amal (kim, qachon, qaysi versiya) agreement_events da saqlanadi, hech narsa o'chirilmaydi;
+--   * bitta e'lon va usta uchun bir vaqtda faqat bitta ochiq kelishuv;
+--   * amallar agreements qatorini qulflab bajariladi va kutilgan versiya tekshiriladi (VERSION_CHANGED) —
+--     bir vaqtda kelgan o'zgarishlar tasdiqlarni chalkashtirmaydi.
+create table if not exists public.agreements (
+  id               uuid primary key default gen_random_uuid(),
+  number           bigint generated always as identity unique,
+  job_id           uuid not null references public.jobs (id) on delete cascade,
+  proposal_id      uuid not null references public.proposals (id) on delete cascade,
+  client_id        uuid not null references public.users (id) on delete cascade,
+  provider_id      uuid not null references public.users (id) on delete cascade,
+  status           text not null check (status in ('draft', 'proposed', 'changes_proposed', 'accepted', 'rejected', 'cancelled')),
+  current_version  int not null default 1,
+  accepted_version int,
+  accepted_at      timestamptz,
+  created_by       uuid not null references public.users (id) on delete cascade,
+  created_at       timestamptz not null default now(),
+  -- Qarshi tomonga yuborilgan vaqt; null — qoralama, uni faqat muallif ko'radi
+  sent_at          timestamptz,
+  updated_at       timestamptz not null default now(),
+  closed_by        uuid references public.users (id) on delete set null,
+  closed_at        timestamptz,
+  close_reason     text check (char_length(close_reason) <= 500)
+);
+
+-- Bir juftlik (e'lon + usta) uchun bitta ochiq kelishuv; qoralamalar hisobga kirmaydi (yuborishda tekshiriladi)
+create unique index if not exists agreements_one_open on public.agreements (job_id, provider_id)
+  where status in ('proposed', 'changes_proposed', 'accepted');
+create index if not exists agreements_client_idx on public.agreements (client_id, updated_at desc);
+create index if not exists agreements_provider_idx on public.agreements (provider_id, updated_at desc);
+
+create table if not exists public.agreement_versions (
+  agreement_id uuid not null references public.agreements (id) on delete cascade,
+  version      int not null,
+  terms        jsonb not null,
+  comment      text check (char_length(comment) <= 500),
+  created_by   uuid not null references public.users (id) on delete cascade,
+  created_at   timestamptz not null default now(),
+  primary key (agreement_id, version)
+);
+
+create table if not exists public.agreement_approvals (
+  agreement_id uuid not null,
+  version      int not null,
+  user_id      uuid not null references public.users (id) on delete cascade,
+  approved_at  timestamptz not null default now(),
+  primary key (agreement_id, version, user_id),
+  foreign key (agreement_id, version) references public.agreement_versions (agreement_id, version) on delete cascade
+);
+
+create table if not exists public.agreement_events (
+  id           bigint generated always as identity primary key,
+  agreement_id uuid not null references public.agreements (id) on delete cascade,
+  version      int,
+  actor_id     uuid references public.users (id) on delete set null,
+  action       text not null check (action in ('draft', 'sent', 'approved', 'changes_proposed', 'confirmed',
+                                               'rejected', 'change_rejected', 'cancelled')),
+  comment      text check (char_length(comment) <= 500),
+  created_at   timestamptz not null default now()
+);
+
+create index if not exists agreement_events_idx on public.agreement_events (agreement_id, id);
+
+alter table public.agreements enable row level security;
+alter table public.agreement_versions enable row level security;
+alter table public.agreement_approvals enable row level security;
+alter table public.agreement_events enable row level security;
+
+-- Tizim xabarlari yozishmada (kelishuv holati o'zgarganda) — haqiqiy holatdan yoziladi
+alter table public.messages add column if not exists kind text not null default 'text';
+alter table public.messages add column if not exists agreement_id uuid references public.agreements (id) on delete set null;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'messages_kind_check') then
+    alter table public.messages add constraint messages_kind_check check (kind in ('text', 'system'));
+  end if;
+end $$;
+
+-- Shartlarni tekshiradi va bir xil ko'rinishga keltiradi. Narx yoki muddat noma'lum bo'lsa — null
+-- ("Hali kelishilmagan"), o'ylab topilmaydi.
+create or replace function public._agreement_terms(p jsonb)
+returns jsonb language plpgsql immutable as $$
+declare
+  v_scope text := btrim(coalesce(p ->> 'scope', ''));
+  v_price int;
+  v_price_type text := coalesce(nullif(p ->> 'price_type', ''), 'negotiable');
+  v_start date := _opt_date(p, 'start_date');
+  v_end date := _opt_date(p, 'end_date');
+  v_materials text := nullif(p ->> 'materials', '');
+begin
+  if char_length(v_scope) not between 10 and 2000 then raise exception 'INVALID_SCOPE'; end if;
+  begin
+    v_price := nullif(p ->> 'price', '')::int;
+  exception when others then
+    raise exception 'INVALID_PRICE';
+  end;
+  if v_price is not null and v_price not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
+  if v_price_type not in ('fixed', 'negotiable') then raise exception 'INVALID_INPUT'; end if;
+  if v_price_type = 'fixed' and v_price is null then raise exception 'INVALID_PRICE'; end if;
+  if v_start is not null and v_end is not null and v_end < v_start then raise exception 'INVALID_DATE'; end if;
+  if v_materials is not null and v_materials not in ('client', 'provider', 'shared') then raise exception 'INVALID_INPUT'; end if;
+  return jsonb_build_object(
+    'scope', v_scope,
+    'price', v_price,
+    'price_type', v_price_type,
+    'start_date', v_start,
+    'end_date', v_end,
+    'duration', _opt_text(p, 'duration', 100),
+    'materials', v_materials,
+    'payment_terms', _opt_text(p, 'payment_terms', 500),
+    'extra_work', _opt_text(p, 'extra_work', 500),
+    'notes', _opt_text(p, 'notes', 1000)
+  );
+end;
+$$;
+
+-- Amal yozuvi + qarshi tomonga bildirishnoma + yozishmada tizim xabari (taklif chati; shartnoma chati uni ham ko'rsatadi)
+create or replace function public._agreement_event(p_a agreements, p_actor uuid, p_action text, p_version int, p_comment text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_name text;
+  v_title text;
+  v_other uuid := case when p_actor = p_a.client_id then p_a.provider_id else p_a.client_id end;
+  v_text text;
+  v_link text := '/agreement/' || p_a.id;
+begin
+  insert into agreement_events (agreement_id, version, actor_id, action, comment)
+  values (p_a.id, p_version, p_actor, p_action, nullif(btrim(coalesce(p_comment, '')), ''));
+  if p_action = 'draft' then return; end if;  -- qoralama qarshi tomonga ko'rinmaydi
+
+  select full_name into v_name from profiles where id = p_actor;
+  select title into v_title from jobs where id = p_a.job_id;
+  v_text := case p_action
+    when 'sent' then format('%s "%s" bo''yicha kelishuv taklifini yubordi.', v_name, v_title)
+    when 'changes_proposed' then format('%s kelishuvga o''zgartirish taklif qildi (%s-versiya).', v_name, p_version)
+    when 'approved' then format('%s kelishuvning %s-versiyasini tasdiqladi.', v_name, p_version)
+    when 'confirmed' then format('Ikkala tomon kelishuvning %s-versiyasini tasdiqladi.', p_version)
+    when 'rejected' then format('%s kelishuv taklifini rad etdi.', v_name)
+    when 'change_rejected' then format('%s o''zgartirish taklifini rad etdi — amaldagi %s-versiya kuchda qoladi.',
+                                       v_name, p_a.accepted_version)
+    when 'cancelled' then format('%s kelishuvni bekor qildi.', v_name)
+  end;
+
+  insert into messages (proposal_id, sender_id, text, kind, agreement_id)
+  values (p_a.proposal_id, p_actor, v_text, 'system', p_a.id);
+
+  perform queue_notification(v_other, E'\U0001F91D ' || v_text, v_link);
+  if p_action = 'confirmed' then
+    perform queue_notification(p_actor, E'\U0001F91D ' || v_text, v_link);
+  end if;
+end;
+$$;
+
+-- Shu e'lon va usta uchun yuborilgan ochiq kelishuv bormi
+create or replace function public._agreement_open_exists(p_job_id uuid, p_provider_id uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from agreements a where a.job_id = p_job_id and a.provider_id = p_provider_id
+                  and a.status in ('proposed', 'changes_proposed', 'accepted'));
+$$;
+
+-- Kelishuvni yaratish (mijoz yoki usta). p_send = false — qoralama (faqat muallif ko'radi).
+create or replace function public.create_agreement(p_proposal_id uuid, p_terms jsonb, p_send boolean default true)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_p proposals;
+  v_job jobs;
+  v_terms jsonb := _agreement_terms(p_terms);
+  v_a agreements;
+begin
+  select * into v_p from proposals where id = p_proposal_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  select * into v_job from jobs where id = v_p.job_id;
+  if v_uid <> v_job.client_id and v_uid <> v_p.provider_id then raise exception 'NOT_ALLOWED'; end if;
+  if v_p.status not in ('submitted', 'accepted') or v_job.status = 'cancelled' then raise exception 'INVALID_STATE'; end if;
+  if _blocked(v_job.client_id, v_p.provider_id) then raise exception 'USER_BLOCKED'; end if;
+  if _has_contact(v_terms::text) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
+  if _agreement_open_exists(v_job.id, v_p.provider_id)
+     or exists (select 1 from agreements a where a.job_id = v_job.id and a.provider_id = v_p.provider_id
+                 and a.status = 'draft' and a.created_by = v_uid) then
+    raise exception 'AGREEMENT_EXISTS';
+  end if;
+
+  insert into agreements (job_id, proposal_id, client_id, provider_id, status, created_by, sent_at)
+  values (v_job.id, v_p.id, v_job.client_id, v_p.provider_id,
+          case when coalesce(p_send, true) then 'proposed' else 'draft' end, v_uid,
+          case when coalesce(p_send, true) then now() end)
+  returning * into v_a;
+  insert into agreement_versions (agreement_id, version, terms, created_by) values (v_a.id, 1, v_terms, v_uid);
+  if coalesce(p_send, true) then
+    insert into agreement_approvals (agreement_id, version, user_id) values (v_a.id, 1, v_uid);
+    perform _agreement_event(v_a, v_uid, 'sent', 1, null);
+  else
+    perform _agreement_event(v_a, v_uid, 'draft', 1, null);
+  end if;
+  return v_a.id;
+end;
+$$;
+
+-- Qoralamani saqlash (shartlarni almashtirish) va/yoki yuborish — faqat muallif
+create or replace function public.save_agreement_draft(p_agreement_id uuid, p_terms jsonb, p_send boolean default false)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_a agreements;
+  v_terms jsonb;
+begin
+  select * into v_a from agreements where id = p_agreement_id for update;
+  if not found or v_a.created_by <> v_uid then raise exception 'NOT_FOUND'; end if;
+  if v_a.status <> 'draft' then raise exception 'INVALID_STATE'; end if;
+  if p_terms is not null then
+    v_terms := _agreement_terms(p_terms);
+    if _has_contact(v_terms::text) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
+    update agreement_versions set terms = v_terms, created_at = now() where agreement_id = v_a.id and version = 1;
+  end if;
+  if coalesce(p_send, false) then
+    if _agreement_open_exists(v_a.job_id, v_a.provider_id) then raise exception 'AGREEMENT_EXISTS'; end if;
+    update agreements set status = 'proposed', sent_at = now(), updated_at = now() where id = v_a.id returning * into v_a;
+    insert into agreement_approvals (agreement_id, version, user_id) values (v_a.id, 1, v_uid);
+    perform _agreement_event(v_a, v_uid, 'sent', 1, null);
+  end if;
+end;
+$$;
+
+-- Tasdiqlash: faqat joriy (kutilayotgan) versiya; ikkala tomon tasdiqlasa — "accepted"
+create or replace function public.approve_agreement(p_agreement_id uuid, p_version int)
+returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_a agreements;
+begin
+  select * into v_a from agreements where id = p_agreement_id for update;
+  if not found or (v_uid <> v_a.client_id and v_uid <> v_a.provider_id) or v_a.status = 'draft' then
+    raise exception 'NOT_FOUND';
+  end if;
+  if v_a.status not in ('proposed', 'changes_proposed') then raise exception 'INVALID_STATE'; end if;
+  if p_version is distinct from v_a.current_version then raise exception 'VERSION_CHANGED'; end if;
+  if exists (select 1 from agreement_approvals where agreement_id = v_a.id and version = p_version and user_id = v_uid) then
+    raise exception 'ALREADY_APPROVED';
+  end if;
+
+  insert into agreement_approvals (agreement_id, version, user_id) values (v_a.id, p_version, v_uid);
+  if (select count(*) from agreement_approvals
+       where agreement_id = v_a.id and version = p_version and user_id in (v_a.client_id, v_a.provider_id)) = 2 then
+    update agreements set status = 'accepted', accepted_version = p_version, accepted_at = now(), updated_at = now()
+     where id = v_a.id returning * into v_a;
+    perform _agreement_event(v_a, v_uid, 'confirmed', p_version, null);
+    return 'accepted';
+  end if;
+  update agreements set updated_at = now() where id = v_a.id;
+  perform _agreement_event(v_a, v_uid, 'approved', p_version, null);
+  return v_a.status;
+end;
+$$;
+
+-- O'zgartirish taklifi: yangi versiya (taklif qilgan tomon uni tasdiqlagan hisoblanadi). Tasdiqlangan kelishuvga ham
+-- taklif qilish mumkin — yangi versiya tasdiqlanguncha amaldagi versiya kuchda qoladi.
+create or replace function public.propose_agreement_changes(p_agreement_id uuid, p_base_version int, p_terms jsonb, p_comment text default null)
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_a agreements;
+  v_terms jsonb := _agreement_terms(p_terms);
+  v_version int;
+begin
+  if char_length(coalesce(p_comment, '')) > 500 then raise exception 'INVALID_INPUT'; end if;
+  select * into v_a from agreements where id = p_agreement_id for update;
+  if not found or (v_uid <> v_a.client_id and v_uid <> v_a.provider_id) or v_a.status = 'draft' then
+    raise exception 'NOT_FOUND';
+  end if;
+  if v_a.status not in ('proposed', 'changes_proposed', 'accepted') then raise exception 'INVALID_STATE'; end if;
+  if p_base_version is distinct from v_a.current_version then raise exception 'VERSION_CHANGED'; end if;
+  if _has_contact(v_terms::text) or _has_contact(p_comment) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
+  if v_terms = (select terms from agreement_versions where agreement_id = v_a.id and version = v_a.current_version) then
+    raise exception 'NO_CHANGES';
+  end if;
+
+  v_version := v_a.current_version + 1;
+  insert into agreement_versions (agreement_id, version, terms, comment, created_by)
+  values (v_a.id, v_version, v_terms, nullif(btrim(coalesce(p_comment, '')), ''), v_uid);
+  insert into agreement_approvals (agreement_id, version, user_id) values (v_a.id, v_version, v_uid);
+  update agreements set status = 'changes_proposed', current_version = v_version, updated_at = now()
+   where id = v_a.id returning * into v_a;
+  perform _agreement_event(v_a, v_uid, 'changes_proposed', v_version, p_comment);
+  return v_version;
+end;
+$$;
+
+-- Rad etish: kutilayotgan versiyani qabul qilmagan tomon. Avval tasdiqlangan versiya bo'lsa — u amalda qoladi.
+create or replace function public.reject_agreement(p_agreement_id uuid, p_version int, p_reason text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_a agreements;
+begin
+  if char_length(coalesce(p_reason, '')) > 500 then raise exception 'INVALID_INPUT'; end if;
+  select * into v_a from agreements where id = p_agreement_id for update;
+  if not found or (v_uid <> v_a.client_id and v_uid <> v_a.provider_id) or v_a.status = 'draft' then
+    raise exception 'NOT_FOUND';
+  end if;
+  if v_a.status not in ('proposed', 'changes_proposed') then raise exception 'INVALID_STATE'; end if;
+  if p_version is distinct from v_a.current_version then raise exception 'VERSION_CHANGED'; end if;
+  -- O'zi taklif qilgan versiyani rad etib bo'lmaydi — buning uchun "bekor qilish"
+  if exists (select 1 from agreement_approvals where agreement_id = v_a.id and version = p_version and user_id = v_uid) then
+    raise exception 'NOT_ALLOWED';
+  end if;
+
+  if v_a.accepted_version is not null then
+    update agreements set status = 'accepted', updated_at = now() where id = v_a.id returning * into v_a;
+    perform _agreement_event(v_a, v_uid, 'change_rejected', p_version, p_reason);
+  else
+    update agreements set status = 'rejected', closed_by = v_uid, closed_at = now(),
+                          close_reason = nullif(btrim(coalesce(p_reason, '')), ''), updated_at = now()
+     where id = v_a.id returning * into v_a;
+    perform _agreement_event(v_a, v_uid, 'rejected', p_version, p_reason);
+  end if;
+end;
+$$;
+
+-- Bekor qilish: istalgan tomon (qoralamani — muallif). Tarix saqlanadi, kim bekor qilgani yoziladi.
+create or replace function public.cancel_agreement(p_agreement_id uuid, p_reason text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_a agreements;
+begin
+  if char_length(coalesce(p_reason, '')) > 500 then raise exception 'INVALID_INPUT'; end if;
+  select * into v_a from agreements where id = p_agreement_id for update;
+  if not found or (v_uid <> v_a.client_id and v_uid <> v_a.provider_id)
+     or (v_a.sent_at is null and v_a.created_by <> v_uid) then
+    raise exception 'NOT_FOUND';
+  end if;
+  if v_a.status in ('rejected', 'cancelled') then raise exception 'INVALID_STATE'; end if;
+  update agreements set status = 'cancelled', closed_by = v_uid, closed_at = now(),
+                        close_reason = nullif(btrim(coalesce(p_reason, '')), ''), updated_at = now()
+   where id = v_a.id returning * into v_a;
+  if v_a.sent_at is null then
+    -- Yuborilmagan qoralama: faqat tarixga, qarshi tomon bilmaydi
+    insert into agreement_events (agreement_id, version, actor_id, action, comment)
+    values (v_a.id, v_a.current_version, v_uid, 'cancelled', v_a.close_reason);
+  else
+    perform _agreement_event(v_a, v_uid, 'cancelled', v_a.current_version, v_a.close_reason);
+  end if;
+end;
+$$;
+
+-- Qisqa ko'rinish (ro'yxatlar uchun): kutilayotgan amal kimda
+create or replace function public._agreement_brief(p_a agreements, p_uid uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'id', p_a.id, 'number', p_a.number, 'status', p_a.status, 'job_id', p_a.job_id, 'proposal_id', p_a.proposal_id,
+    'current_version', p_a.current_version, 'accepted_version', p_a.accepted_version, 'updated_at', p_a.updated_at,
+    'counterpart', (select jsonb_build_object('id', u.id, 'full_name', u.full_name) from profiles u
+                     where u.id = case when p_uid = p_a.client_id then p_a.provider_id else p_a.client_id end),
+    'pending_for_me', p_a.status in ('proposed', 'changes_proposed')
+      and not exists (select 1 from agreement_approvals ap
+                       where ap.agreement_id = p_a.id and ap.version = p_a.current_version and ap.user_id = p_uid)
+  );
+$$;
+
+create or replace function public.get_agreement(p_agreement_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_a agreements;
+begin
+  select * into v_a from agreements where id = p_agreement_id;
+  if not found or (v_uid <> v_a.client_id and v_uid <> v_a.provider_id)
+     or (v_a.sent_at is null and v_a.created_by <> v_uid) then
+    raise exception 'NOT_FOUND';
+  end if;
+  return _agreement_brief(v_a, v_uid) || jsonb_build_object(
+    'my_role', case when v_uid = v_a.client_id then 'client' else 'provider' end,
+    'created_by', v_a.created_by, 'created_at', v_a.created_at, 'sent_at', v_a.sent_at, 'accepted_at', v_a.accepted_at,
+    'closed_by', v_a.closed_by, 'closed_at', v_a.closed_at, 'close_reason', v_a.close_reason,
+    'job', (select jsonb_build_object('id', j.id, 'title', j.title, 'category', j.category, 'district', j.district)
+              from jobs j where j.id = v_a.job_id),
+    'client', (select jsonb_build_object('id', u.id, 'full_name', u.full_name, 'avatar_updated_at', u.avatar_updated_at)
+                 from profiles u where u.id = v_a.client_id),
+    'provider', (select jsonb_build_object('id', u.id, 'full_name', u.full_name, 'avatar_updated_at', u.avatar_updated_at)
+                   from profiles u where u.id = v_a.provider_id),
+    'contract', (select jsonb_build_object('id', k.id, 'status', k.status) from contracts k
+                  where k.proposal_id = v_a.proposal_id),
+    'versions', (select jsonb_agg(jsonb_build_object(
+                    'version', v.version, 'terms', v.terms, 'comment', v.comment, 'created_by', v.created_by,
+                    'created_at', v.created_at,
+                    'approvals', (select coalesce(jsonb_agg(jsonb_build_object('user_id', ap.user_id, 'approved_at', ap.approved_at)
+                                                            order by ap.approved_at), '[]'::jsonb)
+                                    from agreement_approvals ap
+                                   where ap.agreement_id = v.agreement_id and ap.version = v.version)
+                  ) order by v.version desc)
+                  from agreement_versions v where v.agreement_id = v_a.id),
+    'events', (select jsonb_agg(jsonb_build_object(
+                  'action', e.action, 'version', e.version, 'actor_id', e.actor_id, 'comment', e.comment,
+                  'created_at', e.created_at, 'actor_name', (select full_name from profiles where id = e.actor_id)
+                ) order by e.id desc)
+                from agreement_events e where e.agreement_id = v_a.id
+                  and (e.action <> 'draft' or e.actor_id = v_uid))
+  );
+end;
+$$;
+
+-- Buyurtmaning kelishuvlari: mijozga — hammasi (boshqaning qoralamasisiz), ustaga — faqat o'ziniki
+create or replace function public.get_job_agreements(p_job_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if not exists (select 1 from jobs where id = p_job_id) then raise exception 'NOT_FOUND'; end if;
+  return coalesce((
+    select jsonb_agg(_agreement_brief(a, v_uid) order by a.updated_at desc)
+    from agreements a
+    where a.job_id = p_job_id and (a.client_id = v_uid or a.provider_id = v_uid)
+      and (a.sent_at is not null or a.created_by = v_uid)
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Yozishma (taklif yoki shartnoma chati) uchun: shu juftlikning oxirgi kelishuvi va yangisini yaratish mumkinmi
+create or replace function public.get_chat_agreement(p_proposal_id uuid default null, p_contract_id uuid default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_proposal uuid := p_proposal_id;
+  v_p proposals;
+  v_client uuid;
+  v_a agreements;
+begin
+  if v_proposal is null then
+    select k.proposal_id into v_proposal from contracts k
+     where k.id = p_contract_id and (k.client_id = v_uid or k.provider_id = v_uid);
+  end if;
+  select * into v_p from proposals where id = v_proposal;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  v_client := job_client_id(v_p.job_id);
+  if v_uid <> v_client and v_uid <> v_p.provider_id then raise exception 'NOT_ALLOWED'; end if;
+
+  select * into v_a from agreements a
+   where a.job_id = v_p.job_id and a.provider_id = v_p.provider_id and (a.sent_at is not null or a.created_by = v_uid)
+   order by (a.status in ('proposed', 'changes_proposed', 'accepted')) desc, a.created_at desc limit 1;
+  return jsonb_build_object(
+    'proposal_id', v_p.id,
+    'agreement', case when v_a.id is not null then _agreement_brief(v_a, v_uid) end,
+    'can_create', v_p.status in ('submitted', 'accepted') and not _agreement_open_exists(v_p.job_id, v_p.provider_id)
+      and (v_a.id is null or v_a.status in ('rejected', 'cancelled'))
+  );
+end;
+$$;
+
+revoke execute on function
+  public._job_details_json(uuid), public._opt_text(jsonb, text, int), public._opt_date(jsonb, text),
+  public.set_job_details(uuid, jsonb), public.update_job(uuid, text, text, text, text, text, int, text),
+  public._order_status(uuid), public.set_proposal_terms(uuid, date, text), public.mark_proposal_viewed(uuid),
+  public._portfolio_json(uuid), public.get_my_jobs(), public.get_recent_applicants(int), public.get_job_proposals(uuid),
+  public.notify_new_review(), public.set_account_type(text, text),
+  public._agreement_terms(jsonb), public._agreement_event(agreements, uuid, text, int, text),
+  public._agreement_open_exists(uuid, uuid),
+  public.create_agreement(uuid, jsonb, boolean), public.save_agreement_draft(uuid, jsonb, boolean),
+  public.approve_agreement(uuid, int), public.propose_agreement_changes(uuid, int, jsonb, text),
+  public.reject_agreement(uuid, int, text), public.cancel_agreement(uuid, text),
+  public._agreement_brief(agreements, uuid), public.get_agreement(uuid), public.get_job_agreements(uuid),
+  public.get_chat_agreement(uuid, uuid)
+from public, anon, authenticated;
+
+grant execute on function
+  public.set_job_details(uuid, jsonb), public.update_job(uuid, text, text, text, text, text, int, text),
+  public.set_proposal_terms(uuid, date, text), public.mark_proposal_viewed(uuid),
+  public.get_my_jobs(), public.get_recent_applicants(int), public.get_job_proposals(uuid),
+  public.set_account_type(text, text),
+  public.create_agreement(uuid, jsonb, boolean), public.save_agreement_draft(uuid, jsonb, boolean),
+  public.approve_agreement(uuid, int), public.propose_agreement_changes(uuid, int, jsonb, text),
+  public.reject_agreement(uuid, int, text), public.cancel_agreement(uuid, text),
+  public.get_agreement(uuid), public.get_job_agreements(uuid), public.get_chat_agreement(uuid, uuid)
+to authenticated;

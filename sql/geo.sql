@@ -152,6 +152,9 @@ begin
         then jsonb_build_object('lat', v_job.approx_lat, 'lng', v_job.approx_lng, 'exact', false)
     end,
     'proposals_count', (select count(*) from proposals p where p.job_id = p_job_id and p.status = 'submitted'),
+    -- Buyurtma holati (Yangi ... Bajarilgan) va 3 bosqichli formadagi tafsilotlar (app.sql)
+    'order_status', _order_status(v_job.id),
+    'details', _job_details_json(v_job.id),
     'client', (select jsonb_build_object('id', c.id, 'full_name', c.full_name, 'member_since', c.created_at,
                                          'stats', client_stats(c.id))
                from profiles c where c.id = v_job.client_id),
