@@ -5944,6 +5944,7 @@ begin
    order by (a.status in ('proposed', 'changes_proposed', 'accepted')) desc, a.created_at desc limit 1;
   return jsonb_build_object(
     'proposal_id', v_p.id,
+    'job_id', v_p.job_id,
     'agreement', case when v_a.id is not null then _agreement_brief(v_a, v_uid) end,
     'can_create', v_p.status in ('submitted', 'accepted') and not _agreement_open_exists(v_p.job_id, v_p.provider_id)
       and (v_a.id is null or v_a.status in ('rejected', 'cancelled'))
