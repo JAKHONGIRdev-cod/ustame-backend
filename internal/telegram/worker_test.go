@@ -59,6 +59,7 @@ type fakeStore struct {
 	loginCodes map[string]bool  // kutilayotgan kirishlar (start_code)
 	loginChats map[int64]bool   // /start login_ bosilgan chatlar
 	verified   map[int64]string // chat -> tasdiqlangan raqam
+	known      map[int64]string // chat -> avval Telegram orqali kirgan foydalanuvchi raqami
 }
 
 func (s *fakeStore) BeginLogin(_ context.Context, code string, chat int64) (bool, error) {
@@ -76,6 +77,10 @@ func (s *fakeStore) CompleteLogin(_ context.Context, chat int64, phone string) (
 	delete(s.loginChats, chat)
 	s.verified[chat] = phone
 	return true, nil
+}
+
+func (s *fakeStore) KnownLoginPhone(_ context.Context, chat int64) (string, error) {
+	return s.known[chat], nil
 }
 
 func (s *fakeStore) SaveBotUsername(_ context.Context, u string) error { s.username = u; return nil }
@@ -121,7 +126,7 @@ func newTest(t *testing.T) (*Worker, *fakeTG, *fakeStore) {
 	srv := httptest.NewServer(tg)
 	t.Cleanup(srv.Close)
 	st := &fakeStore{codes: map[string]bool{}, linked: map[int64]bool{},
-		loginCodes: map[string]bool{}, loginChats: map[int64]bool{}, verified: map[int64]string{}}
+		loginCodes: map[string]bool{}, loginChats: map[int64]bool{}, verified: map[int64]string{}, known: map[int64]string{}}
 	w := &Worker{TG: &Client{Token: "123:SECRET", BaseURL: srv.URL, HTTP: srv.Client()}, Store: st}
 	w.defaults()
 	return w, tg, st

@@ -29,6 +29,9 @@ type Store interface {
 	BeginLogin(ctx context.Context, code string, chatID int64) (bool, error)
 	// CompleteLogin — shu chat'dagi oxirgi kutilayotgan kirishga tasdiqlangan raqamni yozadi.
 	CompleteLogin(ctx context.Context, chatID int64, phone string) (bool, error)
+	// KnownLoginPhone — shu chat'dan avval Telegram orqali kirib raqami tasdiqlangan (bloklanmagan) foydalanuvchi
+	// raqami; bo'lmasa "". Faqat bildirishnoma uchun ulangan chat hisobga olinmaydi.
+	KnownLoginPhone(ctx context.Context, chatID int64) (string, error)
 	// ClaimNotifications — yuborilmagan xabarlarni "yuborildi" deb belgilab oladi
 	// (ikki nusxa bir vaqtda ishlasa ham bir xabar ikki marta ketmasin).
 	ClaimNotifications(ctx context.Context, limit int) ([]Notification, error)
@@ -70,6 +73,8 @@ const (
 	msgLoginNoSession = "Avval ilovada «Telegram orqali kirish» tugmasini bosing, keyin raqamingizni yuboring."
 	msgLoginDone      = "✅ Raqamingiz tasdiqlandi. Ilovaga qayting — kirish avtomatik davom etadi.\n\n" +
 		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
+	msgLoginKnown = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas. " +
+		"Ilovaga qayting — kirish avtomatik davom etadi."
 )
 
 var (
@@ -183,7 +188,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 			log.Printf("telegram: kirishni boshlashda xato: %v", err)
 			return
 		case ok:
-			reply, markup = msgLoginAsk, askContactKeyboard
+			reply, markup = w.loginReply(ctx, chatID)
 		default:
 			reply = msgLoginBadCode
 		}
@@ -208,6 +213,25 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		reply = msgHello
 	}
 	w.send(ctx, chatID, reply, markup)
+}
+
+// loginReply — /start login_<kod> dan keyin: chat avval shu foydalanuvchi sifatida tasdiqlangan bo'lsa,
+// kirish darhol tasdiqlanadi (bir bosish); aks holda raqamni yuborish so'raladi.
+func (w *Worker) loginReply(ctx context.Context, chatID int64) (string, any) {
+	phone, err := w.Store.KnownLoginPhone(ctx, chatID)
+	if err != nil {
+		log.Printf("telegram: tanish chat'ni tekshirishda xato: %v", err)
+	}
+	if phone != "" {
+		ok, err := w.Store.CompleteLogin(ctx, chatID, phone)
+		if err != nil {
+			log.Printf("telegram: kirishni tasdiqlashda xato: %v", err)
+		}
+		if ok {
+			return msgLoginKnown, removeKeyboard
+		}
+	}
+	return msgLoginAsk, askContactKeyboard
 }
 
 // contactReply — yuborilgan kontaktni tekshiradi va kirishni tasdiqlaydi. Bo'sh javob — jim turamiz.

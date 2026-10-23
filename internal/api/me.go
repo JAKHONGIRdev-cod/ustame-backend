@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 )
 
 // GET /api/me
@@ -14,6 +16,23 @@ func (s *Server) getMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, publicUser(u))
+}
+
+// POST /api/auth/refresh -> { token }: amaldagi (bekor qilinmagan) token o'rniga yangi 30 kunlik token.
+// Ilova har ochilganda chaqiradi — faol foydalanuvchi 30 kundan keyin hisobidan chiqib qolmaydi.
+// Chiqish/bloklash/hisobni o'chirish token_version'ni oshiradi, eski token bilan yangilab bo'lmaydi.
+func (s *Server) refreshToken(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(r.Context(), r)
+	if u == nil {
+		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
+		return
+	}
+	token, err := auth.SignToken(s.cfg.JWTSecret, u.ID, u.TokenVersion)
+	if err != nil {
+		s.fail(w, "refresh", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
 // PATCH /api/me  { full_name?, active_role? }

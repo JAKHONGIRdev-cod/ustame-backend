@@ -58,6 +58,31 @@ func TestLoginFlow(t *testing.T) {
 	}
 }
 
+func TestLoginKnownChatSkipsContact(t *testing.T) {
+	w, tg, st := newTest(t)
+	st.loginCodes["k5"] = true
+	st.known[55] = "998901112233" // shu chat'dan avval kirilgan
+	w.handleUpdate(context.Background(), privateMsg(55, "/start login_k5"))
+
+	if got := st.verified[55]; got != "998901112233" {
+		t.Fatalf("tanish chat raqamsiz tasdiqlanishi kerak, verified = %q", got)
+	}
+	if len(tg.sent) != 1 || tg.sent[0].Text != msgLoginKnown || askedForContact(tg.markups[0]) {
+		t.Fatalf("yuborilgan: %v %v", tg.sent, tg.markups)
+	}
+}
+
+func TestLoginUnknownChatAsksContact(t *testing.T) {
+	w, tg, st := newTest(t)
+	st.loginCodes["k6"] = true
+	st.known[77] = "998901112233" // boshqa chat tanish — bu chat emas
+	w.handleUpdate(context.Background(), privateMsg(66, "/start login_k6"))
+
+	if len(st.verified) != 0 || tg.sent[0].Text != msgLoginAsk || !askedForContact(tg.markups[0]) {
+		t.Fatalf("notanish chat'dan raqam so'ralishi kerak: verified=%v sent=%v", st.verified, tg.sent)
+	}
+}
+
 func TestLoginRejectsForeignContact(t *testing.T) {
 	w, tg, st := newTest(t)
 	st.loginCodes["k2"] = true

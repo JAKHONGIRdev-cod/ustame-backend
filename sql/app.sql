@@ -26,6 +26,9 @@ create or replace view auth.users as
 alter table public.users add column if not exists blocked_at timestamptz;
 alter table public.users add column if not exists block_reason text;
 alter table public.users add column if not exists deleted_at timestamptz;
+-- Telegram orqali kirishda raqami (kontakt) tasdiqlangan chat: keyingi kirishlarda bot raqamni qayta so'ramaydi.
+-- Faqat bildirishnoma uchun ulangan chat (telegram_chat_id) kirish huquqini bermaydi.
+alter table public.users add column if not exists telegram_login_chat_id bigint;
 
 create or replace function auth.uid() returns uuid language sql stable as $$
   select nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub', '')::uuid
@@ -1810,6 +1813,7 @@ create or replace function public.unlink_telegram()
 returns void language plpgsql security definer set search_path = public as $$
 begin
   update profiles set telegram_chat_id = null where id = require_uid();
+  update users set telegram_login_chat_id = null where id = require_uid(); -- uzilgan Telegram bir bosishda kira olmaydi
 end;
 $$;
 
@@ -2467,8 +2471,8 @@ begin
   delete from provider_profiles where user_id = v_uid;
   update users set
     full_name = 'O''chirilgan hisob', phone = 'deleted:' || id::text, active_role = 'client',
-    telegram_chat_id = null, telegram_link_code = null, avatar_updated_at = null, is_admin = false,
-    token_version = token_version + 1, deleted_at = now()
+    telegram_chat_id = null, telegram_link_code = null, telegram_login_chat_id = null, avatar_updated_at = null,
+    is_admin = false, token_version = token_version + 1, deleted_at = now()
   where id = v_uid;
 end;
 $$;

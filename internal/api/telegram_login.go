@@ -169,6 +169,13 @@ func (s *Server) telegramCheck(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, "telegram-check", err)
 			return
 		}
+		// Raqami shu chat'dan tasdiqlandi: keyingi kirishlarda bot raqamni qayta so'ramaydi (internal/telegram)
+		if _, err := tx.Exec(ctx, `
+			update users set telegram_login_chat_id = case when id = $2::uuid then $1::bigint end
+			where id = $2::uuid or telegram_login_chat_id = $1::bigint`, *chatID, u.ID); err != nil {
+			s.fail(w, "telegram-check", err)
+			return
+		}
 		u.TelegramChatID = chatID
 	}
 	if err := tx.Commit(ctx); err != nil {

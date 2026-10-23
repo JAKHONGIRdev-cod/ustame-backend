@@ -72,6 +72,18 @@ func (s *PgStore) BeginLogin(ctx context.Context, code string, chatID int64) (bo
 	return tag.RowsAffected() == 1, err
 }
 
+func (s *PgStore) KnownLoginPhone(ctx context.Context, chatID int64) (string, error) {
+	var phone string
+	err := s.DB.QueryRow(ctx, `
+		select phone from users
+		where telegram_login_chat_id = $1 and blocked_at is null and deleted_at is null
+		limit 1`, chatID).Scan(&phone)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return phone, err
+}
+
 func (s *PgStore) CompleteLogin(ctx context.Context, chatID int64, phone string) (bool, error) {
 	tag, err := s.DB.Exec(ctx, `
 		update telegram_logins set phone = $2
