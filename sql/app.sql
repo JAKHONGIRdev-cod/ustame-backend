@@ -1645,6 +1645,7 @@ begin
       select i.created_at as invited_at, jsonb_build_object(
         'id', j.id, 'title', j.title, 'description', left(j.description, 240),
         'category', j.category, 'district', j.district, 'budget', j.budget,
+        'budget_max', (select d.budget_max from job_details d where d.job_id = j.id and d.budget_type = 'range'),
         'urgency', j.urgency, 'created_at', j.created_at, 'has_photo', j.has_photo,
         'proposals_count', (select count(*) from proposals p where p.job_id = j.id and p.status = 'submitted'),
         'has_applied', exists (select 1 from proposals p where p.job_id = j.id and p.provider_id = v_uid),
@@ -4184,6 +4185,7 @@ begin
     select jsonb_agg(jsonb_build_object(
       'id', j.id, 'title', j.title, 'description', left(j.description, 240),
       'category', j.category, 'district', j.district, 'budget', j.budget,
+      'budget_max', (select d.budget_max from job_details d where d.job_id = j.id and d.budget_type = 'range'),
       'urgency', j.urgency, 'created_at', j.created_at, 'has_photo', j.has_photo,
       'crew_needed', j.crew_needed, 'status', j.status,
       'lat', j.approx_lat, 'lng', j.approx_lng,
