@@ -29,6 +29,8 @@ type Client struct {
 	From     string
 	TestMode bool
 	HTTP     *http.Client
+
+	avail availability // CanSendOTP natijasi (availability.go)
 }
 
 func form(fields map[string]string) (*bytes.Buffer, string) {

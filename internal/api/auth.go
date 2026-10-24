@@ -48,6 +48,13 @@ func (s *Server) sendCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	_, isTestPhone := s.cfg.TestPhones[phone]
 
+	// Eskiz hali test rolida bo'lsa, kod odamga yetmaydi (kod o'rniga "Bu Eskiz dan test" boradi) —
+	// SMS so'ramaymiz va pul ham ketmaydi. Sinov raqamlari (Google tekshiruvchisi) bunga qaramaydi.
+	if !isTestPhone && !s.sms.CanSendOTP(r.Context()) {
+		writeError(w, http.StatusServiceUnavailable, "SMS orqali kirish hozircha ishlamayapti. Telegram orqali kiring")
+		return
+	}
+
 	// SMS hujumidan himoya: bitta IP'dan soatiga cheklangan so'rov va 24 soatlik umumiy chegara.
 	// Test raqamlarga SMS ketmaydi, ular hisobga kirmaydi (Google tekshiruvchisi to'xtamasin).
 	if !isTestPhone {
