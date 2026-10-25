@@ -88,6 +88,15 @@ create table if not exists public.provider_profiles (
 -- Admin ustaning shaxsini (pasport/ID) ko'rib tasdiqlagan vaqt — profilda "Shaxsi tasdiqlangan" belgisi
 alter table public.provider_profiles add column if not exists id_verified_at timestamptz;
 
+-- Ixtiyoriy soliq maqomi (o'zini o'zi band qilgan / YaTT) — tartibi pastda, "soliq maqomi" bo'limida.
+-- Ustunlar shu yerda: provider_stats ularni o'qiydi.
+alter table public.provider_profiles add column if not exists tax_kind text;
+alter table public.provider_profiles add column if not exists tax_id text;
+alter table public.provider_profiles add column if not exists tax_consent_at timestamptz;
+alter table public.provider_profiles add column if not exists tax_submitted_at timestamptz;
+alter table public.provider_profiles add column if not exists tax_verified_at timestamptz;
+alter table public.provider_profiles add column if not exists tax_rejection_reason text;
+
 create table if not exists public.jobs (
   id          uuid primary key default gen_random_uuid(),
   client_id   uuid not null references public.users (id) on delete cascade,
@@ -361,7 +370,7 @@ returns jsonb language sql stable security definer set search_path = public as $
     from contracts where provider_id = p_user_id
   ),
   pp as (
-    select status, reviewed_at, id_verified_at from provider_profiles where user_id = p_user_id
+    select status, reviewed_at, id_verified_at, tax_verified_at from provider_profiles where user_id = p_user_id
   ),
   r as (
     select count(*) as cnt, round(avg(rating)::numeric, 1) as avg
@@ -388,7 +397,9 @@ returns jsonb language sql stable security definer set search_path = public as $
     'rising',         coalesce((select pp.status = 'approved' and pp.reviewed_at > now() - interval '90 days' from pp)
                                and c.completed between 1 and 4 and c.withdrawals = 0 and c.disputes_lost = 0
                                and coalesce(r.avg, 5) >= 4.5, false),
-    'verified',       coalesce((select pp.id_verified_at is not null from pp), false)
+    'verified',       coalesce((select pp.id_verified_at is not null from pp), false),
+    -- Ixtiyoriy: o'zini o'zi band qilgan yoki YaTT ekani admin tomonidan tekshirilgan ("soliq maqomi" bo'limi)
+    'tax_registered', coalesce((select pp.tax_verified_at is not null from pp), false)
   )
   from c, r;
 $$;
@@ -2066,7 +2077,9 @@ begin
     'pending_providers',   (select count(*) from provider_profiles
                              where status = 'pending'
                                 or (status = 'approved' and id_verified_at is null
-                                    and jsonb_array_length(_id_docs(user_id)) > 0)),
+                                    and jsonb_array_length(_id_docs(user_id)) > 0)
+                                -- Soliq maqomini tekshirish ham shu ekranda
+                                or (tax_id is not null and tax_verified_at is null and tax_rejection_reason is null)),
     'disputed_contracts',  (select count(*) from contracts where status = 'disputed'),
     'payments_action',     (select count(*) from contracts
                              where payment_status = 'held' and status in ('completed', 'cancelled'))
@@ -5982,4 +5995,106 @@ grant execute on function
   public.approve_agreement(uuid, int), public.propose_agreement_changes(uuid, int, jsonb, text),
   public.reject_agreement(uuid, int, text), public.cancel_agreement(uuid, text),
   public.get_agreement(uuid), public.get_job_agreements(uuid), public.get_chat_agreement(uuid, uuid)
+to authenticated;
+
+
+-- ===== soliq maqomi (ixtiyoriy belgi) =====
+-- Usta xohlasa o'zini o'zi band qilgan shaxs yoki YaTT sifatida ro'yxatdan o'tganini STIR (yoki JShShIR) bilan
+-- ko'rsatadi; admin uni soliq.uz da tekshirib tasdiqlaydi va profilda "Soliqda ro'yxatdan o'tgan" belgisi chiqadi.
+-- Majburiy emas (boshida ustalar kelishi to'xtamasin). STIR'ni faqat egasi (get_me) va admin ko'radi,
+-- ochiq profilda faqat belgi (provider_stats.tax_registered). Ustunlar yuqorida, provider_profiles yonida.
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'provider_profiles_tax_check') then
+    alter table public.provider_profiles add constraint provider_profiles_tax_check check (
+      (tax_kind is null and tax_id is null)
+      or (tax_kind in ('self_employed', 'entrepreneur') and tax_id ~ '^([0-9]{9}|[0-9]{14})$'));
+  end if;
+end $$;
+
+create index if not exists provider_profiles_tax_pending_idx on public.provider_profiles (tax_submitted_at)
+  where tax_id is not null and tax_verified_at is null and tax_rejection_reason is null;
+
+-- Usta soliq maqomini yuboradi; p_tax_id bo'sh bo'lsa — olib tashlaydi. p_consent — STIR'ni soliq bazasida
+-- tekshirishga rozilik (ilovadagi belgi), usiz yuborilmaydi. O'zgargan ma'lumot qayta tekshiruvga tushadi.
+create or replace function public.submit_tax_status(p_kind text, p_tax_id text, p_consent boolean default false)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_id text := nullif(regexp_replace(coalesce(p_tax_id, ''), '\D', '', 'g'), '');
+begin
+  if not exists (select 1 from provider_profiles where user_id = v_uid) then raise exception 'NOT_FOUND'; end if;
+  if v_id is null then
+    update provider_profiles
+       set tax_kind = null, tax_id = null, tax_consent_at = null, tax_submitted_at = null,
+           tax_verified_at = null, tax_rejection_reason = null
+     where user_id = v_uid;
+    return;
+  end if;
+  if p_kind is null or p_kind not in ('self_employed', 'entrepreneur') then raise exception 'INVALID_INPUT'; end if;
+  if v_id !~ '^([0-9]{9}|[0-9]{14})$' then raise exception 'INVALID_TAX_ID'; end if;
+  if not coalesce(p_consent, false) then raise exception 'CONSENT_REQUIRED'; end if;
+
+  -- SET ichida eski qiymatlar o'qiladi: ma'lumot o'zgarmagan bo'lsa tasdiq saqlanadi
+  update provider_profiles
+     set tax_verified_at = case when tax_kind = p_kind and tax_id = v_id then tax_verified_at end,
+         tax_submitted_at = case when tax_kind = p_kind and tax_id = v_id and tax_rejection_reason is null
+                                 then tax_submitted_at else now() end,
+         tax_kind = p_kind, tax_id = v_id, tax_consent_at = now(), tax_rejection_reason = null
+   where user_id = v_uid;
+end;
+$$;
+
+-- Admin: tekshirilishi kerak bo'lgan soliq maqomlari (eng eskisi birinchi)
+create or replace function public.admin_get_pending_tax()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'user_id',          pp.user_id,
+      'full_name',        p.full_name,
+      'phone',            u.phone,
+      'headline',         pp.headline,
+      'tax_kind',         pp.tax_kind,
+      'tax_id',           pp.tax_id,
+      'tax_submitted_at', pp.tax_submitted_at,
+      'id_verified',      pp.id_verified_at is not null
+    ) order by pp.tax_submitted_at asc)
+    from provider_profiles pp
+    join profiles p on p.id = pp.user_id
+    join auth.users u on u.id = pp.user_id
+    where pp.tax_id is not null and pp.tax_verified_at is null and pp.tax_rejection_reason is null
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Admin soliq.uz da tekshirgach tasdiqlaydi yoki sabab bilan rad etadi (tasdiqlanganni ham bekor qilish mumkin)
+create or replace function public.admin_review_tax(p_user_id uuid, p_approve boolean, p_reason text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_admin();
+  if not p_approve and v_reason is null then raise exception 'INVALID_INPUT'; end if;
+  update provider_profiles
+     set tax_verified_at = case when p_approve then coalesce(tax_verified_at, now()) end,
+         tax_rejection_reason = case when p_approve then null else left(v_reason, 300) end
+   where user_id = p_user_id and tax_id is not null;
+  if not found then raise exception 'NOT_FOUND'; end if;
+
+  perform queue_notification(p_user_id,
+    case when p_approve
+      then E'\U0001F9FE Soliq maqomingiz tasdiqlandi — profilingizda "Soliqda ro''yxatdan o''tgan" belgisi chiqadi.'
+      else format(E'Soliq maqomi tasdiqlanmadi. Sabab: %s', v_reason)
+    end,
+    '/become-provider');
+end;
+$$;
+
+revoke execute on function public.submit_tax_status(text, text, boolean), public.admin_get_pending_tax(),
+  public.admin_review_tax(uuid, boolean, text)
+from public, anon, authenticated;
+
+grant execute on function public.submit_tax_status(text, text, boolean), public.admin_get_pending_tax(),
+  public.admin_review_tax(uuid, boolean, text)
 to authenticated;
