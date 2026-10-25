@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -35,6 +36,10 @@ func hashSecret(secret string) string {
 // url — botni ochadi; secret — faqat ilovada qoladi va check'da ishlatiladi.
 func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	if !s.tgStartLimit.allow(clientIP(r), time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "Juda ko'p urinish. Keyinroq urinib ko'ring")
+		return
+	}
 
 	var bot *string
 	err := s.db.QueryRow(ctx, `select telegram_bot_username from app_secrets where id = 1`).Scan(&bot)

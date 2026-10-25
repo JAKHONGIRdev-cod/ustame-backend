@@ -143,34 +143,55 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Kod 6 xonali bo'lishi kerak")
 		return
 	}
+	if !s.verifyLimit.allow(clientIP(r), time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "Juda ko'p urinish. Keyinroq urinib ko'ring")
+		return
+	}
 	ctx := r.Context()
 
+	// Urinish hisoblagichi tekshiruvdan OLDIN, bitta atomar so'rovda oshiriladi: bir vaqtda yuborilgan
+	// yuzlab so'rov ham kodga 5 tadan ortiq urinish qila olmaydi (aks holda hammasi "0 urinish"ni ko'rardi).
 	var otpID int64
 	var codeHash string
-	var attempts int
 	err = s.db.QueryRow(ctx, `
-		select id, code_hash, attempts from otp_codes
-		where phone = $1 and used = false and expires_at > now()
-		order by created_at desc limit 1`, phone).Scan(&otpID, &codeHash, &attempts)
+		update otp_codes set attempts = attempts + 1
+		where id = (select id from otp_codes
+		            where phone = $1 and used = false and expires_at > now()
+		            order by created_at desc limit 1)
+		  and attempts < 5
+		returning id, code_hash`, phone).Scan(&otpID, &codeHash)
 	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusBadRequest, "Kod eskirgan. Yangi kod so'rang")
+		var exhausted bool
+		if err := s.db.QueryRow(ctx, `
+			select exists (select 1 from otp_codes
+			               where phone = $1 and used = false and expires_at > now() and attempts >= 5)`,
+			phone).Scan(&exhausted); err != nil {
+			s.fail(w, "verify", err)
+			return
+		}
+		if exhausted {
+			writeError(w, http.StatusTooManyRequests, "Juda ko'p xato. Yangi kod so'rang")
+		} else {
+			writeError(w, http.StatusBadRequest, "Kod eskirgan. Yangi kod so'rang")
+		}
 		return
 	}
 	if err != nil {
 		s.fail(w, "verify", err)
 		return
 	}
-	if attempts >= 5 {
-		writeError(w, http.StatusTooManyRequests, "Juda ko'p xato. Yangi kod so'rang")
-		return
-	}
 	if !auth.SafeEqual(codeHash, auth.HashCode(s.cfg.OTPSecret, phone, code)) {
-		s.db.Exec(ctx, `update otp_codes set attempts = attempts + 1 where id = $1`, otpID)
 		writeError(w, http.StatusBadRequest, "Kod noto'g'ri")
 		return
 	}
-	if _, err := s.db.Exec(ctx, `update otp_codes set used = true where id = $1`, otpID); err != nil {
+	// Kod bir martalik: bir vaqtda kelgan ikkinchi to'g'ri so'rov uni qayta ishlata olmaydi
+	tag, err := s.db.Exec(ctx, `update otp_codes set used = true where id = $1 and used = false`, otpID)
+	if err != nil {
 		s.fail(w, "verify", err)
+		return
+	}
+	if tag.RowsAffected() != 1 {
+		writeError(w, http.StatusBadRequest, "Kod eskirgan. Yangi kod so'rang")
 		return
 	}
 

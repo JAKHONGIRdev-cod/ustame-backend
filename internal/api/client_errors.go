@@ -58,7 +58,13 @@ func (l *hourLimiter) cleanupDue(now time.Time) bool {
 }
 
 // clientIP — Railway proksisi orqasida haqiqiy manzil X-Forwarded-For'ning birinchi qiymatida.
+// clientIP — so'rov yuborgan manzil. Railway'ning tashqi proksisi mijoz yuborgan X-Real-IP va
+// X-Forwarded-For'ni o'zi qayta yozadi; mijoz manzili X-Real-IP'da (Railway xodimlari tavsiyasi,
+// station.railway.com, 2026). U bo'lmasa — X-Forwarded-For'ning birinchi qiymati.
 func clientIP(r *http.Request) string {
+	if ip := strings.TrimSpace(r.Header.Get("X-Real-Ip")); ip != "" {
+		return ip
+	}
 	if f := r.Header.Get("X-Forwarded-For"); f != "" {
 		first, _, _ := strings.Cut(f, ",")
 		return strings.TrimSpace(first)

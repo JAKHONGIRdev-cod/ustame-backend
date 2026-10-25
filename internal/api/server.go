@@ -34,6 +34,9 @@ type Server struct {
 	smsLimit hourLimiter // POST /api/auth/send-code: bitta IP'dan soatiga
 	smsAlert smsAlert    // kunlik SMS chegarasiga yaqinlashganda adminlarga xabar
 
+	// POST /api/auth/verify va /api/auth/telegram/start: bitta IP'dan soatiga (security.go)
+	verifyLimit, tgStartLimit hourLimiter
+
 	// Outbox — yozuvchi RPC'dan keyin: navbatga bildirishnoma tushgan bo'lishi mumkin.
 	// Activity — har qanday RPC'dan keyin: baza hozir uyg'oq (davriy ishlar shu paytda ishlaydi).
 	Outbox, Activity *wakeup.Hub
@@ -49,6 +52,9 @@ func New(cfg *config.Config, db *pgxpool.Pool) *Server {
 		},
 		funcs:    &funcCache{},
 		smsLimit: hourLimiter{max: smsPerIPPerHour},
+
+		verifyLimit:  hourLimiter{max: verifyPerIPPerHour},
+		tgStartLimit: hourLimiter{max: tgStartPerIPPerHour},
 	}
 }
 
@@ -69,7 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/files", s.uploadFile)
 	mux.HandleFunc("DELETE /api/files", s.deleteFile)
 	mux.HandleFunc("POST /api/client-errors", s.clientError)
-	return s.cors(recoverer(mux))
+	return securityHeaders(s.cors(recoverer(mux)))
 }
 
 // --- yordamchilar ---
