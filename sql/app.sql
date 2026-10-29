@@ -808,8 +808,6 @@ declare
   v_team uuid;
 begin
   if not is_approved_provider(v_uid) then raise exception 'NOT_APPROVED_PROVIDER'; end if;
-  -- Taklif yuborish uchun shaxs pasport bilan tasdiqlangan bo'lishi shart
-  if (select id_verified_at from provider_profiles where user_id = v_uid) is null then raise exception 'ID_NOT_VERIFIED'; end if;
   -- Oylik obuna: bepul davrdan keyin obunasiz usta oyiga cheklangan taklif yuboradi (pastda, "oylik obuna")
   perform _check_proposal_quota(v_uid);
   if p_price is null or p_price not between 10000 and 100000000 then raise exception 'INVALID_PRICE'; end if;
@@ -2011,8 +2009,9 @@ begin
 end;
 $$;
 
--- Usta arizasi (yoki tasdiqlangan ustaning pasporti): admin pasport rasmi va selfini ko'rib tasdiqlaydi yoki rad etadi.
--- Tasdiqlash pasportsiz bo'lmaydi; rasmlar qarordan keyin darhol o'chiriladi (faqat "tasdiqlangan" belgisi qoladi).
+-- Usta arizasi: admin profilni ko'rib tasdiqlaydi yoki rad etadi. 2026-10-30 dan pasport so'ralmaydi — tasdiq
+-- "Shaxsi tasdiqlangan" belgisini bermaydi (uni admin_set_verified bilan qo'lda qo'yish mumkin). Eski ilovadan
+-- yuklangan pasport rasmlari bo'lsa, qarordan keyin o'chiriladi.
 create or replace function public.admin_review_provider(p_user_id uuid, p_approve boolean, p_reason text default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -2024,23 +2023,17 @@ begin
   end if;
   select * into v_pp from provider_profiles where user_id = p_user_id for update;
   if not found then raise exception 'NOT_FOUND'; end if;
-  if p_approve and v_pp.id_verified_at is null and jsonb_array_length(_id_docs(p_user_id)) < 2 then
-    raise exception 'ID_DOCS_REQUIRED';
-  end if;
 
   update provider_profiles
      set status = case when p_approve then 'approved' else 'rejected' end,
          rejection_reason = case when p_approve then null else p_reason end,
-         reviewed_at = now(),
-         id_verified_at = case when p_approve then coalesce(id_verified_at, now()) else id_verified_at end
+         reviewed_at = now()
    where user_id = p_user_id;
   delete from files where bucket = 'id-docs' and path like p_user_id::text || '/%';
 
   perform queue_notification(p_user_id,
-    case when p_approve and v_pp.status = 'approved'
-      then E'\U0001F6E1 Shaxsingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
-    when p_approve
-      then E'✅ Tabriklaymiz! Usta profilingiz va shaxsingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
+    case when p_approve
+      then E'✅ Tabriklaymiz! Usta profilingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
       else format(E'❌ Usta profilingiz rad etildi. Sabab: %s', coalesce(p_reason, '-'))
     end,
     case when p_approve then '/' else '/become-provider' end);
@@ -2076,8 +2069,6 @@ begin
   select jsonb_build_object(
     'pending_providers',   (select count(*) from provider_profiles
                              where status = 'pending'
-                                or (status = 'approved' and id_verified_at is null
-                                    and jsonb_array_length(_id_docs(user_id)) > 0)
                                 -- Soliq maqomini tekshirish ham shu ekranda
                                 or (tax_id is not null and tax_verified_at is null and tax_rejection_reason is null)),
     'disputed_contracts',  (select count(*) from contracts where status = 'disputed'),
@@ -2125,8 +2116,7 @@ begin
   from provider_profiles pp
   join profiles p on p.id = pp.user_id
   join auth.users u on u.id = pp.user_id
-  where pp.status = 'pending'
-     or (pp.status = 'approved' and pp.id_verified_at is null and jsonb_array_length(_id_docs(pp.user_id)) > 0);
+  where pp.status = 'pending';
   return v;
 end;
 $$;
