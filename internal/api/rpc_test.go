@@ -5,7 +5,24 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestAnonCacheExpires(t *testing.T) {
+	var c anonCache
+	now := time.Now()
+	if _, ok := c.get("get_material_catalog", now); ok {
+		t.Fatal("bo'sh keshda javob bo'lmasligi kerak")
+	}
+	body := `{"materials":[]}`
+	c.put("get_material_catalog", &body, now)
+	if got, ok := c.get("get_material_catalog", now.Add(anonCacheTTL-time.Second)); !ok || *got != body {
+		t.Fatalf("muddat ichida keshdan olinishi kerak: %v %v", got, ok)
+	}
+	if _, ok := c.get("get_material_catalog", now.Add(anonCacheTTL+time.Second)); ok {
+		t.Fatal("muddati o'tgan javob qaytmasligi kerak")
+	}
+}
 
 func decodeArg(t *testing.T, raw string) any {
 	t.Helper()

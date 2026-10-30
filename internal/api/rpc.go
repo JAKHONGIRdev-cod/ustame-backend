@@ -21,7 +21,8 @@ import (
 // POST /api/rpc/{fn}  body: { "p_arg": qiymat, ... }
 // sql/app.sql dagi funksiyani chaqiradi. Faqat `authenticated` rolga EXECUTE berilgan
 // ilova funksiyalariga ruxsat (ro'yxat SQL grant'laridan olinadi). auth.uid() tranzaksiya
-// ichida o'rnatiladigan request.jwt.claims orqali ishlaydi.
+// ichida o'rnatiladigan request.jwt.claims orqali ishlaydi. `anon` rolga ham EXECUTE berilgan
+// funksiyalarni (masalan saytdagi material narxlari) tokensiz mehmon ham chaqira oladi — auth.uid() null.
 
 var (
 	fnName    = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -44,25 +45,30 @@ const (
 	returnsOther
 )
 
+type funcInfo struct {
+	kind returnKind
+	anon bool // `anon` rolga ham ruxsat: kirmagan mehmon chaqira oladi
+}
+
 type funcCache struct {
 	mu       sync.Mutex
-	funcs    map[string]returnKind
+	funcs    map[string]funcInfo
 	loadedAt time.Time
 }
 
 // get funksiya ruxsat etilganmi va nima qaytarishini aytadi. Ro'yxat birinchi so'rovda
 // yuklanadi; noma'lum nom kelsa (masalan migratsiyadan keyin) daqiqada bir marta qayta yuklanadi.
-func (c *funcCache) get(ctx context.Context, s *Server, name string) (returnKind, bool, error) {
+func (c *funcCache) get(ctx context.Context, s *Server, name string) (funcInfo, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if kind, ok := c.funcs[name]; ok {
-		return kind, true, nil
+	if info, ok := c.funcs[name]; ok {
+		return info, true, nil
 	}
 	if c.funcs != nil && time.Since(c.loadedAt) < time.Minute {
-		return 0, false, nil
+		return funcInfo{}, false, nil
 	}
 	rows, err := s.db.Query(ctx, `
-		select distinct p.proname, p.prorettype::regtype::text
+		select distinct p.proname, p.prorettype::regtype::text, has_function_privilege('anon', p.oid, 'execute')
 		from pg_proc p join pg_namespace n on n.oid = p.pronamespace
 		where n.nspname = 'public'
 		  and has_function_privilege('authenticated', p.oid, 'execute')
@@ -71,30 +77,65 @@ func (c *funcCache) get(ctx context.Context, s *Server, name string) (returnKind
 		  -- pgcrypto kabi kengaytma funksiyalari emas, faqat ilovaning o'z funksiyalari
 		  and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')`)
 	if err != nil {
-		return 0, false, err
+		return funcInfo{}, false, err
 	}
 	defer rows.Close()
-	funcs := map[string]returnKind{}
+	funcs := map[string]funcInfo{}
 	for rows.Next() {
 		var n, ret string
-		if err := rows.Scan(&n, &ret); err != nil {
-			return 0, false, err
+		var anon bool
+		if err := rows.Scan(&n, &ret, &anon); err != nil {
+			return funcInfo{}, false, err
 		}
+		info := funcInfo{kind: returnsOther, anon: anon}
 		switch ret {
 		case "void":
-			funcs[n] = returnsVoid
+			info.kind = returnsVoid
 		case "json", "jsonb":
-			funcs[n] = returnsJSON
-		default:
-			funcs[n] = returnsOther
+			info.kind = returnsJSON
 		}
+		funcs[n] = info
 	}
 	if err := rows.Err(); err != nil {
-		return 0, false, err
+		return funcInfo{}, false, err
 	}
 	c.funcs, c.loadedAt = funcs, time.Now()
-	kind, ok := funcs[name]
-	return kind, ok, nil
+	info, ok := funcs[name]
+	return info, ok, nil
+}
+
+// anonCache — mehmonlar chaqiradigan argumentsiz funksiyalar javobi (masalan get_material_catalog):
+// sayt har ochilganda (botlar ham) baza uyg'onmasligi uchun bir necha daqiqa xotirada turadi.
+// Faqat argumentsiz chaqiruvlar saqlanadi — kalitlar soni ochiq funksiyalar sonidan oshmaydi.
+type anonCache struct {
+	mu    sync.Mutex
+	items map[string]anonEntry
+}
+
+type anonEntry struct {
+	body *string
+	at   time.Time
+}
+
+const anonCacheTTL = 5 * time.Minute
+
+func (c *anonCache) get(fn string, now time.Time) (*string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.items[fn]
+	if !ok || now.Sub(e.at) > anonCacheTTL {
+		return nil, false
+	}
+	return e.body, true
+}
+
+func (c *anonCache) put(fn string, body *string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.items == nil {
+		c.items = map[string]anonEntry{}
+	}
+	c.items[fn] = anonEntry{body: body, at: now}
 }
 
 // toArg JSON qiymatini Postgres parametriga aylantiradi.
@@ -150,7 +191,7 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND")
 		return
 	}
-	kind, ok, err := s.funcs.get(ctx, s, fn)
+	info, ok, err := s.funcs.get(ctx, s, fn)
 	if err != nil {
 		s.fail(w, "rpc funcs", err)
 		return
@@ -159,10 +200,15 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND")
 		return
 	}
+	kind := info.kind
 
-	uid, tv, ok := s.tokenUser(r)
-	if !ok {
+	uid, tv, signedIn := s.tokenUser(r)
+	if !signedIn && !info.anon {
 		writeError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
+		return
+	}
+	if !signedIn && !s.anonLimit.allow(clientIP(r), time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "Juda ko'p so'rov. Keyinroq urinib ko'ring")
 		return
 	}
 
@@ -170,6 +216,14 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 	if err := readJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_INPUT")
 		return
+	}
+	// Mehmonning argumentsiz chaqiruvi: javob keshda bo'lsa bazaga borilmaydi
+	cacheable := !signedIn && len(body) == 0 && kind != returnsVoid
+	if cacheable {
+		if cached, ok := s.anonCache.get(fn, time.Now()); ok {
+			writeRPCResult(w, cached)
+			return
+		}
 	}
 	// Nomlar tartiblanadi: SQL matni har safar bir xil bo'lsa, pgx tayyorlangan so'rovni keshdan oladi
 	// (Go map tartibi tasodifiy — aks holda har chaqiruvda qayta tayyorlash uchun qo'shimcha borib-kelish).
@@ -193,7 +247,9 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 	var result *string
 	scan := func(row pgx.Row) error { return row.Scan(&result) }
 	b := &pgx.Batch{}
-	b.Queue(`select auth.set_request_user($1::uuid, $2)`, uid, tv)
+	if signedIn {
+		b.Queue(`select auth.set_request_user($1::uuid, $2)`, uid, tv)
+	}
 	switch kind {
 	case returnsVoid:
 		b.Queue("select "+call, args...)
@@ -204,7 +260,7 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 	}
 	// Admin amallari jurnali: o'zgartiruvchi admin_* chaqiruvi shu paketning o'zida yoziladi — funksiya xato
 	// bersa (masalan admin emas) paket bekor bo'ladi va yozuv ham qolmaydi.
-	if strings.HasPrefix(fn, "admin_") && !readOnly(fn) {
+	if signedIn && strings.HasPrefix(fn, "admin_") && !readOnly(fn) {
 		logArgs, _ := json.Marshal(body)
 		b.Queue(`insert into public.admin_actions (admin_id, action, args) values ($1::uuid, $2, $3::jsonb)`,
 			uid, fn, string(logArgs))
@@ -231,7 +287,13 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 	if !readOnly(fn) {
 		s.Outbox.Notify()
 	}
+	if cacheable {
+		s.anonCache.put(fn, result, time.Now())
+	}
+	writeRPCResult(w, result)
+}
 
+func writeRPCResult(w http.ResponseWriter, result *string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if result == nil {

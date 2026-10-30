@@ -10,6 +10,8 @@ const (
 	// so'rovlar bilan to'ldirishga qarshi qo'shimcha to'siq.
 	verifyPerIPPerHour  = 120
 	tgStartPerIPPerHour = 120
+	// Tokensiz RPC (saytdagi material narxlari): oddiy mehmon soatiga bir necha marta ochadi
+	anonPerIPPerHour = 600
 )
 
 // securityHeaders — barcha API javoblariga himoya sarlavhalari. Javoblar JSON yoki rasm: hech biri sahifa

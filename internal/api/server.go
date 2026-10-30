@@ -36,6 +36,9 @@ type Server struct {
 
 	// POST /api/auth/verify va /api/auth/telegram/start: bitta IP'dan soatiga (security.go)
 	verifyLimit, tgStartLimit hourLimiter
+	// Tokensiz (mehmon) RPC: bitta IP'dan soatiga; argumentsiz javoblar keshi (rpc.go)
+	anonLimit hourLimiter
+	anonCache anonCache
 
 	// Outbox — yozuvchi RPC'dan keyin: navbatga bildirishnoma tushgan bo'lishi mumkin.
 	// Activity — har qanday RPC'dan keyin: baza hozir uyg'oq (davriy ishlar shu paytda ishlaydi).
@@ -55,6 +58,7 @@ func New(cfg *config.Config, db *pgxpool.Pool) *Server {
 
 		verifyLimit:  hourLimiter{max: verifyPerIPPerHour},
 		tgStartLimit: hourLimiter{max: tgStartPerIPPerHour},
+		anonLimit:    hourLimiter{max: anonPerIPPerHour},
 	}
 }
 
