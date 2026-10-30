@@ -54,14 +54,15 @@ begin
 end;
 $$;
 
--- find_jobs: + approx_lat/approx_lng (xarita uchun)
+-- find_jobs: + approx_lat/approx_lng (xarita uchun). Kirmagan mehmon ham ko'radi (auth.uid() null):
+-- mijoz ismi qisqartiriladi ("Aziza K."), "sizga mos" saralash yo'q
 create or replace function public.find_jobs(
   p_category text default null, p_district text default null, p_search text default null,
   p_limit int default 30, p_offset int default 0
 )
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
-  v_uid uuid := require_uid();
+  v_uid uuid := auth.uid();
   v_q text := nullif(btrim(coalesce(p_search, '')), '');
   v_cats text[];
   v_dists text[];
@@ -85,11 +86,12 @@ begin
         'has_applied', exists (select 1 from proposals p where p.job_id = j.id and p.provider_id = v_uid),
         'is_saved', exists (select 1 from saved_jobs sj where sj.user_id = v_uid and sj.job_id = j.id),
         'match', j.category = any (coalesce(v_cats, '{}')) and j.district = any (coalesce(v_dists, '{}')),
-        'client', jsonb_build_object('full_name', c.full_name, 'stats', client_stats(c.id))
+        'client', jsonb_build_object('full_name', case when v_uid is null then _public_name(c.full_name) else c.full_name end,
+                                     'stats', client_stats(c.id))
       ) as row_data
       from jobs j join profiles c on c.id = j.client_id
       where j.status = 'open'
-        and j.client_id <> v_uid
+        and j.client_id is distinct from v_uid
         and not _blocked(v_uid, j.client_id)
         and (p_category is null or j.category = p_category)
         and (p_district is null or j.district = p_district)
@@ -102,11 +104,12 @@ begin
 end;
 $$;
 
--- get_job: + location (tomonlarga aniq, boshqalarga yaxlitlangan)
+-- get_job: + location (tomonlarga aniq, boshqalarga yaxlitlangan). Kirmagan mehmon faqat ochiq e'lonni ko'radi,
+-- manzil va shartnomasiz, mijoz ismi qisqartirilgan
 create or replace function public.get_job(p_job_id uuid)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
-  v_uid uuid := require_uid();
+  v_uid uuid := auth.uid();
   v_job jobs;
   v_is_client boolean;
   v_contract contracts;
@@ -117,12 +120,13 @@ begin
   select * into v_job from jobs where id = p_job_id;
   if not found then raise exception 'NOT_FOUND'; end if;
 
-  v_is_client := v_job.client_id = v_uid;
+  -- coalesce: mehmonda (v_uid null) taqqoslash null beradi — "mijoz emas" deb hisoblanishi shart
+  v_is_client := coalesce(v_job.client_id = v_uid, false);
 
   select * into v_contract from contracts
    where job_id = p_job_id and status <> 'cancelled'
    order by created_at desc limit 1;
-  v_is_party := v_is_client or (v_contract.id is not null and v_contract.provider_id = v_uid);
+  v_is_party := v_is_client or coalesce(v_contract.id is not null and v_contract.provider_id = v_uid, false);
 
   select jsonb_build_object('id', p.id, 'price', p.price, 'message', p.message,
                             'status', p.status, 'created_at', p.created_at,
@@ -156,8 +160,9 @@ begin
     -- Buyurtma holati (Yangi ... Bajarilgan) va 3 bosqichli formadagi tafsilotlar (app.sql)
     'order_status', _order_status(v_job.id),
     'details', _job_details_json(v_job.id),
-    'client', (select jsonb_build_object('id', c.id, 'full_name', c.full_name, 'member_since', c.created_at,
-                                         'stats', client_stats(c.id))
+    'client', (select jsonb_build_object('id', c.id,
+                                         'full_name', case when v_uid is null then _public_name(c.full_name) else c.full_name end,
+                                         'member_since', c.created_at, 'stats', client_stats(c.id))
                from profiles c where c.id = v_job.client_id),
     'my_proposal', v_my_proposal,
     'contract', case when v_is_party and v_contract.id is not null
@@ -166,7 +171,7 @@ begin
 end;
 $$;
 
--- search_providers: + lat/lng (yaxlitlangan)
+-- search_providers: + lat/lng (yaxlitlangan). Kirmagan mehmon ham qidira oladi (usta profillari ochiq)
 create or replace function public.search_providers(
   p_category text default null,
   p_district text default null,
@@ -176,7 +181,7 @@ create or replace function public.search_providers(
 )
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
-  v_uid   uuid := require_uid();
+  v_uid   uuid := auth.uid();
   v_q     text := nullif(btrim(coalesce(p_query, '')), '');
   v_like  text;
   v_limit int  := least(greatest(coalesce(p_limit, 30), 1), 50);
@@ -211,7 +216,7 @@ begin
       join profiles p on p.id = pp.user_id
       cross join lateral (select provider_stats(pp.user_id) as stats) s
       where pp.status = 'approved'
-        and pp.user_id <> v_uid
+        and pp.user_id is distinct from v_uid
         and not _blocked(v_uid, pp.user_id)
         and (p_category is null or p_category = any (pp.categories))
         and (p_district is null or p_district = any (pp.districts))
@@ -242,3 +247,11 @@ grant execute on function
   public.set_job_location(uuid, double precision, double precision),
   public.set_provider_location(double precision, double precision)
   to authenticated;
+
+-- Mehmon rejimi (saytda kirmasdan ko'rish): e'lonlar lentasi, e'lon sahifasi va ustalar qidiruvi.
+-- Taklif yuborish, e'lon joylash va boshqa amallar baribir kirishni talab qiladi.
+grant execute on function
+  public.find_jobs(text, text, text, int, int),
+  public.get_job(uuid),
+  public.search_providers(text, text, text, int, int)
+  to anon;

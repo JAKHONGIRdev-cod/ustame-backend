@@ -1673,10 +1673,11 @@ begin
 end;
 $$;
 
+-- Kirmagan mehmon ham ko'radi (auth.uid() null): faqat tasdiqlangan usta, sharh yozgan mijoz ismi qisqartirilgan
 create or replace function public.get_provider_profile(p_user_id uuid)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
-  v_uid uuid := require_uid();
+  v_uid uuid := auth.uid();
   v jsonb;
 begin
   select jsonb_build_object(
@@ -1695,7 +1696,8 @@ begin
     'reviews', coalesce((
       select jsonb_agg(jsonb_build_object(
                'rating', r.rating, 'comment', r.comment, 'created_at', r.created_at,
-               'reviewer_name', rp.full_name, 'job_title', j.title
+               'reviewer_name', case when v_uid is null then _public_name(rp.full_name) else rp.full_name end,
+               'job_title', j.title
              ) order by r.created_at desc)
       from (select * from reviews
             where reviewee_id = p.id
@@ -3849,7 +3851,7 @@ create or replace function public.search_teams(
   p_category text default null, p_district text default null, p_limit int default 30, p_offset int default 0
 )
 returns jsonb language plpgsql stable security definer set search_path = public as $$
-declare v_uid uuid := require_uid();
+declare v_uid uuid := auth.uid(); -- kirmagan mehmon ham ko'radi
 begin
   return coalesce((
     select jsonb_agg(x.item order by (x.item->'stats'->>'completed_jobs')::int desc,
@@ -6261,3 +6263,19 @@ from public, anon, authenticated;
 grant execute on function public.get_material_catalog() to anon, authenticated;
 grant execute on function public.admin_set_material_price(text, int, int, int, boolean), public.admin_get_materials()
 to authenticated;
+
+-- ===== mehmon rejimi (kirmagan foydalanuvchi) =====
+-- Saytda ro'yxatdan o'tmasdan ustalar, e'lonlar va usta profillarini ko'rish mumkin. Ochiq funksiyalar auth.uid()
+-- null bo'lganda ham ishlaydi; e'lon joylash, taklif yuborish, xabar va boshqa amallar baribir kirishni talab qiladi.
+-- find_jobs, get_job va search_providers ruxsati — geo.sql oxirida (ular o'sha yerda oxirgi marta yaratiladi).
+
+-- Begona (kirmagan) ko'ruvchiga mijoz ismi qisqartirib ko'rsatiladi: "Aziza Karimova" -> "Aziza K."
+create or replace function public._public_name(p_full_name text)
+returns text language sql immutable set search_path = public as $$
+  select case when array_length(w, 1) > 1 then w[1] || ' ' || left(w[2], 1) || '.' else w[1] end
+  from (select regexp_split_to_array(btrim(coalesce(p_full_name, '')), '\s+') as w) s;
+$$;
+
+revoke execute on function public._public_name(text) from public, anon, authenticated;
+
+grant execute on function public.get_provider_profile(uuid), public.search_teams(text, text, int, int) to anon;
