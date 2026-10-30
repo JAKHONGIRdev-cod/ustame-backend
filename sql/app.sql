@@ -6088,3 +6088,176 @@ from public, anon, authenticated;
 grant execute on function public.submit_tax_status(text, text, boolean), public.admin_get_pending_tax(),
   public.admin_review_tax(uuid, boolean, text)
 to authenticated;
+
+
+-- ===== qurilish materiallari narxlari va smeta kalkulyatori =====
+-- Toshkent bozoridagi taxminiy narxlar (o'rtacha + oraliq). Admin ilovada yangilaydi; mijoz va usta materialni
+-- tanlab, miqdor kiritib smeta hisoblaydi (smeta telefonda saqlanadi, bazaga yozilmaydi).
+-- per_m2 — 1 m² ish uchun shu birlikdan qancha kerak (sarf va odatiy zaxira bilan): "maydon bo'yicha hisoblash".
+create table if not exists public.material_categories (
+  slug    text primary key,
+  name_uz text not null,
+  name_ru text not null,
+  icon    text not null default 'cube-outline',
+  sort    int  not null default 0
+);
+
+create table if not exists public.materials (
+  id         text primary key,
+  category   text not null references public.material_categories (slug) on update cascade,
+  sub_uz     text not null default '',
+  sub_ru     text not null default '',
+  name_uz    text not null check (char_length(name_uz) between 2 and 80),
+  name_ru    text not null check (char_length(name_ru) between 2 and 80),
+  size_uz    text not null default '',
+  size_ru    text not null default '',
+  unit       text not null check (unit in ('bag', 'pcs', 'm', 'm2', 'm3', 'kg', 'bucket', 'can', 'tube', 'roll', 'sheet', 'pack')),
+  price      int  not null check (price between 0 and 1000000000),
+  price_min  int  check (price_min is null or price_min between 0 and 1000000000),
+  price_max  int  check (price_max is null or price_max between 0 and 1000000000),
+  per_m2     numeric(8, 4) check (per_m2 is null or per_m2 > 0),
+  hint_uz    text,
+  hint_ru    text,
+  sort       int  not null default 0,
+  active     boolean not null default true,
+  updated_at timestamptz not null default now(),
+  check (price_min is null or price_max is null or (price_min <= price and price <= price_max))
+);
+
+create index if not exists materials_category_idx on public.materials (category, sort) where active;
+
+alter table public.material_categories enable row level security;
+alter table public.materials enable row level security;
+
+-- Boshlang'ich ma'lumot: qayta migratsiyada admin o'zgartirgan narxlar ustidan yozilmaydi (on conflict do nothing)
+insert into public.material_categories (slug, name_uz, name_ru, icon, sort) values
+  ('cement',   'Sement va aralashma',      'Цемент и смеси',          'cube-outline',          1),
+  ('brick',    'G''isht va blok',           'Кирпич и блоки',          'apps-outline',          2),
+  ('metal',    'Armatura va metall',        'Арматура и металл',       'construct-outline',     3),
+  ('plumbing', 'Santexnika',                'Сантехника',              'water-outline',         4),
+  ('electric', 'Elektr',                    'Электрика',               'flash-outline',         5),
+  ('paint',    'Bo''yoq va pardoz',          'Краски и отделка',        'color-palette-outline', 6),
+  ('floor',    'Kafel va pol',              'Плитка и полы',           'grid-outline',          7),
+  ('drywall',  'Gipsokarton va shift',      'Гипсокартон и потолки',   'layers-outline',        8),
+  ('insul',    'Izolyatsiya va tom',        'Изоляция и кровля',       'home-outline',          9)
+on conflict (slug) do nothing;
+
+insert into public.materials
+  (id, category, sub_uz, sub_ru, name_uz, name_ru, size_uz, size_ru, unit, price, price_min, price_max, per_m2, hint_uz, hint_ru, sort)
+values
+  ('cement-m400', 'cement', 'Sement', 'Цемент', 'Sement M400', 'Цемент М400', '50 kg', '50 кг', 'bag', 50000, 45000, 57000, null, null, null, 1),
+  ('cement-m500', 'cement', 'Sement', 'Цемент', 'Sement M500', 'Цемент М500', '50 kg', '50 кг', 'bag', 56000, 50000, 63000, null, null, null, 2),
+  ('tile-glue', 'cement', 'Quruq aralashma', 'Сухие смеси', 'Plitka yelimi', 'Плиточный клей', '25 kg', '25 кг', 'bag', 60000, 45000, 85000, 0.2, '5 kg/m²', '5 кг/м²', 3),
+  ('putty-start', 'cement', 'Quruq aralashma', 'Сухие смеси', 'Start shpaklyovka', 'Шпаклёвка стартовая', '25 kg', '25 кг', 'bag', 70000, 55000, 90000, 0.12, '3 kg/m²', '3 кг/м²', 4),
+  ('putty-finish', 'cement', 'Quruq aralashma', 'Сухие смеси', 'Finish shpaklyovka', 'Шпаклёвка финишная', '25 kg', '25 кг', 'bag', 95000, 75000, 120000, 0.04, '1 kg/m²', '1 кг/м²', 5),
+  ('plaster-gypsum', 'cement', 'Quruq aralashma', 'Сухие смеси', 'Gips suvoq', 'Гипсовая штукатурка', '30 kg', '30 кг', 'bag', 75000, 60000, 95000, 0.3, '1 sm qatlam, 9 kg/m²', 'слой 1 см, 9 кг/м²', 6),
+  ('plaster-cement', 'cement', 'Quruq aralashma', 'Сухие смеси', 'Sement-qum suvoq', 'Цементно-песчаная штукатурка', '25 kg', '25 кг', 'bag', 40000, 32000, 50000, 0.68, '1 sm qatlam, 17 kg/m²', 'слой 1 см, 17 кг/м²', 7),
+  ('floor-screed', 'cement', 'Quruq aralashma', 'Сухие смеси', 'Pol uchun styajka', 'Стяжка для пола', '25 kg', '25 кг', 'bag', 70000, 55000, 90000, 0.64, '1 sm qatlam, 16 kg/m²', 'слой 1 см, 16 кг/м²', 8),
+  ('sand', 'cement', 'Qum va shag''al', 'Песок и щебень', 'Qum (yuvilgan)', 'Песок мытый', '', '', 'm3', 160000, 120000, 200000, null, null, null, 9),
+  ('gravel', 'cement', 'Qum va shag''al', 'Песок и щебень', 'Shag''al', 'Щебень', '5–20 mm', '5–20 мм', 'm3', 190000, 150000, 230000, null, null, null, 10),
+
+  ('brick-red', 'brick', 'G''isht', 'Кирпич', 'Pishgan g''isht', 'Кирпич жжёный', '250×120×65', '250×120×65', 'pcs', 1300, 1000, 1700, null, null, null, 1),
+  ('brick-facing', 'brick', 'G''isht', 'Кирпич', 'Pardozbop g''isht', 'Кирпич облицовочный', '250×120×65', '250×120×65', 'pcs', 2800, 2000, 3800, null, null, null, 2),
+  ('gasblock-200', 'brick', 'Blok', 'Блоки', 'Gazoblok', 'Газоблок', '600×300×200', '600×300×200', 'pcs', 14000, 10000, 18000, 5.6, 'devor 20 sm', 'стена 20 см', 3),
+  ('gasblock-100', 'brick', 'Blok', 'Блоки', 'Gazoblok (pardevor)', 'Газоблок перегородочный', '600×300×100', '600×300×100', 'pcs', 8000, 6000, 10000, 5.6, 'pardevor 10 sm', 'перегородка 10 см', 4),
+  ('cinder-block', 'brick', 'Blok', 'Блоки', 'Shlakoblok', 'Шлакоблок', '390×190×188', '390×190×188', 'pcs', 5000, 4000, 6500, 13.5, 'devor 19 sm', 'стена 19 см', 5),
+
+  ('rebar-10', 'metal', 'Armatura', 'Арматура', 'Armatura 10 mm', 'Арматура 10 мм', '', '', 'm', 7000, 6000, 8000, null, null, null, 1),
+  ('rebar-12', 'metal', 'Armatura', 'Арматура', 'Armatura 12 mm', 'Арматура 12 мм', '', '', 'm', 9500, 8500, 11000, null, null, null, 2),
+  ('rebar-14', 'metal', 'Armatura', 'Арматура', 'Armatura 14 mm', 'Арматура 14 мм', '', '', 'm', 13000, 11500, 15000, null, null, null, 3),
+  ('tie-wire', 'metal', 'Armatura', 'Арматура', 'Bog''lash simi', 'Вязальная проволока', '', '', 'kg', 25000, 20000, 30000, null, null, null, 4),
+  ('pipe-40x20', 'metal', 'Profil truba', 'Профильная труба', 'Profil truba', 'Профильная труба', '40×20', '40×20', 'm', 28000, 24000, 34000, null, null, null, 5),
+  ('pipe-60x40', 'metal', 'Profil truba', 'Профильная труба', 'Profil truba', 'Профильная труба', '60×40', '60×40', 'm', 45000, 38000, 55000, null, null, null, 6),
+  ('profnastil', 'metal', 'Tom va devor', 'Кровля и стены', 'Profnastil', 'Профнастил', '0,4 mm', '0,4 мм', 'm2', 65000, 50000, 85000, 1.1, '+10% zaxira', '+10% запас', 7),
+
+  ('ppr-20', 'plumbing', 'Quvurlar', 'Трубы', 'PPR quvur 20 mm', 'Труба ППР 20 мм', '', '', 'm', 9000, 6000, 13000, null, null, null, 1),
+  ('ppr-25', 'plumbing', 'Quvurlar', 'Трубы', 'PPR quvur 25 mm', 'Труба ППР 25 мм', '', '', 'm', 13000, 9000, 18000, null, null, null, 2),
+  ('sewer-50', 'plumbing', 'Quvurlar', 'Трубы', 'Kanalizatsiya quvuri 50 mm', 'Канализационная труба 50 мм', '', '', 'm', 15000, 11000, 20000, null, null, null, 3),
+  ('sewer-110', 'plumbing', 'Quvurlar', 'Трубы', 'Kanalizatsiya quvuri 110 mm', 'Канализационная труба 110 мм', '', '', 'm', 38000, 28000, 50000, null, null, null, 4),
+  ('faucet', 'plumbing', 'Jihozlar', 'Оборудование', 'Smesitel', 'Смеситель', 'oshxona yoki hammom', 'кухня или ванная', 'pcs', 350000, 180000, 700000, null, null, null, 5),
+  ('toilet', 'plumbing', 'Jihozlar', 'Оборудование', 'Unitaz (kompakt)', 'Унитаз компакт', '', '', 'pcs', 1300000, 800000, 2500000, null, null, null, 6),
+  ('sink', 'plumbing', 'Jihozlar', 'Оборудование', 'Rakovina', 'Раковина', '', '', 'pcs', 450000, 250000, 900000, null, null, null, 7),
+  ('boiler-80', 'plumbing', 'Jihozlar', 'Оборудование', 'Suv isitgich (boyler)', 'Водонагреватель (бойлер)', '80 l', '80 л', 'pcs', 2200000, 1600000, 3200000, null, null, null, 8),
+  ('radiator-section', 'plumbing', 'Isitish', 'Отопление', 'Radiator seksiyasi', 'Секция радиатора', 'alyuminiy', 'алюминий', 'pcs', 110000, 85000, 140000, null, null, null, 9),
+
+  ('cable-3x15', 'electric', 'Kabel', 'Кабель', 'Kabel VVG 3×1,5', 'Кабель ВВГ 3×1,5', 'chiroqlar uchun', 'для освещения', 'm', 7000, 5500, 9000, null, null, null, 1),
+  ('cable-3x25', 'electric', 'Kabel', 'Кабель', 'Kabel VVG 3×2,5', 'Кабель ВВГ 3×2,5', 'rozetkalar uchun', 'для розеток', 'm', 11000, 8000, 15600, null, null, null, 2),
+  ('corrugated', 'electric', 'Kabel', 'Кабель', 'Gofra quvur', 'Гофротруба', '16–20 mm', '16–20 мм', 'm', 1500, 1000, 2200, null, null, null, 3),
+  ('socket', 'electric', 'Jihozlar', 'Изделия', 'Rozetka', 'Розетка', 'ichki', 'внутренняя', 'pcs', 25000, 12000, 60000, null, null, null, 4),
+  ('switch', 'electric', 'Jihozlar', 'Изделия', 'O''chirgich', 'Выключатель', '', '', 'pcs', 22000, 10000, 55000, null, null, null, 5),
+  ('breaker-16', 'electric', 'Jihozlar', 'Изделия', 'Avtomat 16A', 'Автомат 16А', '', '', 'pcs', 45000, 25000, 80000, null, null, null, 6),
+  ('led-12w', 'electric', 'Jihozlar', 'Изделия', 'LED lampa 12W', 'LED лампа 12 Вт', '', '', 'pcs', 15000, 9000, 25000, null, null, null, 7),
+  ('junction-box', 'electric', 'Jihozlar', 'Изделия', 'Montaj qutisi', 'Монтажная коробка', '', '', 'pcs', 2000, 1200, 3500, null, null, null, 8),
+
+  ('paint-interior', 'paint', 'Bo''yoq', 'Краски', 'Emulsiya bo''yoq (ichki)', 'Водоэмульсионная краска', '20 kg', '20 кг', 'bucket', 230000, 130000, 400000, 0.0125, '2 qavat, 0,25 kg/m²', '2 слоя, 0,25 кг/м²', 1),
+  ('primer', 'paint', 'Bo''yoq', 'Краски', 'Gruntovka', 'Грунтовка', '10 l', '10 л', 'can', 120000, 80000, 180000, 0.015, '0,15 l/m²', '0,15 л/м²', 2),
+  ('wallpaper', 'paint', 'Gulqog''oz', 'Обои', 'Gulqog''oz (oboy)', 'Обои', '10 m rulon', 'рулон 10 м', 'roll', 150000, 70000, 350000, 0.2, '1 rulon ≈ 5 m²', '1 рулон ≈ 5 м²', 3),
+  ('wallpaper-glue', 'paint', 'Gulqog''oz', 'Обои', 'Gulqog''oz yelimi', 'Клей для обоев', '', '', 'pack', 35000, 25000, 55000, 0.04, '1 paket ≈ 25 m²', '1 пачка ≈ 25 м²', 4),
+  ('sealant', 'paint', 'Germetik', 'Герметики', 'Silikon germetik', 'Силиконовый герметик', '', '', 'tube', 30000, 18000, 50000, null, null, null, 5),
+  ('foam', 'paint', 'Germetik', 'Герметики', 'Montaj ko''pigi', 'Монтажная пена', '', '', 'can', 45000, 30000, 65000, null, null, null, 6),
+
+  ('tile-wall', 'floor', 'Kafel', 'Плитка', 'Devor kafeli', 'Настенная плитка', '', '', 'm2', 95000, 65000, 180000, 1.1, '+10% zaxira', '+10% запас', 1),
+  ('tile-floor', 'floor', 'Kafel', 'Плитка', 'Pol kafeli (keramogranit)', 'Напольная плитка (керамогранит)', '', '', 'm2', 130000, 85000, 250000, 1.1, '+10% zaxira', '+10% запас', 2),
+  ('grout', 'floor', 'Kafel', 'Плитка', 'Fuga (zatirka)', 'Затирка', '2 kg', '2 кг', 'pack', 30000, 20000, 50000, 0.1, '0,2 kg/m²', '0,2 кг/м²', 3),
+  ('laminate', 'floor', 'Pol', 'Полы', 'Laminat', 'Ламинат', '8 mm', '8 мм', 'm2', 120000, 80000, 220000, 1.08, '+8% zaxira', '+8% запас', 4),
+  ('linoleum', 'floor', 'Pol', 'Полы', 'Linoleum', 'Линолеум', '', '', 'm2', 70000, 45000, 120000, 1.1, '+10% zaxira', '+10% запас', 5),
+  ('skirting', 'floor', 'Pol', 'Полы', 'Plintus', 'Плинтус', '', '', 'm', 18000, 10000, 30000, null, null, null, 6),
+
+  ('drywall', 'drywall', 'Gipsokarton', 'Гипсокартон', 'Gipsokarton', 'Гипсокартон', '12,5 mm, 1,2×2,5 m', '12,5 мм, 1,2×2,5 м', 'sheet', 65000, 50000, 85000, 0.37, '1 list = 3 m², +10%', '1 лист = 3 м², +10%', 1),
+  ('drywall-moist', 'drywall', 'Gipsokarton', 'Гипсокартон', 'Namga chidamli gipsokarton', 'Влагостойкий гипсокартон', '12,5 mm, 1,2×2,5 m', '12,5 мм, 1,2×2,5 м', 'sheet', 85000, 65000, 110000, 0.37, '1 list = 3 m², +10%', '1 лист = 3 м², +10%', 2),
+  ('profile-cd', 'drywall', 'Profil', 'Профиль', 'Profil CD-60', 'Профиль CD-60', '3 m', '3 м', 'pcs', 22000, 16000, 30000, 0.9, '1 m² ga ≈ 0,9 dona', '≈ 0,9 шт на 1 м²', 3),
+  ('profile-ud', 'drywall', 'Profil', 'Профиль', 'Profil UD-27', 'Профиль UD-27', '3 m', '3 м', 'pcs', 16000, 12000, 22000, null, null, null, 4),
+  ('screws', 'drywall', 'Profil', 'Профиль', 'Shurup (samorez)', 'Саморезы', '1000 dona', '1000 шт', 'pack', 70000, 45000, 100000, null, null, null, 5),
+
+  ('foam-board', 'insul', 'Issiqlik izolyatsiyasi', 'Утеплитель', 'Penoplast', 'Пенопласт', '5 sm', '5 см', 'm2', 30000, 22000, 40000, 1.1, '+10% zaxira', '+10% запас', 1),
+  ('mineral-wool', 'insul', 'Issiqlik izolyatsiyasi', 'Утеплитель', 'Mineral paxta', 'Минеральная вата', '5 sm', '5 см', 'm2', 35000, 25000, 50000, 1.1, '+10% zaxira', '+10% запас', 2),
+  ('waterproofing', 'insul', 'Gidroizolyatsiya', 'Гидроизоляция', 'Gidroizolyatsiya (surtma)', 'Гидроизоляция обмазочная', '20 kg', '20 кг', 'bucket', 250000, 180000, 400000, 0.075, '2 qavat, 1,5 kg/m²', '2 слоя, 1,5 кг/м²', 3),
+  ('slate', 'insul', 'Tom', 'Кровля', 'Shifer', 'Шифер', '1 list', '1 лист', 'sheet', 75000, 60000, 95000, null, null, null, 4),
+  ('roofing-felt', 'insul', 'Tom', 'Кровля', 'Ruberoid', 'Рубероид', '10 m²', '10 м²', 'roll', 110000, 80000, 150000, 0.12, '1 rulon ≈ 10 m², +20%', '1 рулон ≈ 10 м², +20%', 5)
+on conflict (id) do nothing;
+
+-- Katalog: kategoriyalar va faol materiallar (ilova va keyinchalik saytdagi kalkulyator uchun)
+create or replace function public.get_material_catalog()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'updated_at', (select max(updated_at) from materials where active),
+    'categories', coalesce((select jsonb_agg(to_jsonb(c) order by c.sort) from material_categories c), '[]'::jsonb),
+    'materials',  coalesce((select jsonb_agg(to_jsonb(m) - 'active' order by m.category, m.sort)
+                              from materials m where m.active), '[]'::jsonb)
+  );
+$$;
+
+-- Admin: narxni yangilash (o'rtacha va oraliq) yoki materialni yashirish/qaytarish
+create or replace function public.admin_set_material_price(
+  p_id text, p_price int, p_price_min int default null, p_price_max int default null, p_active boolean default true
+) returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform require_admin();
+  if p_price is null or p_price < 0 or p_price > 1000000000
+     or (p_price_min is not null and p_price_min > p_price) or (p_price_max is not null and p_price_max < p_price) then
+    raise exception 'INVALID_PRICE';
+  end if;
+  update materials
+     set price = p_price, price_min = p_price_min, price_max = p_price_max,
+         active = coalesce(p_active, true), updated_at = now()
+   where id = p_id;
+  if not found then raise exception 'NOT_FOUND'; end if;
+end;
+$$;
+
+-- Admin: barcha materiallar, yashirilganlari bilan
+create or replace function public.admin_get_materials()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return coalesce((select jsonb_agg(to_jsonb(m) order by m.category, m.sort) from materials m), '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function public.get_material_catalog(), public.admin_set_material_price(text, int, int, int, boolean),
+  public.admin_get_materials()
+from public, anon, authenticated;
+
+grant execute on function public.get_material_catalog() to anon, authenticated;
+grant execute on function public.admin_set_material_price(text, int, int, int, boolean), public.admin_get_materials()
+to authenticated;
