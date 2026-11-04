@@ -6024,7 +6024,8 @@ begin
     return;
   end if;
   if p_kind is null or p_kind not in ('self_employed', 'entrepreneur') then raise exception 'INVALID_INPUT'; end if;
-  if v_id !~ '^([0-9]{9}|[0-9]{14})$' then raise exception 'INVALID_TAX_ID'; end if;
+  -- Faqat STIR (9 raqam): JShShIR (14 raqam) so'ralmaydi va qabul qilinmaydi (2026-11-04)
+  if v_id !~ '^[0-9]{9}$' then raise exception 'INVALID_TAX_ID'; end if;
   if not coalesce(p_consent, false) then raise exception 'CONSENT_REQUIRED'; end if;
 
   -- SET ichida eski qiymatlar o'qiladi: ma'lumot o'zgarmagan bo'lsa tasdiq saqlanadi
