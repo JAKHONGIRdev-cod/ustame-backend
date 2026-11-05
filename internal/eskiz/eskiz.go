@@ -105,8 +105,9 @@ func (c *Client) SendOTP(ctx context.Context, phone, code string) error {
 		log.Printf("TEST REJIM (SMS yuborilmadi) - %s uchun OTP: %s", phone, code)
 		return nil
 	}
-	// Eskiz'da moderatsiyadan o'tgan matn bilan harfma-harf bir xil bo'lsin
-	message := fmt.Sprintf("Ustame: tasdiqlash kodingiz %s. Kodni hech kimga bermang.", code)
+	// Eskiz'da moderatsiyadan o'tgan matn bilan harfma-harf bir xil bo'lsin. Operatorlar talabi: matnda resurs
+	// nomi va kodning maqsadi bo'lishi shart (my.eskiz.uz → SMS → Mening matnlarim, "Punkt 2").
+	message := fmt.Sprintf("Ustame ilovasiga kirish uchun tasdiqlash kodi: %s. Kodni hech kimga bermang.", code)
 
 	tok, err := c.token(ctx, false)
 	if err != nil {
