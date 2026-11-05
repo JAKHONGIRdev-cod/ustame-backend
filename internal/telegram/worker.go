@@ -66,7 +66,8 @@ const (
 	loginPrefix   = "login_" // t.me/<bot>?start=login_<kod>
 	contactButton = "📱 Raqamni yuborish"
 
-	msgLoginAsk       = "Ustame ilovasiga kirish uchun pastdagi «" + contactButton + "» tugmasini bosing."
+	msgLoginAsk = "Ustame ilovasiga kirish uchun pastdagi «" + contactButton + "» tugmasini bosing 👇\n\n" +
+		"Tugma ko'rinmasa, xabar yozish joyi yonidagi klaviatura (🎛) belgisini bosing."
 	msgLoginBadCode   = "Kirish havolasi eskirgan. Ilovada «Telegram orqali kirish» tugmasini qayta bosing."
 	msgLoginNotOwn    = "Faqat o'zingizning raqamingizni yuboring: pastdagi «" + contactButton + "» tugmasini bosing."
 	msgLoginNotUz     = "Hozircha faqat O'zbekiston raqamlari (+998) bilan kirish mumkin."
