@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log"
 	"time"
+
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
 )
 
 // Message — navbatdagi bitta xabar bitta telefon uchun (foydalanuvchining har bir qurilmasiga alohida).
@@ -12,6 +14,7 @@ type Message struct {
 	ID        int64 // notification_outbox.id
 	Token     string
 	Text      string
+	Lang      string  // users.lang: "uzc" bo'lsa matn kirillga o'giriladi
 	Link      *string // ilovada ochiladigan sahifa
 	CreatedAt time.Time
 }
@@ -115,7 +118,7 @@ func (w *Worker) deliverOnce(ctx context.Context) (failed, full bool) {
 func (w *Worker) send(ctx context.Context, part []Message) bool {
 	msgs := make([]ExpoMessage, len(part))
 	for i, m := range part {
-		msgs[i] = ExpoMessage{To: m.Token, Title: title, Body: m.Text, Sound: "default", ChannelID: "default", Priority: "high"}
+		msgs[i] = ExpoMessage{To: m.Token, Title: title, Body: cyrillic.For(m.Lang, m.Text), Sound: "default", ChannelID: "default", Priority: "high"}
 		if m.Link != nil {
 			msgs[i].Data = map[string]string{"url": *m.Link}
 		}

@@ -3,6 +3,8 @@ package telegram
 import (
 	"context"
 	"testing"
+
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
 )
 
 func privateMsg(chat int64, text string) Update {
@@ -170,5 +172,32 @@ func TestUzPhone(t *testing.T) {
 		if got != want || ok != (want != "") {
 			t.Errorf("uzPhone(%q) = %q, %v; kutilgan %q", in, got, ok, want)
 		}
+	}
+}
+
+// Ilovada o'zbek kirill tanlangan: havola login_<kod>_c — kirish oqimidagi javoblar kirillda
+func TestLoginFlowCyrillic(t *testing.T) {
+	w, tg, st := newTest(t)
+	st.loginCodes["k9"] = true
+	ctx := context.Background()
+
+	w.handleUpdate(ctx, privateMsg(90, "/start login_k9_c"))
+	w.handleUpdate(ctx, contactMsg(90, 90, "+998 90 123-45-67"))
+
+	if got := st.verified[90]; got != "998901234567" {
+		t.Fatalf("tasdiqlangan raqam = %q (kod _c belgisisiz o'qilishi kerak)", got)
+	}
+	if len(tg.sent) != 2 || tg.sent[0].Text != cyrillic.Convert(msgLoginAsk) || tg.sent[1].Text != cyrillic.Convert(msgLoginDone) {
+		t.Fatalf("yuborilgan: %v", tg.sent)
+	}
+	if !askedForContact(tg.markups[0]) {
+		t.Errorf("raqam so'raydigan tugma bo'lishi kerak: %v", tg.markups[0])
+	}
+
+	// Keyingi lotin havola bilan kirish — yana lotincha
+	st.loginCodes["k10"] = true
+	w.handleUpdate(ctx, privateMsg(90, "/start login_k10"))
+	if last := tg.sent[len(tg.sent)-1].Text; last != msgLoginAsk {
+		t.Errorf("lotin havoladan keyin javob lotincha bo'lishi kerak: %q", last)
 	}
 }

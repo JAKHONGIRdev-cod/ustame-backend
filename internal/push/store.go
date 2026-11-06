@@ -27,8 +27,10 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 			from c where o.id = c.id
 			returning o.id, o.user_id, o.message, o.link, o.created_at
 		)
-		select (select count(*)::int from u), u.id, t.token, u.message, u.link, u.created_at
+		select (select count(*)::int from u), u.id, t.token, u.message, u.link, u.created_at,
+		       coalesce(to_jsonb(usr)->>'lang', '') -- users.lang ustuni hali bo'lmasa ham xato bermaydi
 		from u left join push_tokens t on t.user_id = u.user_id
+		left join users usr on usr.id = u.user_id
 		order by u.id`, limit)
 	if err != nil {
 		return 0, nil, err
@@ -38,7 +40,7 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 	for rows.Next() {
 		var m Message
 		var token *string
-		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang); err != nil {
 			rows.Close()
 			return 0, nil, err
 		}

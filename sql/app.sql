@@ -6093,6 +6093,22 @@ grant execute on function public.submit_tax_status(text, text, boolean), public.
 to authenticated;
 
 
+-- ===== ilova tili (server matnlari uchun) =====
+-- Foydalanuvchi ilovada tanlagan til: "uzc" (o'zbek kirill) bo'lsa Telegram va push bildirishnomalari kirillga
+-- o'giriladi (ustame-backend: internal/cyrillic). Ilova kirganda va til almashganda set_my_lang chaqiradi.
+alter table public.users add column if not exists lang text;
+
+create or replace function public.set_my_lang(p_lang text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_lang is null or p_lang not in ('uz', 'uzc', 'ru', 'en') then raise exception 'INVALID_INPUT'; end if;
+  update users set lang = p_lang where id = require_uid() and lang is distinct from p_lang;
+end;
+$$;
+
+revoke execute on function public.set_my_lang(text) from public, anon, authenticated;
+grant execute on function public.set_my_lang(text) to authenticated;
+
 -- ===== qurilish materiallari narxlari va smeta kalkulyatori =====
 -- Toshkent bozoridagi taxminiy narxlar (o'rtacha + oraliq). Admin ilovada yangilaydi; mijoz va usta materialni
 -- tanlab, miqdor kiritib smeta hisoblaydi (smeta telefonda saqlanadi, bazaga yozilmaydi).

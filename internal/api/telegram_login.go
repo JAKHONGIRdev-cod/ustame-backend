@@ -35,6 +35,11 @@ func hashSecret(secret string) string {
 // POST /api/auth/telegram/start -> { url, secret, expires_in }
 // url — botni ochadi; secret — faqat ilovada qoladi va check'da ishlatiladi.
 func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
+	// { lang } — ilova tili: "uzc" bo'lsa havolaga belgi qo'shiladi va bot kirillda javob beradi
+	var body struct {
+		Lang any `json:"lang"`
+	}
+	readJSON(w, r, &body)
 	ctx := r.Context()
 	if !s.tgStartLimit.allow(clientIP(r), time.Now()) {
 		writeError(w, http.StatusTooManyRequests, "Juda ko'p urinish. Keyinroq urinib ko'ring")
@@ -82,11 +87,15 @@ func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "telegram-start", err)
 		return
 	}
-	// Eski yozuvlarni tozalaymiz (indeks bor, arzon)
-	s.db.Exec(ctx, `delete from telegram_logins where created_at < now() - interval '1 day'`)
+	// Eski yozuvlarni tozalaymiz (indeks bor, arzon). 30 kun saqlanadi — kirish voronkasi statistikasi uchun
+	s.db.Exec(ctx, `delete from telegram_logins where created_at < now() - interval '30 days'`)
 
+	startArg := "login_" + code
+	if str(body.Lang) == "uzc" {
+		startArg += "_c" // internal/telegram: loginCyrSuffix
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"url":        "https://t.me/" + *bot + "?start=login_" + code,
+		"url":        "https://t.me/" + *bot + "?start=" + startArg,
 		"secret":     secret,
 		"expires_in": telegramLoginTTLSeconds,
 	})

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
 )
 
 // Notification — notification_outbox'dan yuborish uchun olingan bitta xabar.
@@ -14,6 +16,7 @@ type Notification struct {
 	ID        int64
 	ChatID    *int64 // foydalanuvchi botga ulanmagan bo'lsa nil
 	Text      string
+	Lang      string // users.lang: "uzc" bo'lsa matn kirillga o'giriladi
 	CreatedAt time.Time
 }
 
@@ -52,6 +55,21 @@ type Worker struct {
 	IdlePoll      time.Duration // signalsiz zaxira tekshiruv oralig'i (standart 6 soat)
 	RetryDelay    time.Duration // xatodan keyin kutish (standart 5 s)
 	MaxMessageAge time.Duration // shundan eski xabar yuborilmay tashlanadi (standart 24 soat)
+
+	// loginLang — kirish havolasidan kelgan til (chat_id → "uzc"): ilovada kirill tanlangan bo'lsa,
+	// kirish oqimidagi javoblar (kontakt yuborilgandan keyingisi ham) kirillda.
+	loginLang sync.Map
+}
+
+// loginCyrSuffix — kirish havolasi oxirida: ilovada o'zbek kirill tanlangan (api/telegram_login.go)
+const loginCyrSuffix = "_c"
+
+// reply — kirish oqimidagi javob, chat tiliga moslab
+func (w *Worker) reply(chatID int64, text string) string {
+	if lang, ok := w.loginLang.Load(chatID); ok {
+		return cyrillic.For(lang.(string), text)
+	}
+	return text
 }
 
 const (
@@ -168,7 +186,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 	chatID := m.Chat.ID
 	if m.Contact != nil {
 		if reply, markup := w.contactReply(ctx, m); reply != "" {
-			w.send(ctx, chatID, reply, markup)
+			w.send(ctx, chatID, w.reply(chatID, reply), markup)
 		}
 		return
 	}
@@ -183,7 +201,14 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		if m.Chat.Type != "private" {
 			return
 		}
-		ok, err := w.Store.BeginLogin(ctx, strings.TrimPrefix(arg, loginPrefix), chatID)
+		code := strings.TrimPrefix(arg, loginPrefix)
+		if c, cyr := strings.CutSuffix(code, loginCyrSuffix); cyr {
+			code = c
+			w.loginLang.Store(chatID, "uzc")
+		} else {
+			w.loginLang.Delete(chatID)
+		}
+		ok, err := w.Store.BeginLogin(ctx, code, chatID)
 		switch {
 		case err != nil:
 			log.Printf("telegram: kirishni boshlashda xato: %v", err)
@@ -213,7 +238,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 	default:
 		reply = msgHello
 	}
-	w.send(ctx, chatID, reply, markup)
+	w.send(ctx, chatID, w.reply(chatID, reply), markup)
 }
 
 // loginReply — /start login_<kod> dan keyin: chat avval shu foydalanuvchi sifatida tasdiqlangan bo'lsa,
@@ -324,7 +349,7 @@ func (w *Worker) deliverOnce(ctx context.Context) (wait time.Duration, full bool
 		if n.ChatID == nil {
 			continue // botga ulanmagan foydalanuvchi — xabar shunchaki "yuborilgan" qoladi
 		}
-		err := w.TG.SendMessage(ctx, *n.ChatID, n.Text)
+		err := w.TG.SendMessage(ctx, *n.ChatID, cyrillic.For(n.Lang, n.Text))
 		if err == nil {
 			continue
 		}
