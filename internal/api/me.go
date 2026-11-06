@@ -35,7 +35,7 @@ func (s *Server) refreshToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
-// PATCH /api/me  { full_name?, active_role? }
+// PATCH /api/me  { full_name?, active_role? }  (active_role: client | provider | shop — qurilish materiallari do'koni)
 func (s *Server) patchMe(w http.ResponseWriter, r *http.Request) {
 	u := s.requireUser(r.Context(), r)
 	if u == nil {
@@ -59,7 +59,7 @@ func (s *Server) patchMe(w http.ResponseWriter, r *http.Request) {
 	activeRole := u.ActiveRole
 	if v, ok := body["active_role"]; ok {
 		activeRole = str(v)
-		if activeRole != "client" && activeRole != "provider" {
+		if activeRole != "client" && activeRole != "provider" && activeRole != "shop" {
 			writeError(w, http.StatusBadRequest, "INVALID_INPUT")
 			return
 		}

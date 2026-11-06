@@ -2086,6 +2086,7 @@ begin
     'blocked_users',       (select count(*) from users where blocked_at is not null and deleted_at is null),
     'open_reports',        (select count(*) from reports where status = 'open'),
     'pending_teams',       (select count(*) from teams where status = 'pending'),
+    'pending_shops',       (select count(*) from shop_profiles where status = 'pending'),
     'total_users',         (select count(*) from profiles),
     'total_providers',     (select count(*) from provider_profiles where status = 'approved'),
     'open_jobs',           (select count(*) from jobs where status = 'open'),
@@ -2315,7 +2316,11 @@ begin
     -- Mijoz profili: shaxsiy yoki tashkilot, buyurtmalar statistikasi
     'account_type',      (select x.account_type from users x where x.id = p.id),
     'organization_name', (select x.organization_name from users x where x.id = p.id),
-    'client_stats',      client_stats(p.id)
+    'client_stats',      client_stats(p.id),
+    -- Qurilish materiallari do'koni (ariza yoki tasdiqlangan) — pastda, "do'konlar" bo'limida
+    'shop',              (select to_jsonb(s) - 'user_id'
+                                 || jsonb_build_object('logo_v', _shop_logo_v(s.user_id), 'photos', _shop_photos(s.user_id))
+                            from shop_profiles s where s.user_id = p.id)
   )
   into v
   from profiles p join auth.users u on u.id = p.id
@@ -2464,7 +2469,7 @@ begin
 
   perform _close_user_activity(v_uid);
   delete from files
-   where (bucket in ('avatars', 'portfolio-photos') and path like v_uid::text || '/%')
+   where (bucket in ('avatars', 'portfolio-photos', 'shop-photos') and path like v_uid::text || '/%')
       or (bucket = 'job-photos' and split_part(path, '/', 1) in (select id::text from jobs where client_id = v_uid));
   delete from job_addresses where job_id in (select id from jobs where client_id = v_uid);
   delete from favorites where client_id = v_uid or provider_id = v_uid;
@@ -2474,6 +2479,7 @@ begin
   delete from team_members where user_id = v_uid;
   delete from job_invites where client_id = v_uid or provider_id = v_uid;
   delete from provider_profiles where user_id = v_uid;
+  delete from shop_profiles where user_id = v_uid;
   update users set
     full_name = 'O''chirilgan hisob', phone = 'deleted:' || id::text, active_role = 'client',
     telegram_chat_id = null, telegram_link_code = null, telegram_login_chat_id = null, avatar_updated_at = null,
@@ -6296,3 +6302,284 @@ $$;
 revoke execute on function public._public_name(text) from public, anon, authenticated;
 
 grant execute on function public.get_provider_profile(uuid), public.search_teams(text, text, int, int) to anon;
+
+-- ===== qurilish materiallari do'konlari =====
+-- Foydalanuvchi o'zini do'kon sifatida ochadi: bitta hisob, uch rejim (mijoz ⇄ usta ⇄ do'kon). Ariza admin
+-- tasdig'idan keyin mijozlarga ko'rinadi (get_shops, get_shop — kirmagan mehmonga ham). Rasmlar files jadvalida:
+-- shop-photos/<user_id>/logo.jpg va photo-1..4.jpg (ustame-backend: internal/api/files.go).
+
+-- Faol rol: 'shop' ham (avval faqat client/provider edi)
+do $$
+begin
+  if exists (select 1 from pg_constraint where conname = 'users_active_role_check'
+             and pg_get_constraintdef(oid) not like '%shop%') then
+    alter table public.users drop constraint users_active_role_check;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'users_active_role_check') then
+    alter table public.users add constraint users_active_role_check
+      check (active_role in ('client', 'provider', 'shop'));
+  end if;
+end $$;
+
+create or replace function public.set_active_role(p_role text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_role is null or p_role not in ('client', 'provider', 'shop') then raise exception 'INVALID_INPUT'; end if;
+  update profiles set active_role = p_role where id = require_uid();
+end;
+$$;
+
+create table if not exists public.shop_profiles (
+  user_id          uuid primary key references public.users (id) on delete cascade,
+  name             text not null check (char_length(name) between 2 and 80),
+  description      text not null default '' check (char_length(description) <= 1000),
+  phone            text not null check (phone ~ '^998[0-9]{9}$'),
+  district         text not null check (char_length(district) between 2 and 40),
+  address          text not null check (char_length(address) between 5 and 300),
+  lat              double precision,
+  lng              double precision,
+  work_hours       text not null default '' check (char_length(work_hours) <= 80),
+  -- material_categories.slug lari
+  categories       text[] not null check (cardinality(categories) between 1 and 20),
+  delivery         boolean not null default false,
+  delivery_note    text not null default '' check (char_length(delivery_note) <= 200),
+  status           text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  rejection_reason text,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  reviewed_at      timestamptz
+);
+
+create index if not exists shop_profiles_status_idx on public.shop_profiles (status, created_at desc);
+
+alter table public.shop_profiles enable row level security;
+
+-- Ikki nuqta orasidagi masofa, km (gaversinus)
+create or replace function public._km(
+  p_lat1 double precision, p_lng1 double precision, p_lat2 double precision, p_lng2 double precision
+) returns double precision language sql immutable as $$
+  select 2 * 6371 * asin(sqrt(
+    power(sin(radians(p_lat2 - p_lat1) / 2), 2)
+    + cos(radians(p_lat1)) * cos(radians(p_lat2)) * power(sin(radians(p_lng2 - p_lng1) / 2), 2)));
+$$;
+
+-- Do'kon rasmlari: [{ name, v }] (v — yangilangan vaqt, URL keshini yangilash uchun)
+create or replace function public._shop_photos(p_user_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('name', n.name, 'v', (extract(epoch from f.updated_at) * 1000)::bigint)
+                            order by n.ord), '[]'::jsonb)
+  from unnest(array['photo-1.jpg', 'photo-2.jpg', 'photo-3.jpg', 'photo-4.jpg']) with ordinality as n(name, ord)
+  join files f on f.bucket = 'shop-photos' and f.path = p_user_id::text || '/' || n.name;
+$$;
+
+create or replace function public._shop_logo_v(p_user_id uuid)
+returns bigint language sql stable security definer set search_path = public as $$
+  select (extract(epoch from updated_at) * 1000)::bigint from files
+  where bucket = 'shop-photos' and path = p_user_id::text || '/logo.jpg';
+$$;
+
+-- Do'kon kartochkasi (ro'yxat, xarita va sahifa uchun umumiy qism)
+create or replace function public._shop_card(p_user_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'id',         s.user_id,
+    'name',       s.name,
+    'district',   s.district,
+    'address',    s.address,
+    'lat',        s.lat,
+    'lng',        s.lng,
+    'work_hours', s.work_hours,
+    'categories', s.categories,
+    'delivery',   s.delivery,
+    'status',     s.status,
+    'logo_v',     _shop_logo_v(s.user_id)
+  )
+  from shop_profiles s where s.user_id = p_user_id;
+$$;
+
+-- Do'kon arizasi (yangi) yoki ma'lumotlarini tahrirlash. Rad etilgan ariza qayta tekshiruvga ketadi.
+-- Telefon: 998XXXXXXXXX yoki 9 raqam. Kategoriyalar — material_categories dan.
+create or replace function public.save_my_shop(
+  p_name text, p_description text, p_phone text, p_district text, p_address text,
+  p_lat double precision, p_lng double precision, p_work_hours text, p_categories text[],
+  p_delivery boolean, p_delivery_note text
+) returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_uid   uuid := require_uid();
+  v_name  text := btrim(coalesce(p_name, ''));
+  v_phone text := regexp_replace(coalesce(p_phone, ''), '\D', '', 'g');
+  v_cats  text[] := array(select distinct c from unnest(coalesce(p_categories, '{}'::text[])) c order by c);
+  v_old   text;
+  v_status text;
+begin
+  if char_length(v_name) not between 2 and 80 then raise exception 'INVALID_SHOP_NAME'; end if;
+  if char_length(v_phone) = 9 then v_phone := '998' || v_phone; end if;
+  if v_phone !~ '^998[0-9]{9}$' then raise exception 'INVALID_PHONE'; end if;
+  if char_length(btrim(coalesce(p_district, ''))) not between 2 and 40 then raise exception 'INVALID_DISTRICTS'; end if;
+  if char_length(btrim(coalesce(p_address, ''))) not between 5 and 300 then raise exception 'INVALID_ADDRESS'; end if;
+  if char_length(coalesce(p_description, '')) > 1000 or char_length(coalesce(p_work_hours, '')) > 80
+     or char_length(coalesce(p_delivery_note, '')) > 200 then
+    raise exception 'INVALID_INPUT';
+  end if;
+  if cardinality(v_cats) = 0
+     or exists (select 1 from unnest(v_cats) c where not exists (select 1 from material_categories m where m.slug = c)) then
+    raise exception 'INVALID_SHOP_CATEGORIES';
+  end if;
+  perform check_location(p_lat, p_lng);
+
+  select status into v_old from shop_profiles where user_id = v_uid for update;
+  insert into shop_profiles (user_id, name, description, phone, district, address, lat, lng, work_hours, categories,
+                             delivery, delivery_note)
+  values (v_uid, v_name, btrim(coalesce(p_description, '')), v_phone, btrim(p_district), btrim(p_address), p_lat, p_lng,
+          btrim(coalesce(p_work_hours, '')), v_cats, coalesce(p_delivery, false), btrim(coalesce(p_delivery_note, '')))
+  on conflict (user_id) do update set
+    name             = excluded.name,
+    description      = excluded.description,
+    phone            = excluded.phone,
+    district         = excluded.district,
+    address          = excluded.address,
+    lat              = excluded.lat,
+    lng              = excluded.lng,
+    work_hours       = excluded.work_hours,
+    categories       = excluded.categories,
+    delivery         = excluded.delivery,
+    delivery_note    = excluded.delivery_note,
+    updated_at       = now(),
+    status           = case when shop_profiles.status = 'rejected' then 'pending' else shop_profiles.status end,
+    rejection_reason = case when shop_profiles.status = 'rejected' then null else shop_profiles.rejection_reason end
+  returning status into v_status;
+
+  -- Yangi yoki qayta yuborilgan ariza — adminlarga xabar
+  if v_old is null or v_old = 'rejected' then
+    perform _notify_admins(format(E'\U0001F3EA Yangi do''kon arizasi: "%s" (%s)', v_name, btrim(p_district)), '/admin/shops');
+  end if;
+  return v_status;
+end;
+$$;
+
+-- Tasdiqlangan do'konlar ro'yxati: kategoriya, tuman, qidiruv; joy berilsa — eng yaqini birinchi (distance_km)
+create or replace function public.get_shops(
+  p_category text default null, p_district text default null, p_query text default null,
+  p_lat double precision default null, p_lng double precision default null,
+  p_limit int default 50, p_offset int default 0
+) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_q     text := nullif(btrim(coalesce(p_query, '')), '');
+  v_like  text;
+  v_limit int  := least(greatest(coalesce(p_limit, 50), 1), 100);
+begin
+  if v_q is not null then
+    v_like := '%' || replace(replace(replace(v_q, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  return coalesce((
+    select jsonb_agg(x.item order by x.km nulls last, x.created_at desc)
+    from (
+      select _shop_card(s.user_id) || jsonb_build_object('distance_km', round(d.km::numeric, 1)) as item,
+             d.km, s.created_at
+      from shop_profiles s
+      join users u on u.id = s.user_id and u.blocked_at is null and u.deleted_at is null
+      cross join lateral (
+        select case when p_lat is not null and p_lng is not null and s.lat is not null
+                    then _km(p_lat, p_lng, s.lat, s.lng) end as km
+      ) d
+      where s.status = 'approved'
+        and (p_category is null or p_category = any (s.categories))
+        and (p_district is null or s.district = p_district)
+        and (v_like is null or s.name ilike v_like or s.address ilike v_like or s.description ilike v_like)
+      order by d.km nulls last, s.created_at desc
+      limit v_limit offset greatest(coalesce(p_offset, 0), 0)
+    ) x
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Do'kon sahifasi: tasdiqlangan do'kon hammaga; tekshiruvdagi yoki rad etilgani — faqat egasiga va admin'ga
+create or replace function public.get_shop(p_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := auth.uid();
+  v_s   shop_profiles;
+begin
+  select s.* into v_s from shop_profiles s join users u on u.id = s.user_id
+   where s.user_id = p_id and u.deleted_at is null and (u.blocked_at is null or v_uid = s.user_id);
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_s.status <> 'approved' and v_uid is distinct from v_s.user_id
+     and not coalesce((select is_admin from profiles where id = v_uid), false) then
+    raise exception 'NOT_FOUND';
+  end if;
+  return _shop_card(v_s.user_id) || jsonb_build_object(
+    'description',   v_s.description,
+    'phone',         v_s.phone,
+    'delivery_note', v_s.delivery_note,
+    'photos',        _shop_photos(v_s.user_id),
+    'created_at',    v_s.created_at,
+    'is_mine',       v_uid is not distinct from v_s.user_id
+  );
+end;
+$$;
+
+create or replace function public.admin_get_pending_shops()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return coalesce((
+    select jsonb_agg(_shop_card(s.user_id) || jsonb_build_object(
+             'description',   s.description,
+             'phone',         s.phone,
+             'delivery_note', s.delivery_note,
+             'photos',        _shop_photos(s.user_id),
+             'created_at',    s.created_at,
+             'owner',         jsonb_build_object('id', p.id, 'full_name', p.full_name, 'phone', u.phone))
+           order by s.created_at)
+    from shop_profiles s
+    join profiles p on p.id = s.user_id
+    join auth.users u on u.id = s.user_id
+    where s.status = 'pending'
+  ), '[]'::jsonb);
+end;
+$$;
+
+create or replace function public.admin_review_shop(p_user_id uuid, p_approve boolean, p_reason text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_s shop_profiles;
+  v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
+begin
+  perform require_admin();
+  if p_approve is null then raise exception 'INVALID_INPUT'; end if;
+  if not p_approve and v_reason is null then raise exception 'REASON_REQUIRED'; end if;
+  select * into v_s from shop_profiles where user_id = p_user_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+
+  update shop_profiles
+     set status = case when p_approve then 'approved' else 'rejected' end,
+         rejection_reason = case when p_approve then null else v_reason end,
+         reviewed_at = now()
+   where user_id = p_user_id;
+
+  perform queue_notification(p_user_id,
+    case when p_approve
+      then format(E'✅ "%s" do''koningiz tasdiqlandi — endi mijozlar sizni ro''yxatda va xaritada ko''radi.', v_s.name)
+      else format(E'❌ "%s" do''koni arizasi rad etildi. Sabab: %s', v_s.name, v_reason)
+    end,
+    case when p_approve then '/home' else '/become-shop' end);
+end;
+$$;
+
+revoke execute on function
+  public._km(double precision, double precision, double precision, double precision),
+  public._shop_photos(uuid), public._shop_logo_v(uuid), public._shop_card(uuid),
+  public.save_my_shop(text, text, text, text, text, double precision, double precision, text, text[], boolean, text),
+  public.get_shops(text, text, text, double precision, double precision, int, int),
+  public.get_shop(uuid), public.admin_get_pending_shops(), public.admin_review_shop(uuid, boolean, text)
+from public, anon, authenticated;
+
+grant execute on function
+  public.save_my_shop(text, text, text, text, text, double precision, double precision, text, text[], boolean, text),
+  public.admin_get_pending_shops(), public.admin_review_shop(uuid, boolean, text)
+to authenticated;
+
+-- Mehmon (kirmagan) ham do'konlarni ko'radi
+grant execute on function
+  public.get_shops(text, text, text, double precision, double precision, int, int), public.get_shop(uuid)
+to anon, authenticated;

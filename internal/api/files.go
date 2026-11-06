@@ -20,7 +20,7 @@ import (
 // portfolio-photos/<uid>/<fayl>, work-photos/<o'z shartnomasi id>/before-1..3.jpg | after-1..3.jpg
 // (faqat usta, shartnoma faol yoki topshirilgan paytda), dispute-photos/<o'z shartnomasi id>/client-1..4.jpg
 // (mijoz) | provider-1..4.jpg (usta) — faqat nizo ochiq paytda, id-docs/<uid>/passport.jpg | selfie.jpg — usta
-// shaxsi tasdiqlanguncha.
+// shaxsi tasdiqlanguncha, shop-photos/<uid>/logo.jpg | photo-1..4.jpg | p-<mahsulot id>.jpg — do'kon egasi.
 // id-docs yopiq: o'qish va ro'yxat faqat egasiga va admin'ga, keshlanmaydi. Admin qaroridan keyin SQL o'chiradi.
 
 const (
@@ -29,7 +29,7 @@ const (
 )
 
 var (
-	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos", "dispute-photos", "id-docs"}
+	buckets = []string{"avatars", "job-photos", "portfolio-photos", "work-photos", "dispute-photos", "id-docs", "shop-photos"}
 	// Pasport rasmlari (sql/app.sql: _id_docs, admin_review_provider bilan bir xil)
 	idDocNames     = []string{"passport.jpg", "selfie.jpg"}
 	privateBuckets = []string{"id-docs"}
@@ -42,9 +42,12 @@ var (
 		"client":   {"client-1.jpg", "client-2.jpg", "client-3.jpg", "client-4.jpg"},
 		"provider": {"provider-1.jpg", "provider-2.jpg", "provider-3.jpg", "provider-4.jpg"},
 	}
-	imageTypes = []string{"image/jpeg", "image/png", "image/webp"}
-	filePath   = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
-	uuidLike   = regexp.MustCompile(`^[0-9a-f-]{36}$`)
+	// Do'kon logosi va 4 tagacha rasmi (sql/app.sql: _shop_photos bilan bir xil); mahsulot rasmi — p-<uuid>.jpg
+	shopPhotoNames   = []string{"logo.jpg", "photo-1.jpg", "photo-2.jpg", "photo-3.jpg", "photo-4.jpg"}
+	productPhotoName = regexp.MustCompile(`^p-[0-9a-f-]{36}\.jpg$`)
+	imageTypes       = []string{"image/jpeg", "image/png", "image/webp"}
+	filePath         = regexp.MustCompile(`^([0-9a-f-]{36})/([A-Za-z0-9._-]{1,64})$`)
+	uuidLike         = regexp.MustCompile(`^[0-9a-f-]{36}$`)
 )
 
 // parsePath "<papka>/<nom>" ni ajratadi; bucket noma'lum yoki format noto'g'ri bo'lsa ok=false.
@@ -65,6 +68,9 @@ func (s *Server) canWrite(r *http.Request, u *user, bucket, folder, name string)
 		return folder == u.ID && name == "avatar.jpg", nil
 	case "portfolio-photos":
 		return folder == u.ID, nil
+	case "shop-photos":
+		// Faqat o'z papkasiga; do'kon arizasi bilan birga (profil hali saqlanmagan bo'lsa ham) yuklanadi
+		return folder == u.ID && (slices.Contains(shopPhotoNames, name) || productPhotoName.MatchString(name)), nil
 	case "job-photos":
 		if !slices.Contains(jobPhotoNames, name) {
 			return false, nil

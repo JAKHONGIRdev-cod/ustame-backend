@@ -6,7 +6,7 @@ create table if not exists users (
   phone text unique not null,
   full_name text not null default '',
   active_role text not null default 'client'
-    constraint users_active_role_check check (active_role in ('client', 'provider')),
+    constraint users_active_role_check check (active_role in ('client', 'provider', 'shop')),
   created_at timestamptz not null default now(),
   avatar_updated_at timestamptz,
   is_admin boolean not null default false,
@@ -27,7 +27,7 @@ do $$
 begin
   if not exists (select 1 from pg_constraint where conname = 'users_active_role_check') then
     alter table users add constraint users_active_role_check
-      check (active_role in ('client', 'provider'));
+      check (active_role in ('client', 'provider', 'shop'));
   end if;
 end $$;
 
