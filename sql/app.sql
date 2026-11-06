@@ -498,21 +498,29 @@ begin
   if char_length(coalesce(p_bio, '')) > 1000 then raise exception 'INVALID_BIO'; end if;
   if _has_contact(p_headline) or _has_contact(p_bio) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
 
-  insert into provider_profiles (user_id, headline, bio, categories, districts, experience_years)
-  values (v_uid, btrim(p_headline), btrim(coalesce(p_bio, '')), p_categories, p_districts, p_experience_years)
+  -- 2026-11-06 dan ustalarni jamoa o'zi kiritadi: har bir usta profili darhol tasdiqlanadi (admin tekshiruvisiz).
+  -- Admin keyin ham admin_review_provider bilan rad etishi yoki hisobni bloklashi mumkin.
+  insert into provider_profiles (user_id, headline, bio, categories, districts, experience_years, status, reviewed_at)
+  values (v_uid, btrim(p_headline), btrim(coalesce(p_bio, '')), p_categories, p_districts, p_experience_years,
+          'approved', now())
   on conflict (user_id) do update set
     headline         = excluded.headline,
     bio              = excluded.bio,
     categories       = excluded.categories,
     districts        = excluded.districts,
     experience_years = excluded.experience_years,
-    status           = case when provider_profiles.status = 'rejected' then 'pending' else provider_profiles.status end,
-    rejection_reason = case when provider_profiles.status = 'rejected' then null else provider_profiles.rejection_reason end
+    status           = 'approved',
+    rejection_reason = null,
+    reviewed_at      = coalesce(provider_profiles.reviewed_at, now())
   returning status into v_status;
 
   return v_status;
 end;
 $$;
+
+-- Avval tekshiruvda qolgan arizalar ham tasdiqlanadi (bir martalik; keyingi migratsiyalarda hech narsa o'zgarmaydi)
+update public.provider_profiles set status = 'approved', rejection_reason = null, reviewed_at = now()
+ where status = 'pending';
 
 create or replace function public.get_provider_profile(p_user_id uuid)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
