@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -212,7 +213,16 @@ func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "verify", err)
 		return
 	}
+	s.markLogin(ctx, u.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": publicUser(u)})
+}
+
+// markLogin — oxirgi kirish vaqti: admin operator qo'shgan usta ilovaga kirganini ko'radi. Ustun hali yo'q
+// bo'lsa (SQL migratsiyasidan oldin) xato faqat jurnalga yoziladi — kirish to'xtamaydi.
+func (s *Server) markLogin(ctx context.Context, userID string) {
+	if _, err := s.db.Exec(ctx, `update users set last_login_at = now() where id = $1::uuid`, userID); err != nil {
+		log.Printf("last_login: %v", err)
+	}
 }
 
 func (s *Server) fail(w http.ResponseWriter, where string, err error) {

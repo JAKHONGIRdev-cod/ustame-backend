@@ -6591,3 +6591,91 @@ to authenticated;
 grant execute on function
   public.get_shops(text, text, text, double precision, double precision, int, int), public.get_shop(uuid)
 to anon, authenticated;
+
+-- ===== operator usta qo'shadi (admin panel) =====
+-- Operator ustaga qo'ng'iroq qilib, uning raqami, ismi va kasbini admin paneldan kiritadi. Usta ilovada ro'yxatdan
+-- o'tib o'tirmaydi: shu raqam bilan kiradi (SMS yoki Telegram) va hisobi tayyor — usta rejimida, profili tasdiqlangan.
+-- Kirish raqam bo'yicha (users.phone unikal): backend kirganda shu hisobni topadi va last_login_at ni yozadi.
+alter table public.users add column if not exists last_login_at timestamptz;
+alter table public.provider_profiles add column if not exists added_by uuid references public.users (id) on delete set null;
+
+create or replace function public.admin_create_provider(
+  p_phone text, p_full_name text, p_headline text, p_categories text[], p_districts text[],
+  p_experience_years int, p_bio text default '', p_lat double precision default null,
+  p_lng double precision default null
+)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_admin uuid := require_admin();
+  v_phone text := regexp_replace(coalesce(p_phone, ''), '\D', '', 'g');
+  v_name text := btrim(coalesce(p_full_name, ''));
+  v_user users;
+  v_new boolean := false;
+begin
+  -- "90 123 45 67" ham, "+998 90 123-45-67" ham qabul qilinadi
+  if char_length(v_phone) = 9 then v_phone := '998' || v_phone; end if;
+  if v_phone !~ '^998[0-9]{9}$' then raise exception 'INVALID_PHONE'; end if;
+  if char_length(v_name) < 2 or char_length(v_name) > 60 then raise exception 'INVALID_NAME'; end if;
+  if char_length(btrim(coalesce(p_headline, ''))) < 3 or char_length(btrim(p_headline)) > 80 then
+    raise exception 'INVALID_HEADLINE';
+  end if;
+  if coalesce(cardinality(p_categories), 0) not between 1 and 3 then raise exception 'INVALID_CATEGORIES'; end if;
+  if coalesce(cardinality(p_districts), 0) not between 1 and 12 then raise exception 'INVALID_DISTRICTS'; end if;
+  if p_experience_years is null or p_experience_years not between 0 and 60 then raise exception 'INVALID_EXPERIENCE'; end if;
+  if char_length(coalesce(p_bio, '')) > 1000 then raise exception 'INVALID_BIO'; end if;
+  if _has_contact(p_headline) or _has_contact(p_bio) then raise exception 'CONTACT_NOT_ALLOWED'; end if;
+  perform check_location(p_lat, p_lng);
+
+  select * into v_user from users where phone = v_phone for update;
+  if not found then
+    insert into users (phone, full_name, active_role) values (v_phone, v_name, 'provider')
+    returning * into v_user;
+    v_new := true;
+  else
+    if v_user.blocked_at is not null then raise exception 'PHONE_BLOCKED'; end if;
+    if exists (select 1 from provider_profiles where user_id = v_user.id) then raise exception 'PROVIDER_EXISTS'; end if;
+    -- Avval mijoz sifatida kirgan odam: o'zi yozgan ismi saqlanadi, usta rejimi yoqiladi
+    update users
+       set full_name = case when btrim(full_name) = '' then v_name else full_name end,
+           active_role = 'provider'
+     where id = v_user.id;
+  end if;
+
+  insert into provider_profiles (user_id, headline, bio, categories, districts, experience_years, status, reviewed_at,
+                                 lat, lng, added_by)
+  values (v_user.id, btrim(p_headline), btrim(coalesce(p_bio, '')), p_categories, p_districts, p_experience_years,
+          'approved', now(), p_lat, p_lng, v_admin);
+
+  return jsonb_build_object('user_id', v_user.id, 'phone', v_phone, 'is_new', v_new);
+end;
+$$;
+
+-- Operator qo'shgan ustalar: kim qo'shgan va usta keyin ilovaga kirganmi (kirmaganlarga qayta qo'ng'iroq qilinadi)
+create or replace function public.admin_get_added_providers()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', u.id, 'full_name', u.full_name, 'phone', u.phone,
+      'headline', pp.headline, 'categories', pp.categories, 'districts', pp.districts,
+      'status', pp.status, 'created_at', pp.created_at, 'last_login_at', u.last_login_at,
+      'logged_in', coalesce(u.last_login_at > pp.created_at, false),
+      'added_by_name', a.full_name
+    ) order by pp.created_at desc)
+    from (select * from provider_profiles where added_by is not null order by created_at desc limit 100) pp
+    join users u on u.id = pp.user_id and u.deleted_at is null
+    left join users a on a.id = pp.added_by
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function
+  public.admin_create_provider(text, text, text, text[], text[], int, text, double precision, double precision),
+  public.admin_get_added_providers()
+from public, anon, authenticated;
+
+grant execute on function
+  public.admin_create_provider(text, text, text, text[], text[], int, text, double precision, double precision),
+  public.admin_get_added_providers()
+to authenticated;

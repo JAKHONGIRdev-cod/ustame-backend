@@ -202,5 +202,6 @@ func (s *Server) telegramCheck(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "telegram-check", err)
 		return
 	}
+	s.markLogin(ctx, u.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "token": token, "user": publicUser(u)})
 }
