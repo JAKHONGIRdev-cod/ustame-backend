@@ -6679,3 +6679,90 @@ grant execute on function
   public.admin_create_provider(text, text, text, text[], text[], int, text, double precision, double precision),
   public.admin_get_added_providers()
 to authenticated;
+
+-- ===== so'rovnomalar (ilova ichida) =====
+-- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
+-- tanlov savollari — variant id'lari massivi {"q1": ["plumbing"]}, matnli javoblar — satr {"q1_other": "...", "q10": "..."}.
+create table if not exists public.survey_responses (
+  user_id    uuid not null references public.users (id) on delete cascade,
+  survey     text not null check (survey ~ '^[a-z0-9_]{2,40}$'),
+  answers    jsonb not null check (jsonb_typeof(answers) = 'object'),
+  created_at timestamptz not null default now(),
+  primary key (user_id, survey)
+);
+
+alter table public.survey_responses enable row level security;
+
+create or replace function public.submit_survey(p_survey text, p_answers jsonb)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_key text;
+  v_val jsonb;
+begin
+  if p_survey is null or p_survey !~ '^[a-z0-9_]{2,40}$' then raise exception 'INVALID_INPUT'; end if;
+  if p_answers is null or jsonb_typeof(p_answers) <> 'object' or length(p_answers::text) > 10000 then
+    raise exception 'INVALID_INPUT';
+  end if;
+  -- Faqat qisqa kalitlar; qiymat — satrlar massivi yoki 2000 belgigacha matn
+  for v_key, v_val in select key, value from jsonb_each(p_answers) loop
+    if v_key !~ '^[a-z0-9_]{1,40}$' then raise exception 'INVALID_INPUT'; end if;
+    if jsonb_typeof(v_val) = 'array' then
+      if jsonb_array_length(v_val) > 20
+         or exists (select 1 from jsonb_array_elements(v_val) e
+                    where jsonb_typeof(e) <> 'string' or length(e #>> '{}') > 60) then
+        raise exception 'INVALID_INPUT';
+      end if;
+    elsif jsonb_typeof(v_val) = 'string' then
+      if length(v_val #>> '{}') > 2000 then raise exception 'INVALID_INPUT'; end if;
+    else
+      raise exception 'INVALID_INPUT';
+    end if;
+  end loop;
+
+  insert into survey_responses (user_id, survey, answers) values (v_uid, p_survey, p_answers)
+  on conflict (user_id, survey) do update set answers = excluded.answers, created_at = now();
+end;
+$$;
+
+-- Foydalanuvchi to'ldirgan so'rovnomalar (ilova qaysi birini qayta ko'rsatmasligini biladi)
+create or replace function public.get_my_surveys()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(survey order by survey), '[]'::jsonb)
+  from survey_responses where user_id = require_uid();
+$$;
+
+-- Admin: natijalar — har bir savol bo'yicha variantlar soni va matnli javoblar
+create or replace function public.admin_get_survey_results(p_survey text)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return jsonb_build_object(
+    'total', (select count(*) from survey_responses where survey = p_survey),
+    'counts', coalesce((
+      select jsonb_object_agg(q, opts) from (
+        select q, jsonb_object_agg(opt, n) opts from (
+          select e.key q, v opt, count(*) n
+          from survey_responses r, jsonb_each(r.answers) e, jsonb_array_elements_text(e.value) v
+          where r.survey = p_survey and jsonb_typeof(e.value) = 'array'
+          group by 1, 2
+        ) x group by q
+      ) y
+    ), '{}'::jsonb),
+    'texts', coalesce((
+      select jsonb_agg(jsonb_build_object('q', e.key, 'text', e.value #>> '{}', 'at', r.created_at)
+                       order by r.created_at desc)
+      from survey_responses r, jsonb_each(r.answers) e
+      where r.survey = p_survey and jsonb_typeof(e.value) = 'string' and btrim(e.value #>> '{}') <> ''
+    ), '[]'::jsonb)
+  );
+end;
+$$;
+
+revoke execute on function public.submit_survey(text, jsonb), public.get_my_surveys(),
+  public.admin_get_survey_results(text)
+from public, anon, authenticated;
+
+grant execute on function public.submit_survey(text, jsonb), public.get_my_surveys(),
+  public.admin_get_survey_results(text)
+to authenticated;
