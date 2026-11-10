@@ -133,3 +133,82 @@ func TestNoCodeForForeignContactOrGroup(t *testing.T) {
 		t.Fatalf("yuborilgan: %v", tg.sent)
 	}
 }
+
+// siteButton — xabardagi inline tugma: matni va havolasi ("" — tugma yo'q)
+func siteButton(markup any) (text, url string) {
+	m, _ := markup.(map[string]any)
+	rows, _ := m["inline_keyboard"].([]any)
+	if len(rows) == 0 {
+		return "", ""
+	}
+	row, _ := rows[0].([]any)
+	if len(row) == 0 {
+		return "", ""
+	}
+	btn, _ := row[0].(map[string]any)
+	text, _ = btn["text"].(string)
+	url, _ = btn["url"].(string)
+	return text, url
+}
+
+// Saytdan kelgan: tasdiqlangach "Ustame'ga qaytish" tugmasi bir martalik kod bilan saytni ochadi
+func TestSiteButtonCarriesCode(t *testing.T) {
+	w, tg, st := newCodeTest(t)
+	st.loginCodes["k1"] = true
+	ctx := context.Background()
+	w.handleUpdate(ctx, privateMsg(91, "/start login_k1"))
+	w.handleUpdate(ctx, contactMsg(91, 91, "998901234567"))
+
+	code := sentCode(t, w, st, tg.sent[1].Text, "998901234567")
+	text, url := siteButton(tg.markups[1])
+	if text != btnBack || url != "https://ustame.com/tg-login#998901234567."+code {
+		t.Fatalf("tugma: %q %q", text, url)
+	}
+
+	// Havolasiz kelgan (kod so'ragan) — "Ustame'ga kirish" tugmasi
+	w.handleUpdate(ctx, contactMsg(92, 92, "998907654321"))
+	code = sentCode(t, w, st, tg.sent[2].Text, "998907654321")
+	if text, url := siteButton(tg.markups[2]); text != btnLogin || url != "https://ustame.com/tg-login#998907654321."+code {
+		t.Fatalf("tugma: %q %q", text, url)
+	}
+}
+
+// Ilovadan kelgan (login_<kod>_a): tugma yo'q — u ilovani emas, saytni ochardi; kod matnda qoladi
+func TestAppLoginHasNoSiteButton(t *testing.T) {
+	w, tg, st := newCodeTest(t)
+	st.loginCodes["k7"] = true
+	ctx := context.Background()
+	w.handleUpdate(ctx, privateMsg(93, "/start login_k7_a"))
+	w.handleUpdate(ctx, contactMsg(93, 93, "998901234567"))
+
+	if st.verified[93] != "998901234567" {
+		t.Fatalf("_a belgisi koddan ajratilishi kerak: verified=%v", st.verified)
+	}
+	sentCode(t, w, st, tg.sent[1].Text, "998901234567")
+	if _, url := siteButton(tg.markups[1]); url != "" {
+		t.Fatalf("ilovadan kelganga sayt tugmasi chiqmasligi kerak: %q", url)
+	}
+	if m, _ := tg.markups[1].(map[string]any); m["remove_keyboard"] != true {
+		t.Errorf("klaviatura yopilishi kerak: %v", tg.markups[1])
+	}
+
+	// Keyin havolasiz /start — endi saytdan deb hisoblanadi (belgi tozalanadi)
+	st.known[93] = "998901234567"
+	w.handleUpdate(ctx, privateMsg(93, "/start"))
+	if _, url := siteButton(tg.markups[2]); url == "" {
+		t.Fatalf("havolasiz /start'da tugma bo'lishi kerak")
+	}
+}
+
+// Ilova + kirill: login_<kod>_a_c — ikkala belgi ham o'qiladi
+func TestAppAndCyrillicSuffixes(t *testing.T) {
+	w, tg, st := newCodeTest(t)
+	st.loginCodes["k8"] = true
+	w.handleUpdate(context.Background(), privateMsg(94, "/start login_k8_a_c"))
+	if !st.loginChats[94] {
+		t.Fatalf("kod belgilarsiz o'qilishi kerak edi")
+	}
+	if tg.sent[0].Text == msgLoginAsk || !askedForContact(tg.markups[0]) {
+		t.Fatalf("javob kirillda va raqam tugmasi bilan bo'lishi kerak: %q", tg.sent[0].Text)
+	}
+}

@@ -91,6 +91,11 @@ func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
 	s.db.Exec(ctx, `delete from telegram_logins where created_at < now() - interval '30 days'`)
 
 	startArg := "login_" + code
+	// Brauzer bu so'rovga doim Origin qo'shadi, Android ilova (React Native) — yo'q. Ilovadan kelganga bot "saytga
+	// qaytish" tugmasini ko'rsatmaydi (u ilovani emas, saytni ochardi)
+	if r.Header.Get("Origin") == "" {
+		startArg += "_a" // internal/telegram: loginAppSuffix
+	}
 	if str(body.Lang) == "uzc" {
 		startArg += "_c" // internal/telegram: loginCyrSuffix
 	}

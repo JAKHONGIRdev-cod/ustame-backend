@@ -65,14 +65,21 @@ type Worker struct {
 	// OTPSecret — SMS kodlari bilan bir xil kalit (config.OTPSecret): bot bergan kod /api/auth/verify'da tekshiriladi.
 	// Bo'sh bo'lsa bot kod bermaydi (faqat havola orqali kirish).
 	OTPSecret []byte
+	// SiteURL — saytga qaytish tugmasi uchun (standart https://ustame.com)
+	SiteURL string
 
 	// loginLang — kirish havolasidan kelgan til (chat_id → "uzc"): ilovada kirill tanlangan bo'lsa,
 	// kirish oqimidagi javoblar (kontakt yuborilgandan keyingisi ham) kirillda.
 	loginLang sync.Map
+	// loginApp — kirish Android ilovadan boshlangan (chat_id → true): saytga qaytish tugmasi ko'rsatilmaydi
+	loginApp sync.Map
 }
 
-// loginCyrSuffix — kirish havolasi oxirida: ilovada o'zbek kirill tanlangan (api/telegram_login.go)
-const loginCyrSuffix = "_c"
+// Kirish havolasi oxiridagi belgilar (api/telegram_login.go): login_<kod>[_a][_c]
+const (
+	loginAppSuffix = "_a" // ilovadan (brauzerdan emas) boshlangan
+	loginCyrSuffix = "_c" // ilovada o'zbek kirill tanlangan
+)
 
 // reply — kirish oqimidagi javob, chat tiliga moslab
 func (w *Worker) reply(chatID int64, text string) string {
@@ -108,17 +115,34 @@ const (
 		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
 	msgLoginKnown = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas. " +
 		"Ilovaga qayting — kirish avtomatik davom etadi."
+	// Saytdan kelganlarga: tugma bir martalik kod bilan saytni ochadi va darhol kiritadi (qaysi brauzerda ochilsa ham)
+	btnBack  = "↩️ Ustame'ga qaytish"
+	btnLogin = "🔑 Ustame'ga kirish"
+
+	msgLoginKnownLink = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas.\n\n" +
+		"Pastdagi «" + btnBack + "» tugmasini bosing — saytga darhol kirasiz. " +
+		"Yoki saytga o'zingiz qayting: kirish o'zi davom etadi.\n\nKirish kodi (kerak bo'lsa): %s"
+	msgLoginDoneLink = "✅ Raqamingiz tasdiqlandi.\n\n" +
+		"Pastdagi «" + btnBack + "» tugmasini bosing — saytga darhol kirasiz. " +
+		"Yoki saytga o'zingiz qayting: kirish o'zi davom etadi.\n\nKirish kodi (kerak bo'lsa): %s\n\n" +
+		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
+	msgLoginCodeLink = "🔑 Ustame'ga kirish kodingiz: %s\n\n" +
+		"Pastdagi «" + btnLogin + "» tugmasini bosing — darhol kirasiz.\n\n" +
+		"Yoki saytda yoki ilovada «Telegram orqali kirish» → «Telegram kodi bilan kirish» ni bosing va raqamingiz bilan " +
+		"shu kodni kiriting. Kod 10 daqiqa amal qiladi.\n\nKodni hech kimga bermang."
+
+	// Ilovadan kelganlarga (Telegram tugmasi ilovani ocha olmaydi — faqat veb-havola): ilovaga o'zi qaytadi
 	msgLoginKnownCode = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas. " +
-		"Saytga yoki ilovaga qayting — kirish o'zi davom etadi.\n\n" +
+		"Ustame ilovasiga qayting — kirish o'zi davom etadi.\n\n" +
 		"O'zi kirmasa, «Telegram kodi bilan kirish» ni bosing va shu kodni kiriting: %s"
-	// msgLoginDoneCode — tasdiqlangach zaxira kod ham: brauzer yopilgan yoki boshqa oynada qolgan bo'lsa ham kiradi
-	msgLoginDoneCode = "✅ Raqamingiz tasdiqlandi. Saytga yoki ilovaga qayting — kirish o'zi davom etadi.\n\n" +
+	// msgLoginDoneCode — tasdiqlangach zaxira kod ham: ilova yopilib qolgan bo'lsa ham kiradi
+	msgLoginDoneCode = "✅ Raqamingiz tasdiqlandi. Ustame ilovasiga qayting — kirish o'zi davom etadi.\n\n" +
 		"O'zi kirmasa, «Telegram kodi bilan kirish» ni bosing va shu kodni kiriting: %s\n\n" +
 		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
-	// msgLoginCode — kutilayotgan kirish yo'q (havolasiz yoki eskirgan havola bilan kelgan): kirish kodi
+	// msgLoginCode — kutilayotgan kirish yo'q (eskirgan havola bilan ilovadan kelgan): kirish kodi
 	msgLoginCode = "🔑 Ustame'ga kirish kodingiz: %s\n\n" +
-		"Saytda yoki ilovada «Telegram orqali kirish» → «Telegram kodi bilan kirish» ni bosing, " +
-		"raqamingiz va shu kodni kiriting. Kod 10 daqiqa amal qiladi.\n\nKodni hech kimga bermang."
+		"Ilovada «Telegram orqali kirish» → «Telegram kodi bilan kirish» ni bosing, raqamingiz va shu kodni kiriting " +
+		"(yoki «Telegram orqali kirish» tugmasini qayta bosing). Kod 10 daqiqa amal qiladi.\n\nKodni hech kimga bermang."
 	msgLoginExpiredAsk = "Bu kirish havolasi eskirgan, lekin muammo yo'q: pastdagi «" + contactButton +
 		"» tugmasini bosing — kirish kodini yuboramiz 👇"
 	msgCodeLimit = "Bu raqamga juda ko'p kod so'raldi. Bir soatdan keyin qayta urinib ko'ring."
@@ -259,6 +283,12 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		} else {
 			w.loginLang.Delete(chatID)
 		}
+		if c, app := strings.CutSuffix(code, loginAppSuffix); app {
+			code = c
+			w.loginApp.Store(chatID, true)
+		} else {
+			w.loginApp.Delete(chatID)
+		}
 		ok, err := w.Store.BeginLogin(ctx, code, chatID)
 		switch {
 		case err != nil:
@@ -290,8 +320,9 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		// Havolasiz /start (botni qidiruvdan yoki QR'dan ochgan) yoki oddiy matn (ko'pincha raqamni qo'lda yozadi):
 		// tanish chat'ga darhol kod, aks holda raqamni tugma orqali yuborishni so'raymiz
 		w.loginLang.Delete(chatID)
+		w.loginApp.Delete(chatID)
 		if phone := w.knownPhone(ctx, chatID); phone != "" {
-			reply, markup = w.codeReply(ctx, phone), removeKeyboard
+			reply, markup = w.codeReply(ctx, chatID, phone)
 		} else {
 			reply, markup = msgHello, askContactKeyboard
 		}
@@ -334,16 +365,37 @@ func (w *Worker) issueCode(ctx context.Context, phone string) (code string, limi
 	return code, false
 }
 
-// codeReply — kirish kodi xabari (yoki limit/xato matni)
-func (w *Worker) codeReply(ctx context.Context, phone string) string {
+// codeReply — kirish kodi xabari (saytdan kelganga — bir bosishda kirish tugmasi bilan) yoki limit/xato matni
+func (w *Worker) codeReply(ctx context.Context, chatID int64, phone string) (string, any) {
 	code, limited := w.issueCode(ctx, phone)
 	switch {
+	case code != "" && w.fromApp(chatID):
+		return fmt.Sprintf(msgLoginCode, code), removeKeyboard
 	case code != "":
-		return fmt.Sprintf(msgLoginCode, code)
+		return fmt.Sprintf(msgLoginCodeLink, code), w.siteButton(chatID, btnLogin, phone, code)
 	case limited:
-		return msgCodeLimit
+		return msgCodeLimit, removeKeyboard
 	}
-	return msgLoginNoSession
+	return msgLoginNoSession, removeKeyboard
+}
+
+func (w *Worker) fromApp(chatID int64) bool {
+	_, ok := w.loginApp.Load(chatID)
+	return ok
+}
+
+// siteButton — saytni ochib bot bergan kod bilan darhol kiritadigan tugma. Tugma ko'pincha Telegram ichidagi
+// brauzerda ochiladi (kirish boshlangan oynada emas), shuning uchun kod havolaning o'zida: # dan keyingi qism
+// serverga va jurnallarga bormaydi, sahifa uni o'qigach manzildan o'chiradi (ilova: src/app/(auth)/tg-login.tsx).
+func (w *Worker) siteButton(chatID int64, title, phone, code string) any {
+	site := w.SiteURL
+	if site == "" {
+		site = "https://ustame.com"
+	}
+	return map[string]any{"inline_keyboard": [][]map[string]any{{{
+		"text": w.reply(chatID, title),
+		"url":  site + "/tg-login#" + phone + "." + code,
+	}}}}
 }
 
 // expiredReply — /start login_<kod> eskirgan yoki ishlatilgan. Kod berish yoqilgan bo'lsa odam havolani qayta
@@ -353,7 +405,7 @@ func (w *Worker) expiredReply(ctx context.Context, chatID int64) (string, any) {
 		return msgLoginBadCode, nil
 	}
 	if phone := w.knownPhone(ctx, chatID); phone != "" {
-		return w.codeReply(ctx, phone), removeKeyboard
+		return w.codeReply(ctx, chatID, phone)
 	}
 	return msgLoginExpiredAsk, askContactKeyboard
 }
@@ -371,8 +423,12 @@ func (w *Worker) loginReply(ctx context.Context, chatID int64) (string, any) {
 			log.Printf("telegram: kirishni tasdiqlashda xato: %v", err)
 		}
 		if ok {
-			if code, _ := w.issueCode(ctx, phone); code != "" {
+			code, _ := w.issueCode(ctx, phone)
+			switch {
+			case code != "" && w.fromApp(chatID):
 				return fmt.Sprintf(msgLoginKnownCode, code), removeKeyboard
+			case code != "":
+				return fmt.Sprintf(msgLoginKnownLink, code), w.siteButton(chatID, btnBack, phone, code)
 			}
 			return msgLoginKnown, removeKeyboard
 		}
@@ -400,10 +456,16 @@ func (w *Worker) contactReply(ctx context.Context, m *Message) (string, any) {
 		return "", nil
 	case !ok:
 		// Kutilayotgan kirish yo'q (havola eskirgan, botni o'zi topib ochgan va h.k.) — kirish kodini beramiz
-		return w.codeReply(ctx, phone), removeKeyboard
+		return w.codeReply(ctx, m.Chat.ID, phone)
 	}
-	if code, _ := w.issueCode(ctx, phone); code != "" {
+	// Tasdiqlandi: kutayotgan oyna o'zi kiradi. Zaxira kod ham — u oyna yopilib qolgan bo'lsa ham kiradi
+	code, _ := w.issueCode(ctx, phone)
+	switch {
+	case code != "" && w.fromApp(m.Chat.ID):
 		return fmt.Sprintf(msgLoginDoneCode, code), removeKeyboard
+	case code != "":
+		// Inline tugma bilan klaviatura yopilmaydi, lekin raqam tugmasi bir martalik — bosilgach o'zi yashirinadi
+		return fmt.Sprintf(msgLoginDoneLink, code), w.siteButton(m.Chat.ID, btnBack, phone, code)
 	}
 	return msgLoginDone, removeKeyboard
 }
