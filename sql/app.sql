@@ -5012,7 +5012,7 @@ create table if not exists public.subscription_settings (
 );
 
 insert into public.subscription_settings (id, free_until, free_proposals, price)
-values (1, '2027-01-22 00:00:00+05', 5, 79000)
+values (1, '2027-01-22 00:00:00+05', 5, 199000) -- oyiga 199 000 so'm (2026-11-10 dan; prod'da update bilan)
 on conflict (id) do nothing;
 
 alter table public.subscription_settings enable row level security;
