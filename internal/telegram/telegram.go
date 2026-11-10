@@ -135,3 +135,38 @@ func (c *Client) SendMessageMarkup(ctx context.Context, chatID int64, text strin
 	}
 	return c.call(ctx, "sendMessage", params, nil)
 }
+
+// BotTexts — botning profil matnlari: description — bo'sh chatda «START» tugmasi ustida ko'rinadi,
+// short — bot profilida va ulashilganda.
+type BotTexts struct {
+	Lang        string // "" — standart (boshqa barcha tillar)
+	Description string
+	Short       string
+}
+
+// EnsureTexts — matnlar farq qilsagina o'rnatadi (setMy* tez-tez chaqirilsa Telegram 429 qaytaradi).
+func (c *Client) EnsureTexts(ctx context.Context, t BotTexts) error {
+	var desc struct {
+		Description string `json:"description"`
+	}
+	if err := c.call(ctx, "getMyDescription", map[string]any{"language_code": t.Lang}, &desc); err != nil {
+		return err
+	}
+	if desc.Description != t.Description {
+		if err := c.call(ctx, "setMyDescription",
+			map[string]any{"description": t.Description, "language_code": t.Lang}, nil); err != nil {
+			return err
+		}
+	}
+	var short struct {
+		ShortDescription string `json:"short_description"`
+	}
+	if err := c.call(ctx, "getMyShortDescription", map[string]any{"language_code": t.Lang}, &short); err != nil {
+		return err
+	}
+	if short.ShortDescription != t.Short {
+		return c.call(ctx, "setMyShortDescription",
+			map[string]any{"short_description": t.Short, "language_code": t.Lang}, nil)
+	}
+	return nil
+}

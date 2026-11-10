@@ -63,10 +63,12 @@ func (s *Server) sendCode(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusTooManyRequests, "Juda ko'p urinish. Keyinroq urinib ko'ring yoki Telegram orqali kiring")
 			return
 		}
+		// Faqat SMS kodlari (5 daqiqalik): Telegram bot bergan kodlar (10 daqiqalik, internal/telegram) SMS emas
 		var sent int
 		if err := s.db.QueryRow(ctx, `
 			select count(*)::int from otp_codes
-			where created_at > now() - interval '24 hours' and phone <> all($1)`, s.testPhoneList()).Scan(&sent); err != nil {
+			where created_at > now() - interval '24 hours' and phone <> all($1)
+			  and expires_at - created_at <= interval '5 minutes'`, s.testPhoneList()).Scan(&sent); err != nil {
 			s.fail(w, "send-code", err)
 			return
 		}

@@ -95,6 +95,17 @@ func (s *PgStore) CompleteLogin(ctx context.Context, chatID int64, phone string)
 	return tag.RowsAffected() == 1, err
 }
 
+// IssueLoginCode — bot bergan kirish kodi. SMS kodidan farqi: 10 daqiqa amal qiladi (SMS — 5 daqiqa; api/auth.go
+// kunlik SMS limitini hisoblashda shu farq bilan bot kodlarini chiqarib tashlaydi). Raqamga soatiga 10 tadan ko'p emas.
+func (s *PgStore) IssueLoginCode(ctx context.Context, phone, codeHash string) (bool, error) {
+	tag, err := s.DB.Exec(ctx, `
+		insert into otp_codes (phone, code_hash, expires_at)
+		select $1, $2, now() + interval '10 minutes'
+		where (select count(*) from otp_codes where phone = $1 and created_at > now() - interval '1 hour') < 10`,
+		phone, codeHash)
+	return tag.RowsAffected() == 1, err
+}
+
 func (s *PgStore) ClaimNotifications(ctx context.Context, limit int) ([]Notification, error) {
 	rows, err := s.DB.Query(ctx, `
 		with c as (

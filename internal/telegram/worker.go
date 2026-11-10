@@ -2,12 +2,16 @@ package telegram
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
 	"log"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
 )
 
@@ -35,6 +39,9 @@ type Store interface {
 	// KnownLoginPhone — shu chat'dan avval Telegram orqali kirib raqami tasdiqlangan (bloklanmagan) foydalanuvchi
 	// raqami; bo'lmasa "". Faqat bildirishnoma uchun ulangan chat hisobga olinmaydi.
 	KnownLoginPhone(ctx context.Context, chatID int64) (string, error)
+	// IssueLoginCode — raqamga bir martalik kirish kodini yozadi (otp_codes; saytdagi /api/auth/verify tekshiradi).
+	// false — shu raqamga oxirgi soatda juda ko'p kod berilgan.
+	IssueLoginCode(ctx context.Context, phone, codeHash string) (bool, error)
 	// ClaimNotifications — yuborilmagan xabarlarni "yuborildi" deb belgilab oladi
 	// (ikki nusxa bir vaqtda ishlasa ham bir xabar ikki marta ketmasin).
 	ClaimNotifications(ctx context.Context, limit int) ([]Notification, error)
@@ -55,6 +62,9 @@ type Worker struct {
 	IdlePoll      time.Duration // signalsiz zaxira tekshiruv oralig'i (standart 6 soat)
 	RetryDelay    time.Duration // xatodan keyin kutish (standart 5 s)
 	MaxMessageAge time.Duration // shundan eski xabar yuborilmay tashlanadi (standart 24 soat)
+	// OTPSecret — SMS kodlari bilan bir xil kalit (config.OTPSecret): bot bergan kod /api/auth/verify'da tekshiriladi.
+	// Bo'sh bo'lsa bot kod bermaydi (faqat havola orqali kirish).
+	OTPSecret []byte
 
 	// loginLang — kirish havolasidan kelgan til (chat_id → "uzc"): ilovada kirill tanlangan bo'lsa,
 	// kirish oqimidagi javoblar (kontakt yuborilgandan keyingisi ham) kirillda.
@@ -76,7 +86,11 @@ const (
 	msgLinked = "✅ Ustame bildirishnomalari ulandi. Yangi taklif, xabar va shartnoma yangiliklari shu yerga keladi.\n\n" +
 		"O'chirish uchun: /stop yoki ilovada Profil → Telegram → Uzish."
 	msgBadCode = "Havola eskirgan yoki noto'g'ri. Ilovada Profil → Telegram → «Botga ulanish» tugmasini qayta bosing."
-	msgHello   = "Assalomu alaykum! Bu Ustame bildirishnomalar boti.\n\n" +
+	msgHello   = "Assalomu alaykum! Bu Ustame boti.\n\n" +
+		"Ustame'ga kirish uchun pastdagi «" + contactButton + "» tugmasini bosing — kirish kodini yuboramiz 👇\n\n" +
+		"Tugma ko'rinmasa, xabar yozish joyi yonidagi klaviatura (🎛) belgisini bosing."
+	// msgHelloNoCode — kod berish o'chiq (OTPSecret yo'q) yoki guruh chati: oddiy /start javobi
+	msgHelloNoCode = "Assalomu alaykum! Bu Ustame bildirishnomalar boti.\n\n" +
 		"Ulash uchun ilovada Profil → Telegram → «Botga ulanish» tugmasini bosing."
 	msgStopped = "Bildirishnomalar o'chirildi. Qayta ulash uchun ilovada «Botga ulanish» tugmasini bosing."
 
@@ -94,7 +108,39 @@ const (
 		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
 	msgLoginKnown = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas. " +
 		"Ilovaga qayting — kirish avtomatik davom etadi."
+	msgLoginKnownCode = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas. " +
+		"Saytga yoki ilovaga qayting — kirish o'zi davom etadi.\n\n" +
+		"O'zi kirmasa, «Telegram kodi bilan kirish» ni bosing va shu kodni kiriting: %s"
+	// msgLoginDoneCode — tasdiqlangach zaxira kod ham: brauzer yopilgan yoki boshqa oynada qolgan bo'lsa ham kiradi
+	msgLoginDoneCode = "✅ Raqamingiz tasdiqlandi. Saytga yoki ilovaga qayting — kirish o'zi davom etadi.\n\n" +
+		"O'zi kirmasa, «Telegram kodi bilan kirish» ni bosing va shu kodni kiriting: %s\n\n" +
+		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
+	// msgLoginCode — kutilayotgan kirish yo'q (havolasiz yoki eskirgan havola bilan kelgan): kirish kodi
+	msgLoginCode = "🔑 Ustame'ga kirish kodingiz: %s\n\n" +
+		"Saytda yoki ilovada «Telegram orqali kirish» → «Telegram kodi bilan kirish» ni bosing, " +
+		"raqamingiz va shu kodni kiriting. Kod 10 daqiqa amal qiladi.\n\nKodni hech kimga bermang."
+	msgLoginExpiredAsk = "Bu kirish havolasi eskirgan, lekin muammo yo'q: pastdagi «" + contactButton +
+		"» tugmasini bosing — kirish kodini yuboramiz 👇"
+	msgCodeLimit = "Bu raqamga juda ko'p kod so'raldi. Bir soatdan keyin qayta urinib ko'ring."
 )
+
+// botTexts — botni birinchi marta ochganda bo'sh chatda «START» tugmasi ustida ko'rinadigan matn. Havoladan kelganlarning
+// ko'pi shu yerda to'xtab qolardi (START bosilmaydi): matn aynan nima qilishni aytadi.
+var botTexts = []BotTexts{
+	{
+		Lang: "",
+		Description: "Ustame — uy ta'miri uchun ishonchli ustalar va qurilish materiallari.\n\n" +
+			"👇 Kirish uchun pastdagi «START» (yoki «Boshlash», «Запустить») tugmasini bosing, " +
+			"keyin «" + contactButton + "» tugmasini bosing.",
+		Short: "Ustame'ga kirish va bildirishnomalar. Ustalar va e'lonlar: ustame.com",
+	},
+	{
+		Lang: "ru",
+		Description: "Ustame — надёжные мастера для ремонта и стройматериалы.\n\n" +
+			"👇 Чтобы войти, нажмите «Запустить» (START) внизу, затем кнопку «" + contactButton + "» (отправить номер).",
+		Short: "Вход в Ustame и уведомления. Мастера и заказы: ustame.com",
+	},
+}
 
 var (
 	askContactKeyboard = map[string]any{
@@ -132,6 +178,11 @@ func (w *Worker) Run(ctx context.Context) {
 				log.Printf("telegram: bot nomini saqlab bo'lmadi: %v", err)
 			}
 			log.Printf("telegram: @%s boti ishga tushdi", me.Username)
+			for _, t := range botTexts {
+				if err := w.TG.EnsureTexts(ctx, t); err != nil {
+					log.Printf("telegram: bot tavsifi (%q) o'rnatilmadi: %v", t.Lang, err)
+				}
+			}
 			break
 		}
 		log.Printf("telegram: getMe xato (token to'g'rimi?): %v", err)
@@ -216,7 +267,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		case ok:
 			reply, markup = w.loginReply(ctx, chatID)
 		default:
-			reply = msgLoginBadCode
+			reply, markup = w.expiredReply(ctx, chatID)
 		}
 	case cmd == "/start" && arg != "":
 		ok, err := w.Store.LinkChat(ctx, arg, chatID)
@@ -235,10 +286,76 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 			return
 		}
 		reply = msgStopped
+	case m.Chat.Type == "private" && w.codesEnabled():
+		// Havolasiz /start (botni qidiruvdan yoki QR'dan ochgan) yoki oddiy matn (ko'pincha raqamni qo'lda yozadi):
+		// tanish chat'ga darhol kod, aks holda raqamni tugma orqali yuborishni so'raymiz
+		w.loginLang.Delete(chatID)
+		if phone := w.knownPhone(ctx, chatID); phone != "" {
+			reply, markup = w.codeReply(ctx, phone), removeKeyboard
+		} else {
+			reply, markup = msgHello, askContactKeyboard
+		}
 	default:
-		reply = msgHello
+		reply = msgHelloNoCode
 	}
 	w.send(ctx, chatID, w.reply(chatID, reply), markup)
+}
+
+func (w *Worker) codesEnabled() bool { return len(w.OTPSecret) > 0 }
+
+func (w *Worker) knownPhone(ctx context.Context, chatID int64) string {
+	phone, err := w.Store.KnownLoginPhone(ctx, chatID)
+	if err != nil {
+		log.Printf("telegram: tanish chat'ni tekshirishda xato: %v", err)
+	}
+	return phone
+}
+
+// issueCode — 6 xonali bir martalik kirish kodi (otp_codes). "" — berilmadi (o'chiq, limit yoki xato);
+// limited — shu raqamga juda ko'p kod so'ralgan.
+func (w *Worker) issueCode(ctx context.Context, phone string) (code string, limited bool) {
+	if !w.codesEnabled() {
+		return "", false
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(900000))
+	if err != nil {
+		log.Printf("telegram: kod yaratilmadi: %v", err)
+		return "", false
+	}
+	code = fmt.Sprint(100000 + n.Int64())
+	ok, err := w.Store.IssueLoginCode(ctx, phone, auth.HashCode(w.OTPSecret, phone, code))
+	switch {
+	case err != nil:
+		log.Printf("telegram: kirish kodi saqlanmadi: %v", err)
+		return "", false
+	case !ok:
+		return "", true
+	}
+	return code, false
+}
+
+// codeReply — kirish kodi xabari (yoki limit/xato matni)
+func (w *Worker) codeReply(ctx context.Context, phone string) string {
+	code, limited := w.issueCode(ctx, phone)
+	switch {
+	case code != "":
+		return fmt.Sprintf(msgLoginCode, code)
+	case limited:
+		return msgCodeLimit
+	}
+	return msgLoginNoSession
+}
+
+// expiredReply — /start login_<kod> eskirgan yoki ishlatilgan. Kod berish yoqilgan bo'lsa odam havolani qayta
+// ochishi shart emas: tanish chat'ga darhol kod, notanish chat'dan raqam so'raladi (keyin kod beriladi).
+func (w *Worker) expiredReply(ctx context.Context, chatID int64) (string, any) {
+	if !w.codesEnabled() {
+		return msgLoginBadCode, nil
+	}
+	if phone := w.knownPhone(ctx, chatID); phone != "" {
+		return w.codeReply(ctx, phone), removeKeyboard
+	}
+	return msgLoginExpiredAsk, askContactKeyboard
 }
 
 // loginReply — /start login_<kod> dan keyin: chat avval shu foydalanuvchi sifatida tasdiqlangan bo'lsa,
@@ -254,6 +371,9 @@ func (w *Worker) loginReply(ctx context.Context, chatID int64) (string, any) {
 			log.Printf("telegram: kirishni tasdiqlashda xato: %v", err)
 		}
 		if ok {
+			if code, _ := w.issueCode(ctx, phone); code != "" {
+				return fmt.Sprintf(msgLoginKnownCode, code), removeKeyboard
+			}
 			return msgLoginKnown, removeKeyboard
 		}
 	}
@@ -279,7 +399,11 @@ func (w *Worker) contactReply(ctx context.Context, m *Message) (string, any) {
 		log.Printf("telegram: kirishni tasdiqlashda xato: %v", err)
 		return "", nil
 	case !ok:
-		return msgLoginNoSession, removeKeyboard
+		// Kutilayotgan kirish yo'q (havola eskirgan, botni o'zi topib ochgan va h.k.) — kirish kodini beramiz
+		return w.codeReply(ctx, phone), removeKeyboard
+	}
+	if code, _ := w.issueCode(ctx, phone); code != "" {
+		return fmt.Sprintf(msgLoginDoneCode, code), removeKeyboard
 	}
 	return msgLoginDone, removeKeyboard
 }

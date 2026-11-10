@@ -8,8 +8,10 @@ const (
 	// Bitta IP'dan soatiga kodni tekshirish va Telegram orqali kirishni boshlash. Mobil operatorlarda ko'p
 	// abonent bitta IP'dan chiqadi — chegara keng; kod tanlab topishga (har kodga 5 urinish) va bazani
 	// so'rovlar bilan to'ldirishga qarshi qo'shimcha to'siq.
-	verifyPerIPPerHour  = 120
-	tgStartPerIPPerHour = 120
+	verifyPerIPPerHour = 120
+	// Sayt kirish sahifasi ochilishi bilan havolani oldindan tayyorlaydi (bosilganda darhol ochilsin) — har
+	// ko'rish bitta so'rov; reklama paytida bitta operator IP'sidan ko'p odam keladi. Umumiy chegara: 300/daqiqa.
+	tgStartPerIPPerHour = 600
 	// Tokensiz RPC (saytdagi material narxlari): oddiy mehmon soatiga bir necha marta ochadi
 	anonPerIPPerHour = 600
 )

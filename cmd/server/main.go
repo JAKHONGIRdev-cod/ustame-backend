@@ -75,6 +75,8 @@ func main() {
 			TG:    &telegram.Client{Token: cfg.TelegramBotToken, HTTP: &http.Client{Timeout: 40 * time.Second}},
 			Store: &telegram.PgStore{DB: db},
 			Wake:  outbox.Subscribe(),
+			// Bot kirish kodini ham bera oladi (havola ishlamasa): /api/auth/verify shu kalit bilan tekshiradi
+			OTPSecret: cfg.OTPSecret,
 		}
 		go bot.Run(ctx)
 	} else {

@@ -60,6 +60,17 @@ type fakeStore struct {
 	loginChats map[int64]bool   // /start login_ bosilgan chatlar
 	verified   map[int64]string // chat -> tasdiqlangan raqam
 	known      map[int64]string // chat -> avval Telegram orqali kirgan foydalanuvchi raqami
+
+	issued      map[string][]string // raqam -> bot bergan kod xeshlari
+	codeLimited bool                // IssueLoginCode limitga yetgan
+}
+
+func (s *fakeStore) IssueLoginCode(_ context.Context, phone, hash string) (bool, error) {
+	if s.codeLimited {
+		return false, nil
+	}
+	s.issued[phone] = append(s.issued[phone], hash)
+	return true, nil
 }
 
 func (s *fakeStore) BeginLogin(_ context.Context, code string, chat int64) (bool, error) {
@@ -126,7 +137,8 @@ func newTest(t *testing.T) (*Worker, *fakeTG, *fakeStore) {
 	srv := httptest.NewServer(tg)
 	t.Cleanup(srv.Close)
 	st := &fakeStore{codes: map[string]bool{}, linked: map[int64]bool{},
-		loginCodes: map[string]bool{}, loginChats: map[int64]bool{}, verified: map[int64]string{}, known: map[int64]string{}}
+		loginCodes: map[string]bool{}, loginChats: map[int64]bool{}, verified: map[int64]string{}, known: map[int64]string{},
+		issued: map[string][]string{}}
 	w := &Worker{TG: &Client{Token: "123:SECRET", BaseURL: srv.URL, HTTP: srv.Client()}, Store: st}
 	w.defaults()
 	return w, tg, st
@@ -151,7 +163,7 @@ func TestStartLinksChat(t *testing.T) {
 	if !st.linked[10] || st.linked[11] {
 		t.Fatalf("linked = %v, faqat 10 ulanishi kerak edi", st.linked)
 	}
-	want := []sentMsg{{10, msgLinked}, {11, msgBadCode}, {12, msgHello}}
+	want := []sentMsg{{10, msgLinked}, {11, msgBadCode}, {12, msgHelloNoCode}}
 	if len(tg.sent) != len(want) {
 		t.Fatalf("yuborilgan: %v", tg.sent)
 	}
