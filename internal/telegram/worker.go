@@ -120,11 +120,11 @@ const (
 	btnLogin = "🔑 Ustame'ga kirish"
 
 	msgLoginKnownLink = "✅ Siz bu Telegram orqali avval tasdiqlangansiz — raqamni qayta yuborish shart emas.\n\n" +
-		"Pastdagi «" + btnBack + "» tugmasini bosing — saytga darhol kirasiz. " +
-		"Yoki saytga o'zingiz qayting: kirish o'zi davom etadi.\n\nKirish kodi (kerak bo'lsa): %s"
+		"Pastdagi «" + btnBack + "» tugmasini bosing — darhol kirasiz. " +
+		"Yoki o'zingiz qayting: kirish o'zi davom etadi.\n\nKirish kodi (kerak bo'lsa): %s"
 	msgLoginDoneLink = "✅ Raqamingiz tasdiqlandi.\n\n" +
-		"Pastdagi «" + btnBack + "» tugmasini bosing — saytga darhol kirasiz. " +
-		"Yoki saytga o'zingiz qayting: kirish o'zi davom etadi.\n\nKirish kodi (kerak bo'lsa): %s\n\n" +
+		"Pastdagi «" + btnBack + "» tugmasini bosing — darhol kirasiz. " +
+		"Yoki o'zingiz qayting: kirish o'zi davom etadi.\n\nKirish kodi (kerak bo'lsa): %s\n\n" +
 		"Ustame bildirishnomalari ham shu yerga keladi. O'chirish uchun: /stop"
 	msgLoginCodeLink = "🔑 Ustame'ga kirish kodingiz: %s\n\n" +
 		"Pastdagi «" + btnLogin + "» tugmasini bosing — darhol kirasiz.\n\n" +

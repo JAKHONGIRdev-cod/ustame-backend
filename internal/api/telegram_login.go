@@ -37,7 +37,8 @@ func hashSecret(secret string) string {
 func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
 	// { lang } — ilova tili: "uzc" bo'lsa havolaga belgi qo'shiladi va bot kirillda javob beradi
 	var body struct {
-		Lang any `json:"lang"`
+		Lang  any `json:"lang"`
+		Links any `json:"links"` // ilova 2.1.11+: Telegram tugmasini o'zi ochadi (App Links)
 	}
 	readJSON(w, r, &body)
 	ctx := r.Context()
@@ -91,9 +92,10 @@ func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
 	s.db.Exec(ctx, `delete from telegram_logins where created_at < now() - interval '30 days'`)
 
 	startArg := "login_" + code
-	// Brauzer bu so'rovga doim Origin qo'shadi, Android ilova (React Native) — yo'q. Ilovadan kelganga bot "saytga
-	// qaytish" tugmasini ko'rsatmaydi (u ilovani emas, saytni ochardi)
-	if r.Header.Get("Origin") == "" {
+	// Brauzer bu so'rovga doim Origin qo'shadi, Android ilova (React Native) — yo'q. Eski ilovaga bot "Ustame'ga
+	// qaytish" tugmasini ko'rsatmaydi (u ilovani emas, saytni ochardi); 2.1.11+ links: true yuboradi — u tugmani
+	// o'zi ochadi (App Links), unga tugma ko'rsatiladi
+	if r.Header.Get("Origin") == "" && body.Links != true {
 		startArg += "_a" // internal/telegram: loginAppSuffix
 	}
 	if str(body.Lang) == "uzc" {
