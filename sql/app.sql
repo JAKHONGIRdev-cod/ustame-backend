@@ -6680,6 +6680,57 @@ grant execute on function
   public.admin_get_added_providers()
 to authenticated;
 
+-- ===== admin: bosh sahifa kartalari bo'yicha ro'yxatlar =====
+-- Admin paneldagi raqamli kartalar (ustalar, ochiq e'lonlar, faol va yakunlangan shartnomalar) bosilganda
+-- ochiladigan ro'yxat. Foydalanuvchilar ro'yxati — admin_search_users. Har qator: id (ochiladigan sahifa uchun),
+-- title, subtitle va tur bo'yicha qo'shimcha maydonlar; eng yangisi birinchi, ko'pi bilan 500 ta.
+create or replace function public.admin_list(p_kind text)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v jsonb;
+begin
+  perform require_admin();
+  if p_kind = 'providers' then
+    select coalesce(jsonb_agg(x order by created_at desc), '[]'::jsonb) into v from (
+      select pp.created_at, jsonb_build_object(
+        'id', u.id, 'title', u.full_name, 'subtitle', pp.headline, 'phone', u.phone,
+        'tags', to_jsonb(pp.categories), 'districts', to_jsonb(pp.districts),
+        'verified', pp.id_verified_at is not null, 'created_at', pp.created_at,
+        'jobs_done', (select count(*) from contracts k where k.provider_id = u.id and k.status = 'completed')) x
+      from provider_profiles pp join users u on u.id = pp.user_id
+      where pp.status = 'approved'
+      order by pp.created_at desc limit 500) s;
+  elsif p_kind = 'open_jobs' then
+    select coalesce(jsonb_agg(x order by created_at desc), '[]'::jsonb) into v from (
+      select j.created_at, jsonb_build_object(
+        'id', j.id, 'title', j.title, 'subtitle', j.category || ' · ' || j.district,
+        'client_name', u.full_name, 'phone', u.phone, 'budget', j.budget, 'created_at', j.created_at,
+        'proposals', (select count(*) from proposals p where p.job_id = j.id and p.status = 'submitted')) x
+      from jobs j join users u on u.id = j.client_id
+      where j.status = 'open'
+      order by j.created_at desc limit 500) s;
+  elsif p_kind in ('active_contracts', 'completed_contracts') then
+    select coalesce(jsonb_agg(x order by created_at desc), '[]'::jsonb) into v from (
+      select coalesce(k.completed_at, k.created_at) as created_at, jsonb_build_object(
+        'id', k.id, 'title', j.title, 'subtitle', c.full_name || ' → ' || p.full_name,
+        'client_name', c.full_name, 'provider_name', p.full_name, 'client_phone', c.phone, 'provider_phone', p.phone,
+        'price', k.price, 'status', k.status,
+        'created_at', k.created_at, 'completed_at', k.completed_at) x
+      from contracts k
+      join jobs j on j.id = k.job_id
+      join users c on c.id = k.client_id
+      join users p on p.id = k.provider_id
+      where k.status = case p_kind when 'active_contracts' then 'active' else 'completed' end
+      order by coalesce(k.completed_at, k.created_at) desc limit 500) s;
+  else
+    raise exception 'INVALID_INPUT';
+  end if;
+  return v;
+end;
+$$;
+
+revoke execute on function public.admin_list(text) from public, anon, authenticated;
+grant execute on function public.admin_list(text) to authenticated;
+
 -- ===== so'rovnomalar (ilova ichida) =====
 -- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
 -- tanlov savollari — variant id'lari massivi {"q1": ["plumbing"]}, matnli javoblar — satr {"q1_other": "...", "q10": "..."}.
