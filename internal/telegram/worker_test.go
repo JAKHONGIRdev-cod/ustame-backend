@@ -63,6 +63,8 @@ type fakeStore struct {
 
 	issued      map[string][]string // raqam -> bot bergan kod xeshlari
 	codeLimited bool                // IssueLoginCode limitga yetgan
+
+	survey *surveyFake // so'rovnoma (survey_test.go)
 }
 
 func (s *fakeStore) IssueLoginCode(_ context.Context, phone, hash string) (bool, error) {

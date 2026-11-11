@@ -6693,6 +6693,25 @@ create table if not exists public.survey_responses (
 
 alter table public.survey_responses enable row level security;
 
+-- Telegram botidagi so'rovnoma: Telegram orqali kirgandan keyin bot ustalar so'rovnomasini (pros_v1) poll'lar bilan
+-- bittadan yuboradi (ustame-backend internal/telegram/survey.go). Har bir yuborilgan savol shu yerda — kelgan ovoz
+-- (poll_answer) qaysi savol va raqamga tegishli ekanini topish uchun. Javoblar survey_responses ga yoziladi.
+-- Faqat backend (bot) ishlatadi: RLS yoqiq, ilovaga ruxsat yo'q.
+create table if not exists public.telegram_survey_polls (
+  poll_id     text primary key,             -- Telegram poll id; ochiq savolda 't:<chat_id>:<savol>'
+  chat_id     bigint not null,
+  phone       text not null,                -- 998XXXXXXXXX
+  survey      text not null,
+  question    text not null,
+  lang        text not null default 'uz',
+  created_at  timestamptz not null default now(),
+  answered_at timestamptz
+);
+create index if not exists telegram_survey_polls_phone_idx on public.telegram_survey_polls (phone, survey);
+create index if not exists telegram_survey_polls_chat_idx on public.telegram_survey_polls (chat_id)
+  where answered_at is null;
+alter table public.telegram_survey_polls enable row level security;
+
 create or replace function public.submit_survey(p_survey text, p_answers jsonb)
 returns void language plpgsql security definer set search_path = public as $$
 declare
