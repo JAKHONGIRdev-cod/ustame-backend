@@ -2327,7 +2327,8 @@ begin
     'client_stats',      client_stats(p.id),
     -- Qurilish materiallari do'koni (ariza yoki tasdiqlangan) — pastda, "do'konlar" bo'limida
     'shop',              (select to_jsonb(s) - 'user_id'
-                                 || jsonb_build_object('logo_v', _shop_logo_v(s.user_id), 'photos', _shop_photos(s.user_id))
+                                 || jsonb_build_object('logo_v', _shop_logo_v(s.user_id), 'photos', _shop_photos(s.user_id),
+                                                       'subscription', _shop_subscription_json(s.user_id))
                             from shop_profiles s where s.user_id = p.id)
   )
   into v
@@ -2390,6 +2391,8 @@ begin
     'provider_status', (select pp.status from provider_profiles pp where pp.user_id = u.id),
     'provider_verified', (select pp.id_verified_at is not null from provider_profiles pp where pp.user_id = u.id),
     'paid_until', (select s.paid_until from provider_subscriptions s where s.user_id = u.id),
+    'shop_status', (select sp.status from shop_profiles sp where sp.user_id = u.id),
+    'shop_paid_until', (select ss.paid_until from shop_subscriptions ss where ss.user_id = u.id),
     'jobs_count', (select count(*) from jobs j where j.client_id = u.id),
     'contracts_count', (select count(*) from contracts k where k.client_id = u.id or k.provider_id = u.id)
   ) order by u.blocked_at desc nulls last, u.created_at desc), '[]'::jsonb)
@@ -7006,15 +7009,21 @@ begin
 end;
 $$;
 
--- Tasdiqlangan do'konning narxlari (hammaga, mehmonga ham)
+-- Tasdiqlangan do'konning narxlari (hammaga, mehmonga ham). Bepul davrdan keyin — faqat obunasi faol do'kon
+-- (_shop_sub_active pastda, "do'kon obunasi" bo'limida; plpgsql — tanasi chaqirilganda tekshiriladi)
 create or replace function public.get_shop_prices(p_shop uuid)
-returns jsonb language sql stable security definer set search_path = public as $$
-  select coalesce(jsonb_agg(jsonb_build_object('material_id', p.material_id, 'price', p.price, 'in_stock', p.in_stock,
-                                               'updated_at', p.updated_at) order by m.category, m.sort), '[]'::jsonb)
-  from shop_prices p
-  join materials m on m.id = p.material_id and m.active
-  join shop_profiles s on s.user_id = p.shop_id and s.status = 'approved'
-  where p.shop_id = p_shop;
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not _shop_sub_active(p_shop) then return '[]'::jsonb; end if;
+  return (
+    select coalesce(jsonb_agg(jsonb_build_object('material_id', p.material_id, 'price', p.price, 'in_stock', p.in_stock,
+                                                 'updated_at', p.updated_at) order by m.category, m.sort), '[]'::jsonb)
+    from shop_prices p
+    join materials m on m.id = p.material_id and m.active
+    join shop_profiles s on s.user_id = p.shop_id and s.status = 'approved'
+    where p.shop_id = p_shop
+  );
+end;
 $$;
 
 -- Smeta do'konlar bo'yicha: p_items = [{id, qty}]. Har do'kon uchun: jami (bor materiallar narxi × miqdor),
@@ -7045,7 +7054,7 @@ begin
         from jsonb_array_elements(p_items) e
       ) i
       join shop_prices p on p.material_id = i.id and p.in_stock
-      join shop_profiles s on s.user_id = p.shop_id and s.status = 'approved'
+      join shop_profiles s on s.user_id = p.shop_id and s.status = 'approved' and _shop_sub_active(s.user_id)
       join users u on u.id = s.user_id and u.blocked_at is null and u.deleted_at is null
       cross join lateral (
         select case when p_lat is not null and p_lng is not null and s.lat is not null
@@ -7065,6 +7074,85 @@ from public, anon, authenticated;
 grant execute on function public.get_my_shop_prices(), public.set_my_shop_prices(jsonb) to authenticated;
 grant execute on function public.get_shop_prices(uuid), public.quote_estimate(jsonb, double precision, double precision)
 to anon, authenticated;
+
+-- ===== do'kon obunasi =====
+-- Do'konlar ham oylik obuna to'laydi (subscription_settings.shop_price, 399 000 so'm). Bepul davrda (free_until gacha)
+-- hamma do'kon to'liq ishlaydi. Keyin obunasiz do'kon ro'yxat va xaritada bepul qoladi, lekin narxlari (do'kon
+-- sahifasi va "smeta qaysi do'konda qancha" — get_shop_prices, quote_estimate) faqat obunasi faol bo'lsa ko'rinadi.
+-- To'lov hozircha qo'lda: admin admin_extend_shop_subscription bilan uzaytiradi (subscription_payments, kind='shop').
+alter table public.subscription_settings add column if not exists shop_price int not null default 399000
+  check (shop_price > 0);
+alter table public.subscription_payments add column if not exists kind text not null default 'provider'
+  check (kind in ('provider', 'shop'));
+
+create table if not exists public.shop_subscriptions (
+  user_id    uuid primary key references public.shop_profiles (user_id) on delete cascade,
+  paid_until timestamptz not null,
+  updated_at timestamptz not null default now()
+);
+alter table public.shop_subscriptions enable row level security;
+
+-- Do'kon narxlari mijozlarga ko'rinadimi: bepul davr yoki faol obuna
+create or replace function public._shop_sub_active(p_shop uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select now() < (select free_until from subscription_settings where id = 1)
+      or exists (select 1 from shop_subscriptions where user_id = p_shop and paid_until > now());
+$$;
+
+create or replace function public._shop_subscription_json(p_shop uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'free_until',  st.free_until,
+    'free_period', now() < st.free_until,
+    'paid_until',  ss.paid_until,
+    'active',      now() < st.free_until or coalesce(ss.paid_until > now(), false),
+    'price',       st.shop_price,
+    'priced',      (select count(*) from shop_prices p where p.shop_id = p_shop)
+  )
+  from subscription_settings st
+  left join shop_subscriptions ss on ss.user_id = p_shop
+  where st.id = 1;
+$$;
+
+create or replace function public.get_my_shop_subscription()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if not exists (select 1 from shop_profiles where user_id = v_uid) then raise exception 'NOT_FOUND'; end if;
+  return _shop_subscription_json(v_uid);
+end;
+$$;
+
+-- Admin: do'kon to'lov qilgach obunani uzaytiradi (qolgan muddat yoki bepul davr oxiridan boshlab qo'shiladi)
+create or replace function public.admin_extend_shop_subscription(p_user_id uuid, p_months int)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_admin uuid := require_admin();
+  v_set subscription_settings;
+  v_until timestamptz;
+begin
+  if p_months is null or p_months not between 1 and 12 then raise exception 'INVALID_INPUT'; end if;
+  if not exists (select 1 from shop_profiles where user_id = p_user_id) then raise exception 'NOT_FOUND'; end if;
+  select * into v_set from subscription_settings where id = 1;
+  select greatest(now(), v_set.free_until, (select paid_until from shop_subscriptions where user_id = p_user_id))
+         + make_interval(months => p_months)
+    into v_until;
+  insert into shop_subscriptions (user_id, paid_until) values (p_user_id, v_until)
+  on conflict (user_id) do update set paid_until = excluded.paid_until, updated_at = now();
+  insert into subscription_payments (user_id, admin_id, months, amount, paid_until, kind)
+  values (p_user_id, v_admin, p_months, v_set.shop_price * p_months, v_until, 'shop');
+  perform queue_notification(p_user_id, format(
+    E'✅ Do''kon obunangiz %s gacha faollashtirildi — narxlaringiz mijozlar smetasida ko''rinadi.',
+    to_char(v_until at time zone 'Asia/Tashkent', 'DD.MM.YYYY')), '/shop-subscription');
+  return _shop_subscription_json(p_user_id);
+end;
+$$;
+
+revoke execute on function public._shop_sub_active(uuid), public._shop_subscription_json(uuid),
+  public.get_my_shop_subscription(), public.admin_extend_shop_subscription(uuid, int)
+from public, anon, authenticated;
+grant execute on function public.get_my_shop_subscription(), public.admin_extend_shop_subscription(uuid, int)
+to authenticated;
 
 -- ===== so'rovnomalar (ilova ichida) =====
 -- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
