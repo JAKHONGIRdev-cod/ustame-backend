@@ -6731,6 +6731,90 @@ $$;
 revoke execute on function public.admin_list(text) from public, anon, authenticated;
 grant execute on function public.admin_list(text) to authenticated;
 
+-- ===== reklama manbalari (UTM) =====
+-- Sayt ochilganda reklama havolasidagi utm_source/utm_medium/utm_campaign (yoki tanish manba: Telegram, Instagram,
+-- Google...) bir marta yoziladi (track_visit, mehmon ham chaqiradi), ro'yxatdan o'tgan foydalanuvchiga esa birinchi
+-- manbasi bog'lanadi (set_my_source). Admin: admin_get_traffic_sources — manba bo'yicha tashrif, ro'yxat, usta.
+alter table public.users add column if not exists signup_source jsonb;
+
+create table if not exists public.visit_sources (
+  id         bigint generated always as identity primary key,
+  source     text not null check (source ~ '^[a-z0-9_.-]{1,40}$'),
+  medium     text check (char_length(medium) <= 40),
+  campaign   text check (char_length(campaign) <= 60),
+  landing    text check (char_length(landing) <= 200),
+  created_at timestamptz not null default now()
+);
+create index if not exists visit_sources_created_idx on public.visit_sources (created_at);
+alter table public.visit_sources enable row level security;
+
+-- Manba nomi: kichik harf, faqat lotin harf/raqam/_.- (utm_source=Instagram -> instagram)
+create or replace function public._clean_source(p text, p_max int)
+returns text language sql immutable as $$
+  select nullif(left(regexp_replace(lower(btrim(coalesce(p, ''))), '[^a-z0-9_.-]+', '_', 'g'), p_max), '')
+$$;
+
+create or replace function public.track_visit(p_source text, p_medium text default null, p_campaign text default null,
+                                              p_landing text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_source text := _clean_source(p_source, 40);
+begin
+  if v_source is null then raise exception 'INVALID_INPUT'; end if;
+  insert into visit_sources (source, medium, campaign, landing)
+  values (v_source, _clean_source(p_medium, 40), _clean_source(p_campaign, 60), left(coalesce(p_landing, ''), 200));
+end;
+$$;
+
+-- Yangi foydalanuvchining birinchi manbasi (bir marta, ro'yxatdan o'tgan kuni)
+create or replace function public.set_my_source(p_source text, p_medium text default null, p_campaign text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_source text := _clean_source(p_source, 40);
+begin
+  if v_source is null then raise exception 'INVALID_INPUT'; end if;
+  update users set signup_source = jsonb_strip_nulls(jsonb_build_object(
+      'source', v_source, 'medium', _clean_source(p_medium, 40), 'campaign', _clean_source(p_campaign, 60)))
+  where id = v_uid and signup_source is null and created_at > now() - interval '1 day';
+end;
+$$;
+
+-- Admin: oxirgi p_days kun — manba (va kampaniya) bo'yicha tashriflar, ro'yxatdan o'tganlar, ulardan ustalar
+create or replace function public.admin_get_traffic_sources(p_days int default 30)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_since timestamptz := now() - make_interval(days => greatest(1, least(coalesce(p_days, 30), 365)));
+  v jsonb;
+begin
+  perform require_admin();
+  with visits as (
+    select source, coalesce(campaign, '') campaign, count(*) n from visit_sources
+    where created_at >= v_since group by 1, 2
+  ), signups as (
+    select coalesce(u.signup_source->>'source', 'direct') source, coalesce(u.signup_source->>'campaign', '') campaign,
+           count(*) n,
+           count(*) filter (where exists (select 1 from provider_profiles pp where pp.user_id = u.id)) pros
+    from users u
+    where u.created_at >= v_since and u.deleted_at is null and not u.is_admin
+    group by 1, 2
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'source', coalesce(s.source, vi.source), 'campaign', nullif(coalesce(s.campaign, vi.campaign), ''),
+           'visits', coalesce(vi.n, 0), 'signups', coalesce(s.n, 0), 'pros', coalesce(s.pros, 0))
+         order by coalesce(s.n, 0) desc, coalesce(vi.n, 0) desc), '[]'::jsonb)
+  into v
+  from visits vi full join signups s on s.source = vi.source and s.campaign = vi.campaign;
+  return v;
+end;
+$$;
+
+revoke execute on function
+  public._clean_source(text, int), public.track_visit(text, text, text, text), public.set_my_source(text, text, text),
+  public.admin_get_traffic_sources(int)
+from public, anon, authenticated;
+grant execute on function public.track_visit(text, text, text, text) to anon, authenticated;
+grant execute on function public.set_my_source(text, text, text), public.admin_get_traffic_sources(int) to authenticated;
+
 -- ===== so'rovnomalar (ilova ichida) =====
 -- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
 -- tanlov savollari — variant id'lari massivi {"q1": ["plumbing"]}, matnli javoblar — satr {"q1_other": "...", "q10": "..."}.
