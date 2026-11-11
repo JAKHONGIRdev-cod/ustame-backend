@@ -6250,12 +6250,21 @@ values
 on conflict (id) do nothing;
 
 -- Katalog: kategoriyalar va faol materiallar (ilova va keyinchalik saytdagi kalkulyator uchun)
+-- Material fotosi (admin yuklaydi: material-photos/00000000-0000-0000-0000-000000000000/<id>.jpg, backend files.go):
+-- yangilangan vaqt (URL keshini yangilash uchun); foto bo'lmasa null — ilova chizilgan rasmni ko'rsatadi
+create or replace function public._material_photo_v(p_id text)
+returns bigint language sql stable security definer set search_path = public as $$
+  select (extract(epoch from updated_at) * 1000)::bigint from files
+  where bucket = 'material-photos' and path = '00000000-0000-0000-0000-000000000000/' || p_id || '.jpg';
+$$;
+
 create or replace function public.get_material_catalog()
 returns jsonb language sql stable security definer set search_path = public as $$
   select jsonb_build_object(
     'updated_at', (select max(updated_at) from materials where active),
     'categories', coalesce((select jsonb_agg(to_jsonb(c) order by c.sort) from material_categories c), '[]'::jsonb),
-    'materials',  coalesce((select jsonb_agg(to_jsonb(m) - 'active' order by m.category, m.sort)
+    'materials',  coalesce((select jsonb_agg((to_jsonb(m) - 'active') || jsonb_build_object('photo_v', _material_photo_v(m.id))
+                                             order by m.category, m.sort)
                               from materials m where m.active), '[]'::jsonb)
   );
 $$;
@@ -6283,12 +6292,13 @@ create or replace function public.admin_get_materials()
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 begin
   perform require_admin();
-  return coalesce((select jsonb_agg(to_jsonb(m) order by m.category, m.sort) from materials m), '[]'::jsonb);
+  return coalesce((select jsonb_agg(to_jsonb(m) || jsonb_build_object('photo_v', _material_photo_v(m.id))
+                                    order by m.category, m.sort) from materials m), '[]'::jsonb);
 end;
 $$;
 
 revoke execute on function public.get_material_catalog(), public.admin_set_material_price(text, int, int, int, boolean),
-  public.admin_get_materials()
+  public.admin_get_materials(), public._material_photo_v(text)
 from public, anon, authenticated;
 
 grant execute on function public.get_material_catalog() to anon, authenticated;
