@@ -6936,6 +6936,126 @@ grant execute on function public.set_heard_from(text), public.get_my_ref(), publ
   public.admin_get_heard_from(int), public.admin_get_referrers(int)
 to authenticated;
 
+-- ===== do'konlar 2-bosqich: narxlar va "smetani qaysi do'kon qanchaga beradi" =====
+-- Do'kon katalogdagi materiallarga o'z narxini qo'yadi (bor/yo'q bilan). Mijoz smetasi (material id va miqdor)
+-- quote_estimate bilan tasdiqlangan do'konlar bo'yicha hisoblanadi: jami, nechta material bor, nechta yo'q, masofa.
+create table if not exists public.shop_prices (
+  shop_id     uuid not null references public.shop_profiles (user_id) on delete cascade,
+  material_id text not null references public.materials (id) on delete cascade,
+  price       int  not null check (price between 1 and 1000000000),
+  in_stock    boolean not null default true,
+  updated_at  timestamptz not null default now(),
+  primary key (shop_id, material_id)
+);
+create index if not exists shop_prices_material_idx on public.shop_prices (material_id) where in_stock;
+alter table public.shop_prices enable row level security;
+
+-- Do'kon egasi: o'z narxlari (do'kon tekshiruvda bo'lsa ham — tasdiqlangunicha tayyorlab qo'yadi)
+create or replace function public.get_my_shop_prices()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if not exists (select 1 from shop_profiles where user_id = v_uid) then raise exception 'NOT_FOUND'; end if;
+  return coalesce((select jsonb_agg(jsonb_build_object('material_id', material_id, 'price', price, 'in_stock', in_stock,
+                                                       'updated_at', updated_at) order by material_id)
+                   from shop_prices where shop_id = v_uid), '[]'::jsonb);
+end;
+$$;
+
+-- Bir yo'la saqlash: [{material_id, price, in_stock}]; price null — narx o'chiriladi. Ko'pi bilan 300 ta.
+create or replace function public.set_my_shop_prices(p_items jsonb)
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_item jsonb;
+  v_price int;
+  v_n int := 0;
+begin
+  if not exists (select 1 from shop_profiles where user_id = v_uid) then raise exception 'NOT_FOUND'; end if;
+  if jsonb_typeof(p_items) is distinct from 'array' or jsonb_array_length(p_items) > 300 then
+    raise exception 'INVALID_INPUT';
+  end if;
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    if not exists (select 1 from materials where id = v_item->>'material_id' and active) then
+      raise exception 'INVALID_INPUT';
+    end if;
+    if v_item->'price' is null or jsonb_typeof(v_item->'price') = 'null' then
+      delete from shop_prices where shop_id = v_uid and material_id = v_item->>'material_id';
+      continue;
+    end if;
+    v_price := (v_item->>'price')::numeric::int;
+    if v_price < 1 or v_price > 1000000000 then raise exception 'INVALID_INPUT'; end if;
+    insert into shop_prices (shop_id, material_id, price, in_stock)
+    values (v_uid, v_item->>'material_id', v_price, coalesce((v_item->>'in_stock')::boolean, true))
+    on conflict (shop_id, material_id) do update
+      set price = excluded.price, in_stock = excluded.in_stock, updated_at = now();
+    v_n := v_n + 1;
+  end loop;
+  update shop_profiles set updated_at = now() where user_id = v_uid;
+  return v_n;
+end;
+$$;
+
+-- Tasdiqlangan do'konning narxlari (hammaga, mehmonga ham)
+create or replace function public.get_shop_prices(p_shop uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object('material_id', p.material_id, 'price', p.price, 'in_stock', p.in_stock,
+                                               'updated_at', p.updated_at) order by m.category, m.sort), '[]'::jsonb)
+  from shop_prices p
+  join materials m on m.id = p.material_id and m.active
+  join shop_profiles s on s.user_id = p.shop_id and s.status = 'approved'
+  where p.shop_id = p_shop;
+$$;
+
+-- Smeta do'konlar bo'yicha: p_items = [{id, qty}]. Har do'kon uchun: jami (bor materiallar narxi × miqdor),
+-- nechta material bor (covered) va yo'q (missing), masofa. Ko'proq materiali bor, keyin arzonroq do'kon birinchi.
+create or replace function public.quote_estimate(p_items jsonb, p_lat double precision default null,
+                                                 p_lng double precision default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_total int;
+begin
+  if jsonb_typeof(p_items) is distinct from 'array' or jsonb_array_length(p_items) = 0
+     or jsonb_array_length(p_items) > 200 then
+    raise exception 'INVALID_INPUT';
+  end if;
+  v_total := (select count(distinct e->>'id') from jsonb_array_elements(p_items) e);
+  return coalesce((
+    select jsonb_agg(x.item order by x.covered desc, x.total asc, x.km nulls last)
+    from (
+      select _shop_card(s.user_id) || jsonb_build_object(
+               'phone', s.phone,
+               'total', sum(p.price::bigint * i.qty),
+               'covered', count(*),
+               'missing', v_total - count(*),
+               'distance_km', round(d.km::numeric, 1),
+               'lines', jsonb_agg(jsonb_build_object('id', i.id, 'price', p.price))) as item,
+             count(*) as covered, sum(p.price::bigint * i.qty) as total, d.km
+      from (
+        select e->>'id' as id, greatest(1, least(coalesce((e->>'qty')::numeric, 1), 100000))::int as qty
+        from jsonb_array_elements(p_items) e
+      ) i
+      join shop_prices p on p.material_id = i.id and p.in_stock
+      join shop_profiles s on s.user_id = p.shop_id and s.status = 'approved'
+      join users u on u.id = s.user_id and u.blocked_at is null and u.deleted_at is null
+      cross join lateral (
+        select case when p_lat is not null and p_lng is not null and s.lat is not null
+                    then _km(p_lat, p_lng, s.lat, s.lng) end as km
+      ) d
+      group by s.user_id, s.phone, d.km
+      order by count(*) desc, sum(p.price::bigint * i.qty) asc
+      limit 20
+    ) x
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function public.get_my_shop_prices(), public.set_my_shop_prices(jsonb), public.get_shop_prices(uuid),
+  public.quote_estimate(jsonb, double precision, double precision)
+from public, anon, authenticated;
+grant execute on function public.get_my_shop_prices(), public.set_my_shop_prices(jsonb) to authenticated;
+grant execute on function public.get_shop_prices(uuid), public.quote_estimate(jsonb, double precision, double precision)
+to anon, authenticated;
+
 -- ===== so'rovnomalar (ilova ichida) =====
 -- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
 -- tanlov savollari — variant id'lari massivi {"q1": ["plumbing"]}, matnli javoblar — satr {"q1_other": "...", "q10": "..."}.
