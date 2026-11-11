@@ -6815,6 +6815,127 @@ from public, anon, authenticated;
 grant execute on function public.track_visit(text, text, text, text) to anon, authenticated;
 grant execute on function public.set_my_source(text, text, text), public.admin_get_traffic_sources(int) to authenticated;
 
+-- ===== "Qayerdan bildingiz?" va taklif kodlari (referral) =====
+-- Ro'yxatdan o'tishda (onboarding) foydalanuvchi o'zi aytadi qayerdan bilganini (heard_from) va ixtiyoriy taklif
+-- kodini kiritadi (referred_by). Har foydalanuvchining o'z kodi bor (ref_code): ustame.com/?ref=KOD havolasi bilan
+-- kelganlar unga yoziladi. Admin: admin_get_heard_from, admin_get_referrers.
+alter table public.users add column if not exists heard_from text;
+alter table public.users add column if not exists ref_code text;
+alter table public.users add column if not exists referred_by uuid references public.users (id) on delete set null;
+create unique index if not exists users_ref_code_key on public.users (ref_code) where ref_code is not null;
+create index if not exists users_referred_by_idx on public.users (referred_by) where referred_by is not null;
+
+create or replace function public.set_heard_from(p_value text)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if p_value is null or p_value not in ('telegram', 'instagram', 'facebook', 'youtube', 'tiktok', 'google', 'friend',
+                                        'olx', 'flyer', 'operator', 'other') then
+    raise exception 'INVALID_INPUT';
+  end if;
+  update users set heard_from = p_value where id = v_uid and heard_from is null;
+end;
+$$;
+
+-- O'z taklif kodi (yo'q bo'lsa yaratiladi: 6 belgi, adashtiradigan 0/O/1/I siz) va taklif qilganlar soni
+create or replace function public.get_my_ref()
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_code text;
+  v_alphabet text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  i int;
+begin
+  select ref_code into v_code from users where id = v_uid;
+  while v_code is null loop
+    v_code := '';
+    for i in 1..6 loop
+      v_code := v_code || substr(v_alphabet, 1 + floor(random() * length(v_alphabet))::int, 1);
+    end loop;
+    begin
+      update users set ref_code = v_code where id = v_uid and ref_code is null;
+    exception when unique_violation then
+      v_code := null;
+    end;
+    if v_code is not null then
+      select ref_code into v_code from users where id = v_uid;
+    end if;
+  end loop;
+  return jsonb_build_object(
+    'code', v_code,
+    'invited', (select count(*) from users u where u.referred_by = v_uid and u.deleted_at is null),
+    'invited_pros', (select count(*) from users u join provider_profiles pp on pp.user_id = u.id
+                     where u.referred_by = v_uid and u.deleted_at is null));
+end;
+$$;
+
+-- Taklif kodini qo'llash: faqat yangi foydalanuvchi (ro'yxatdan o'tgan kuni), bir marta, o'zini emas
+create or replace function public.apply_ref_code(p_code text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_ref uuid;
+begin
+  select id into v_ref from users
+  where ref_code = upper(btrim(coalesce(p_code, ''))) and deleted_at is null and blocked_at is null;
+  if v_ref is null then raise exception 'REF_NOT_FOUND'; end if;
+  if v_ref = v_uid then raise exception 'REF_SELF'; end if;
+  update users set referred_by = v_ref
+  where id = v_uid and referred_by is null and created_at > now() - interval '1 day';
+end;
+$$;
+
+-- Admin: "Qayerdan bildingiz?" javoblari (oxirgi p_days kun ichida ro'yxatdan o'tganlar)
+create or replace function public.admin_get_heard_from(p_days int default 30)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_since timestamptz := now() - make_interval(days => greatest(1, least(coalesce(p_days, 30), 365)));
+  v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(jsonb_build_object('value', value, 'users', n, 'pros', pros) order by n desc), '[]'::jsonb)
+  into v
+  from (
+    select coalesce(u.heard_from, 'unknown') as value, count(*) n,
+           count(*) filter (where exists (select 1 from provider_profiles pp where pp.user_id = u.id)) pros
+    from users u
+    where u.created_at >= v_since and u.deleted_at is null and not u.is_admin
+    group by 1
+  ) s;
+  return v;
+end;
+$$;
+
+-- Admin: kim nechta odam taklif qilgan (oxirgi p_days kun)
+create or replace function public.admin_get_referrers(p_days int default 30)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_since timestamptz := now() - make_interval(days => greatest(1, least(coalesce(p_days, 30), 365)));
+  v jsonb;
+begin
+  perform require_admin();
+  select coalesce(jsonb_agg(jsonb_build_object('id', r.id, 'full_name', r.full_name, 'phone', r.phone, 'code', r.ref_code,
+                                                'invited', s.n, 'pros', s.pros) order by s.n desc), '[]'::jsonb)
+  into v
+  from (
+    select u.referred_by, count(*) n,
+           count(*) filter (where exists (select 1 from provider_profiles pp where pp.user_id = u.id)) pros
+    from users u
+    where u.referred_by is not null and u.created_at >= v_since and u.deleted_at is null
+    group by 1
+  ) s
+  join users r on r.id = s.referred_by;
+  return v;
+end;
+$$;
+
+revoke execute on function public.set_heard_from(text), public.get_my_ref(), public.apply_ref_code(text),
+  public.admin_get_heard_from(int), public.admin_get_referrers(int)
+from public, anon, authenticated;
+grant execute on function public.set_heard_from(text), public.get_my_ref(), public.apply_ref_code(text),
+  public.admin_get_heard_from(int), public.admin_get_referrers(int)
+to authenticated;
+
 -- ===== so'rovnomalar (ilova ichida) =====
 -- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
 -- tanlov savollari — variant id'lari massivi {"q1": ["plumbing"]}, matnli javoblar — satr {"q1_other": "...", "q10": "..."}.
