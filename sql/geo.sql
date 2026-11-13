@@ -171,13 +171,21 @@ begin
 end;
 $$;
 
--- search_providers: + lat/lng (yaxlitlangan). Kirmagan mehmon ham qidira oladi (usta profillari ochiq)
+-- search_providers: + lat/lng (yaxlitlangan). Kirmagan mehmon ham qidira oladi (usta profillari ochiq).
+-- 2026-11-13: mijoz joylashuvi (p_lat/p_lng) berilsa — yaqinlik va sharhlar bo'yicha tartib:
+--   1) masofa oralig'i: 0-2, 2-5, 5-10, 10-25, 25-50 km; keyin joylashuvi belgilanmagan ustalar; keyin 50 km dan uzoq;
+--   2) bir oraliq ichida: top_rated, sharhlar soni bilan tekislangan reyting (bayes: 2 ta 4.0 "virtual" baho), masofa.
+-- Masofa yaxlitlangan koordinatadan (approx_coord, ~1 km) hisoblanadi — ustaning aniq joyi chiqib qolmasin.
+-- Joylashuv berilmasa — eski tartib (top_rated, reyting, bajarilgan ishlar).
+drop function if exists public.search_providers(text, text, text, int, int);
 create or replace function public.search_providers(
   p_category text default null,
   p_district text default null,
   p_query    text default null,
   p_limit    int  default 30,
-  p_offset   int  default 0
+  p_offset   int  default 0,
+  p_lat      double precision default null,
+  p_lng      double precision default null
 )
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
@@ -185,49 +193,67 @@ declare
   v_q     text := nullif(btrim(coalesce(p_query, '')), '');
   v_like  text;
   v_limit int  := least(greatest(coalesce(p_limit, 30), 1), 50);
+  -- Noto'g'ri yoki chala koordinata — joylashuvsiz deb hisoblanadi (xato bermaymiz: bu faqat tartib)
+  v_lat   double precision := case when p_lat between 37 and 46 and p_lng between 55 and 74 then p_lat end;
+  v_lng   double precision := case when p_lat between 37 and 46 and p_lng between 55 and 74 then p_lng end;
 begin
   if v_q is not null then
     v_like := '%' || replace(replace(replace(v_q, '\', '\\'), '%', '\%'), '_', '\_') || '%';
   end if;
 
   return coalesce((
-    select jsonb_agg(x.item order by x.top_rated desc, x.avg_rating desc nulls last,
-                                     x.completed desc, x.created_at desc)
+    select jsonb_agg(x.item || jsonb_build_object('distance_km', round(x.distance_km::numeric, 1))
+                     order by x.ord)
     from (
-      select
-        jsonb_build_object(
-          'id',                p.id,
-          'full_name',         p.full_name,
-          'avatar_updated_at', p.avatar_updated_at,
-          'headline',          pp.headline,
-          'categories',        pp.categories,
-          'districts',         pp.districts,
-          'experience_years',  pp.experience_years,
-          'lat',               approx_coord(pp.lat),
-          'lng',               approx_coord(pp.lng),
-          'is_favorite',       exists (select 1 from favorites f where f.client_id = v_uid and f.provider_id = p.id),
-          'stats',             s.stats
-        ) as item,
-        (s.stats ->> 'top_rated')::boolean       as top_rated,
-        (s.stats ->> 'avg_rating')::numeric      as avg_rating,
-        (s.stats ->> 'completed_jobs')::int      as completed,
-        pp.created_at
-      from provider_profiles pp
-      join profiles p on p.id = pp.user_id
-      cross join lateral (select provider_stats(pp.user_id) as stats) s
-      where pp.status = 'approved'
-        and pp.user_id is distinct from v_uid
-        and not _blocked(v_uid, pp.user_id)
-        and (p_category is null or p_category = any (pp.categories))
-        and (p_district is null or p_district = any (pp.districts))
-        and (v_like is null
-             or p.full_name ilike v_like
-             or pp.headline ilike v_like
-             or pp.bio ilike v_like)
-      order by (s.stats ->> 'top_rated')::boolean desc,
-               (s.stats ->> 'avg_rating')::numeric desc nulls last,
-               (s.stats ->> 'completed_jobs')::int desc,
-               pp.created_at desc
+      select y.*,
+             row_number() over (
+               order by case when y.distance_km is null then 5
+                             when y.distance_km < 2  then 0
+                             when y.distance_km < 5  then 1
+                             when y.distance_km < 10 then 2
+                             when y.distance_km < 25 then 3
+                             when y.distance_km < 50 then 4
+                             else 6 end,
+                        y.top_rated desc, y.score desc, y.distance_km asc nulls last,
+                        y.completed desc, y.created_at desc) as ord
+      from (
+        select
+          jsonb_build_object(
+            'id',                p.id,
+            'full_name',         p.full_name,
+            'avatar_updated_at', p.avatar_updated_at,
+            'headline',          pp.headline,
+            'categories',        pp.categories,
+            'districts',         pp.districts,
+            'experience_years',  pp.experience_years,
+            'lat',               approx_coord(pp.lat),
+            'lng',               approx_coord(pp.lng),
+            'is_favorite',       exists (select 1 from favorites f where f.client_id = v_uid and f.provider_id = p.id),
+            'stats',             s.stats
+          ) as item,
+          case when v_lat is not null and pp.lat is not null and pp.lng is not null then
+            111.32 * sqrt(power(approx_coord(pp.lat) - v_lat, 2)
+                          + power((approx_coord(pp.lng) - v_lng) * cos(radians(v_lat)), 2))
+          end as distance_km,
+          coalesce((s.stats ->> 'top_rated')::boolean, false) as top_rated,
+          (coalesce((s.stats ->> 'avg_rating')::numeric, 0) * coalesce((s.stats ->> 'reviews_count')::int, 0) + 4.0 * 2)
+            / (coalesce((s.stats ->> 'reviews_count')::int, 0) + 2) as score,
+          coalesce((s.stats ->> 'completed_jobs')::int, 0) as completed,
+          pp.created_at
+        from provider_profiles pp
+        join profiles p on p.id = pp.user_id
+        cross join lateral (select provider_stats(pp.user_id) as stats) s
+        where pp.status = 'approved'
+          and pp.user_id is distinct from v_uid
+          and not _blocked(v_uid, pp.user_id)
+          and (p_category is null or p_category = any (pp.categories))
+          and (p_district is null or p_district = any (pp.districts))
+          and (v_like is null
+               or p.full_name ilike v_like
+               or pp.headline ilike v_like
+               or pp.bio ilike v_like)
+      ) y
+      order by ord
       limit v_limit offset greatest(coalesce(p_offset, 0), 0)
     ) x
   ), '[]'::jsonb);
@@ -253,5 +279,8 @@ grant execute on function
 grant execute on function
   public.find_jobs(text, text, text, int, int),
   public.get_job(uuid),
-  public.search_providers(text, text, text, int, int)
+  public.search_providers(text, text, text, int, int, double precision, double precision)
   to anon;
+grant execute on function
+  public.search_providers(text, text, text, int, int, double precision, double precision)
+  to authenticated;
