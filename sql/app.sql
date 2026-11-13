@@ -4008,17 +4008,65 @@ begin
 end;
 $$;
 
+-- >>> district_region (scripts/gen-district-regions.mjs yaratadi — qo'lda o'zgartirmang)
+-- Tuman (bazadagi qiymat) qaysi hududga tegishli: Toshkent shahri, Qoraqalpog'iston yoki viloyat kaliti
+-- (ilovadagi lib/regions.ts bilan bir xil). Noma'lum tuman — null.
+create or replace function public._district_region(p_district text)
+returns text language sql immutable set search_path = public as $$
+  select case
+    when p_district in ('Bektemir', 'Chilonzor', 'Mirobod', 'Mirzo Ulug''bek', 'Olmazor', 'Sergeli', 'Shayxontohur', 'Uchtepa', 'Yakkasaroy', 'Yashnobod', 'Yunusobod', 'Yangihayot')
+      then 'toshkent-sh'
+    when p_district in ('Bekobod tumani', 'Bo''ka', 'Bo''stonliq', 'Chinoz', 'Ohangaron tumani', 'Oqqo''rg''on', 'O''rta Chirchiq', 'Parkent', 'Piskent', 'Qibray', 'Quyi Chirchiq', 'Toshkent tumani', 'Yangiyo''l tumani', 'Yuqori Chirchiq', 'Zangiota')
+      then 'toshkent-v'
+    when p_district in ('Amudaryo', 'Beruniy', 'Bo''zatov', 'Chimboy', 'Ellikqal''a', 'Kegeyli', 'Mo''ynoq', 'Nukus tumani', 'Qanliko''l', 'Qo''ng''irot', 'Qorao''zak', 'Shumanay', 'Taxtako''pir', 'Taxiatosh tumani', 'To''rtko''l', 'Xo''jayli')
+      then 'qoraqalpogiston'
+    when p_district in ('Andijon tumani', 'Asaka tumani', 'Baliqchi', 'Bo''ston', 'Buloqboshi', 'Izboskan', 'Jalaquduq', 'Marhamat', 'Oltinko''l', 'Paxtaobod', 'Qo''rg''ontepa', 'Shahrixon tumani', 'Ulug''nor', 'Xo''jaobod')
+      then 'andijon'
+    when p_district in ('Buxoro tumani', 'G''ijduvon tumani', 'Jondor', 'Kogon tumani', 'Olot', 'Peshku', 'Qorako''l', 'Qorovulbozor', 'Romitan', 'Shofirkon', 'Vobkent')
+      then 'buxoro'
+    when p_district in ('Arnasoy', 'Baxmal', 'Do''stlik', 'Forish', 'G''allaorol', 'Mirzacho''l', 'Paxtakor', 'Sharof Rashidov', 'Yangiobod', 'Zafarobod', 'Zarbdor', 'Zomin')
+      then 'jizzax'
+    when p_district in ('Chiroqchi', 'Dehqonobod', 'G''uzor', 'Kasbi', 'Kitob', 'Ko''kdala', 'Koson', 'Mirishkor', 'Muborak', 'Nishon', 'Qamashi', 'Qarshi tumani', 'Shahrisabz tumani', 'Yakkabog''')
+      then 'qashqadaryo'
+    when p_district in ('Karmana', 'Konimex', 'Navbahor', 'Nurota', 'Qiziltepa', 'Tomdi', 'Uchquduq', 'Xatirchi')
+      then 'navoiy'
+    when p_district in ('Chortoq', 'Chust tumani', 'Kosonsoy', 'Mingbuloq', 'Namangan tumani', 'Norin', 'Pop', 'To''raqo''rg''on', 'Uchqo''rg''on', 'Uychi', 'Yangiqo''rg''on')
+      then 'namangan'
+    when p_district in ('Bulung''ur', 'Ishtixon', 'Jomboy', 'Kattaqo''rg''on tumani', 'Narpay', 'Nurobod', 'Oqdaryo', 'Pastdarg''om', 'Paxtachi', 'Payariq', 'Qo''shrabot', 'Samarqand tumani', 'Toyloq', 'Urgut')
+      then 'samarqand'
+    when p_district in ('Boyovut', 'Guliston tumani', 'Mirzaobod', 'Oqoltin', 'Sardoba', 'Sayxunobod', 'Sirdaryo tumani', 'Xovos')
+      then 'sirdaryo'
+    when p_district in ('Angor', 'Bandixon', 'Boysun', 'Denov tumani', 'Jarqo''rg''on', 'Muzrabot', 'Oltinsoy', 'Qiziriq', 'Qumqo''rg''on', 'Sariosiyo', 'Sherobod', 'Sho''rchi', 'Termiz tumani', 'Uzun')
+      then 'surxondaryo'
+    when p_district in ('Bag''dod', 'Beshariq', 'Buvayda', 'Dang''ara', 'Farg''ona tumani', 'Furqat', 'Oltiariq', 'O''zbekiston tumani', 'Qo''shtepa', 'Quva', 'Rishton', 'So''x', 'Toshloq', 'Uchko''prik', 'Yozyovon')
+      then 'fargona'
+    when p_district in ('Bog''ot', 'Gurlan', 'Hazorasp', 'Xiva tumani', 'Xonqa', 'Qo''shko''pir', 'Shovot', 'Tuproqqal''a', 'Urganch tumani', 'Yangiariq', 'Yangibozor')
+      then 'xorazm'
+  end
+$$;
+revoke execute on function public._district_region(text) from public, anon, authenticated;
+-- <<< district_region
+
 -- ===== yangi e'lon — mos ustalarga xabar =====
--- Shoshilinch e'lonlar notify_urgent_job orqali ketadi; qolganlari — kasbi va tumani mos tasdiqlangan
--- ustalarga. Spam bo'lmasin: ustaga kuniga ko'pi bilan 10 ta shunday xabar.
+-- Shoshilinch e'lonlar notify_urgent_job orqali ketadi; qolganlari uch bosqichda (2026-11-13):
+--   1) kasbi va tumani mos tasdiqlangan ustalar;
+--   2) hech kim topilmasa — shu hududdagi (viloyat / Toshkent shahri; Toshkent shahri va viloyati qo'shni) shu kasb ustalari;
+--   3) baribir hech kim bo'lmasa — adminlarga "Mos usta topilmadi" (operator ustalarga qo'ng'iroq qiladi).
+-- Spam bo'lmasin: ustaga kuniga ko'pi bilan 10 ta "🆕" xabar.
 create or replace function public.notify_new_job()
 returns trigger language plpgsql security definer set search_path = public as $$
-declare r record;
+declare
+  r        record;
+  v_n      int  := 0;
+  v_region text := _district_region(new.district);
+  v_near   text[];
 begin
   if new.status <> 'open' or new.urgency = 'urgent' then return new; end if;
+
   for r in
-    select pp.user_id from provider_profiles pp
+    select pp.user_id from provider_profiles pp join users u on u.id = pp.user_id
      where pp.status = 'approved' and pp.user_id <> new.client_id
+       and u.blocked_at is null and u.deleted_at is null
        and new.category = any (pp.categories) and new.district = any (pp.districts)
        and not _blocked(pp.user_id, new.client_id)
        and (select count(*) from notification_outbox o
@@ -4027,7 +4075,37 @@ begin
   loop
     perform queue_notification(r.user_id, format(E'\U0001F195 Yangi e''lon: "%s" (%s, %s). Narxingizni taklif qiling.',
       new.title, new.category, new.district), '/job/' || new.id);
+    v_n := v_n + 1;
   end loop;
+
+  if v_n = 0 and v_region is not null then
+    v_near := case when v_region in ('toshkent-sh', 'toshkent-v') then array['toshkent-sh', 'toshkent-v']
+                   else array[v_region] end;
+    for r in
+      select pp.user_id from provider_profiles pp join users u on u.id = pp.user_id
+       where pp.status = 'approved' and pp.user_id <> new.client_id
+         and u.blocked_at is null and u.deleted_at is null
+         and new.category = any (pp.categories)
+         and exists (select 1 from unnest(pp.districts) d where _district_region(d) = any (v_near))
+         and not _blocked(pp.user_id, new.client_id)
+         and (select count(*) from notification_outbox o
+               where o.user_id = pp.user_id and o.created_at > now() - interval '24 hours'
+                 and o.message like E'\U0001F195%') < 10
+    loop
+      perform queue_notification(r.user_id, format(
+        E'\U0001F195 Yangi e''lon yaqin hududda: "%s" (%s, %s). Narxingizni taklif qiling.',
+        new.title, new.category, new.district), '/job/' || new.id);
+      v_n := v_n + 1;
+    end loop;
+  end if;
+
+  if v_n = 0 then
+    for r in select id from users where is_admin and blocked_at is null and deleted_at is null loop
+      perform queue_notification(r.id, format(
+        E'⚠️ Mos usta topilmadi: "%s" (%s, %s). Shu kasb ustalariga qo''ng''iroq qiling.',
+        new.title, new.category, new.district), '/admin/waiting');
+    end loop;
+  end if;
   return new;
 end;
 $$;
