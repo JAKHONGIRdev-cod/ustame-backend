@@ -102,11 +102,11 @@ var prosSurvey = []surveyQuestion{
 }
 
 var surveyTexts = map[string]map[string]string{
-	"intro":  {"uz": "Ustalar uchun so'rovnoma", "ru": "Опрос для мастеров"},
-	"introText": {"uz": "Ish jarayonida duch keladigan muammolaringizni bilishimiz kerak — Ustame'ni shularni hal qiladigan qilib quramiz. Javoblaringiz faqat xizmatni yaxshilash uchun ishlatiladi.", "ru": "Нам важно знать, с какими проблемами вы сталкиваетесь в работе — мы строим Ustame, чтобы их решать. Ответы используются только для улучшения сервиса."},
-	"pickUpTo": {"uz": "{n} tagacha belgilang", "ru": "Выберите до {n}"},
-	"optional": {"uz": "Ixtiyoriy", "ru": "Необязательно"},
+	"intro":           {"uz": "Ustalar uchun so'rovnoma", "ru": "Опрос для мастеров"},
+	"introText":       {"uz": "Ish jarayonida duch keladigan muammolaringizni bilishimiz kerak — Ustame'ni shularni hal qiladigan qilib quramiz. Javoblaringiz faqat xizmatni yaxshilash uchun ishlatiladi.", "ru": "Нам важно знать, с какими проблемами вы сталкиваетесь в работе — мы строим Ustame, чтобы их решать. Ответы используются только для улучшения сервиса."},
+	"pickUpTo":        {"uz": "{n} tagacha belgilang", "ru": "Выберите до {n}"},
+	"optional":        {"uz": "Ixtiyoriy", "ru": "Необязательно"},
 	"textPlaceholder": {"uz": "Qisqacha yozing…", "ru": "Коротко опишите…"},
-	"thanksTitle": {"uz": "Rahmat!", "ru": "Спасибо!"},
-	"thanksText": {"uz": "Javoblaringiz Ustame'ni ustalar uchun yanada foydali qilishga yordam beradi.", "ru": "Ваши ответы помогут сделать Ustame полезнее для мастеров."},
+	"thanksTitle":     {"uz": "Rahmat!", "ru": "Спасибо!"},
+	"thanksText":      {"uz": "Javoblaringiz Ustame'ni ustalar uchun yanada foydali qilishga yordam beradi.", "ru": "Ваши ответы помогут сделать Ustame полезнее для мастеров."},
 }
