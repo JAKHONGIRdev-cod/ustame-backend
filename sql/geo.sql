@@ -54,6 +54,54 @@ begin
 end;
 $$;
 
+-- 2026-11-17: qidiruv so'zlar bo'yicha — har bir so'z (tartibsiz) ism, tavsif, kasb yoki tumanda bo'lsa topiladi.
+-- Kichik harf, apostroflarsiz (o', o‘, oʻ bir xil): "santexnik chilonzor", "Mirzo Ulug'bek elektrik".
+create or replace function public._norm_search(p text)
+returns text language sql immutable as $$
+  select translate(lower(coalesce(p, '')), '''‘’ʻʼ`', '')
+$$;
+
+create or replace function public._words_match(p_q text, p_hay text)
+returns boolean language sql immutable as $$
+  select not exists (
+    select 1 from regexp_split_to_table(_norm_search(btrim(p_q)), '\s+') w
+    where w <> '' and position(w in _norm_search(p_hay)) = 0
+  )
+$$;
+
+-- Qidiruv sinonimlari: bazadagi kasb va Toshkent tumanlari o'zbekcha lotinda saqlanadi — ruscha, inglizcha va o'zbek
+-- kirillchasida yozgan ham topsin ("сантехник Чиланзар", "plumber Chilanzar", "электрик Юнусобод").
+create or replace function public._search_synonyms(p_values text[])
+returns text language sql immutable as $$
+  select coalesce(string_agg(s.words, ' '), '') from (values
+    ('Santexnik',           'сантехник сантехника plumber plumbing'),
+    ('Elektrik',            'электрик электрика electrician electric'),
+    ('Mebel ustasi',        'мебел устаси мебельщик мебель furniture'),
+    ('Konditsioner ustasi', 'кондиционер устаси кондиционер aircon conditioner'),
+    ('Quruvchi/ta''mirchi', 'қурувчи таъмирчи строитель ремонт builder renovation remont'),
+    ('Payvandchi',          'пайвандчи сварщик сварка welder welding'),
+    ('Muzlatgich ustasi',   'музлатгич устаси холодильник fridge refrigerator'),
+    ('Bo''yoqchi',          'бўёқчи маляр покраска painter malyar'),
+    ('Duradgor',            'дурадгор плотник столяр carpenter'),
+    ('Boshqa',              'бошқа другое other'),
+    ('Bektemir',            'бектемир'),
+    ('Chilonzor',           'чилонзор чиланзар chilanzar'),
+    ('Mirobod',             'миробод мирабад mirabad'),
+    ('Mirzo Ulug''bek',     'мирзо улуғбек мирзо-улугбек улугбек mirzo ulugbek'),
+    ('Olmazor',             'олмазор алмазар almazar'),
+    ('Sergeli',             'сергели'),
+    ('Shayxontohur',        'шайхонтоҳур шайхантахур shaykhantakhur'),
+    ('Uchtepa',             'учтепа'),
+    ('Yakkasaroy',          'яккасарой яккасарай yakkasaray'),
+    ('Yashnobod',           'яшнобод яшнабад yashnabad'),
+    ('Yunusobod',           'юнусобод юнусабад yunusabad'),
+    ('Yangihayot',          'янгиҳаёт янгихаёт yangihayot')
+  ) s(val, words) where s.val = any (p_values)
+$$;
+
+revoke execute on function public._norm_search(text), public._words_match(text, text),
+  public._search_synonyms(text[]) from public, anon, authenticated;
+
 -- find_jobs: + approx_lat/approx_lng (xarita uchun). Kirmagan mehmon ham ko'radi (auth.uid() null):
 -- mijoz ismi qisqartiriladi ("Aziza K."), "sizga mos" saralash yo'q
 create or replace function public.find_jobs(
@@ -95,7 +143,8 @@ begin
         and not _blocked(v_uid, j.client_id)
         and (p_category is null or j.category = p_category)
         and (p_district is null or j.district = p_district)
-        and (v_q is null or j.title ilike '%' || v_q || '%' or j.description ilike '%' || v_q || '%')
+        and (v_q is null or _words_match(v_q, concat_ws(' ', j.title, j.description, j.category, j.district,
+                                                  _search_synonyms(array[j.category, j.district]))))
       order by 2, j.created_at desc
       limit least(greatest(coalesce(p_limit, 30), 1), 100)
       offset greatest(coalesce(p_offset, 0), 0)
@@ -251,10 +300,10 @@ begin
           and not _blocked(v_uid, pp.user_id)
           and (p_category is null or p_category = any (pp.categories))
           and (p_district is null or p_district = any (pp.districts))
-          and (v_like is null
-               or p.full_name ilike v_like
-               or pp.headline ilike v_like
-               or pp.bio ilike v_like)
+          and (v_q is null
+               or _words_match(v_q, concat_ws(' ', p.full_name, pp.headline, pp.bio,
+                                              array_to_string(pp.categories, ' '), array_to_string(pp.districts, ' '),
+                                              _search_synonyms(pp.categories || pp.districts))))
       ) y
       order by ord
       limit v_limit offset greatest(coalesce(p_offset, 0), 0)
