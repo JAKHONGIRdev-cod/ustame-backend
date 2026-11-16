@@ -1816,6 +1816,8 @@ create index if not exists notification_outbox_pending_idx
 
 -- Bildirishnoma bosilganda ilovada ochiladigan sahifa (expo-router yo'li, masalan /chat/<id>)
 alter table public.notification_outbox add column if not exists link text;
+-- 2026-11-17: Expo rad etgan push sababi (masalan InvalidCredentials — FCM kaliti yo'q); admin ko'radi
+alter table public.notification_outbox add column if not exists push_error text;
 
 -- Telefonga (push) yuborilishi Telegram'dan alohida kuzatiladi: sent_at — Telegram, push_sent_at — push
 do $$ begin
@@ -1840,11 +1842,15 @@ create table if not exists public.push_tokens (
 );
 
 create index if not exists push_tokens_user_idx on public.push_tokens (user_id);
+-- 2026-11-17: ilova yaratgan Android kanallari versiyasi (0 — faqat 'default'; 1 — jobs/messages/reminders, o'z ovozi)
+alter table public.push_tokens add column if not exists channels int not null default 0;
 
 alter table public.push_tokens enable row level security;
 
 -- Ilova kirgandan keyin chaqiradi. Qurilmada boshqa hisobga kirilgan bo'lsa token yangi egasiga o'tadi.
-create or replace function public.register_push_token(p_token text, p_platform text)
+drop function if exists public.register_push_token(text, text);
+-- p_channels: ilova yaratgan bildirishnoma kanallari versiyasi (eski ilovalar yubormaydi — 0)
+create or replace function public.register_push_token(p_token text, p_platform text, p_channels int default 0)
 returns void language plpgsql security definer set search_path = public as $$
 declare v_uid uuid := require_uid();
 begin
@@ -1852,8 +1858,10 @@ begin
      or p_platform is null or p_platform not in ('android', 'ios') then
     raise exception 'INVALID_INPUT';
   end if;
-  insert into push_tokens (token, user_id, platform) values (p_token, v_uid, p_platform)
-  on conflict (token) do update set user_id = excluded.user_id, platform = excluded.platform, updated_at = now();
+  insert into push_tokens (token, user_id, platform, channels)
+  values (p_token, v_uid, p_platform, greatest(coalesce(p_channels, 0), 0))
+  on conflict (token) do update set user_id = excluded.user_id, platform = excluded.platform,
+                                    channels = excluded.channels, updated_at = now();
 end;
 $$;
 
@@ -2048,10 +2056,10 @@ revoke execute on function public.get_telegram_link(), public.unlink_telegram()
 grant execute on function public.get_telegram_link(), public.unlink_telegram()
   to authenticated;
 
-revoke execute on function public.register_push_token(text, text), public.unregister_push_token(text)
+revoke execute on function public.register_push_token(text, text, int), public.unregister_push_token(text)
   from public, anon, authenticated;
 
-grant execute on function public.register_push_token(text, text), public.unregister_push_token(text)
+grant execute on function public.register_push_token(text, text, int), public.unregister_push_token(text)
   to authenticated;
 
 revoke execute on function
@@ -7515,6 +7523,15 @@ begin
 end;
 $$;
 
+-- Tungi tinchlik (2026-11-17): eslatmalar (baho, eski e'lon, profil) Toshkent vaqti bilan 21:00-09:00 yuborilmaydi —
+-- keyingi uyg'onishda (ertalab) navbatga qo'yiladi. Yangi ish va chat xabarlari bunga kirmaydi (triggerlar darhol).
+-- Testlar uchun: set_config('ustame.ignore_quiet', 'on', ...).
+create or replace function public._is_quiet_now()
+returns boolean language sql stable as $$
+  select coalesce(current_setting('ustame.ignore_quiet', true), '') <> 'on'
+     and extract(hour from now() at time zone 'Asia/Tashkent') not between 9 and 20
+$$;
+
 -- Davriy vazifalar — server avto-qabul bilan birga chaqiradi (internal/jobs: ishga tushganda, faollikda
 -- kamida 10 daqiqa oraliq bilan, aks holda har 6 soatda). Navbatga qo'yilgan xabarlar sonini qaytaradi.
 --   1) Qo'ng'iroqdan 20 soat - 14 kun o'tib, baho qo'ymagan mijozga bir marta "Ustani baholang"
@@ -7527,6 +7544,7 @@ declare
   r   record;
   v_n int := 0;
   v_missing text[];
+  v_quiet boolean := _is_quiet_now();
 begin
   -- 1) Baho eslatmasi (shartnoma bo'lgan juftlikka emas — u yerda o'z baholash tartibi bor)
   for r in
@@ -7534,7 +7552,7 @@ begin
       from provider_contacts c
       join profiles p on p.id = c.provider_id
       join users u on u.id = c.client_id
-     where c.kind = 'call'
+     where not v_quiet and c.kind = 'call'
        and c.created_at < now() - interval '20 hours'
        and c.created_at > now() - interval '14 days'
        and u.deleted_at is null and u.blocked_at is null
@@ -7561,7 +7579,7 @@ begin
   for r in
     select j.id, j.client_id, j.title
       from jobs j join users u on u.id = j.client_id
-     where j.status = 'open'
+     where not v_quiet and j.status = 'open'
        and coalesce(j.renewed_at, j.created_at) < now() - interval '30 days'
        and j.stale_notified_at is null
        and u.deleted_at is null and u.blocked_at is null
@@ -7598,7 +7616,7 @@ begin
   for r in
     select pp.user_id
       from provider_profiles pp join users u on u.id = pp.user_id
-     where pp.status = 'approved'
+     where not v_quiet and pp.status = 'approved'
        and u.deleted_at is null and u.blocked_at is null
        and pp.created_at < now() - interval '2 days'
        and pp.completeness_nudges < 3
@@ -7641,3 +7659,40 @@ grant execute on function
   public.log_provider_contact(uuid, text), public.get_my_contact_review(uuid),
   public.leave_contact_review(uuid, int, text), public.renew_job(uuid)
   to authenticated;
+
+-- Admin: o'z telefoniga sinov bildirishnomasi (push to'g'ri ishlayotganini tekshirish uchun)
+create or replace function public.admin_send_test_push()
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+begin
+  perform require_admin();
+  perform queue_notification(v_uid,
+    E'🔔 Sinov bildirishnomasi: Ustame xabarlari telefoningizga shunday keladi.', '/admin');
+  return jsonb_build_object(
+    'tokens',   (select count(*) from push_tokens where user_id = v_uid),
+    'channels', coalesce((select max(channels) from push_tokens where user_id = v_uid), 0)
+  );
+end;
+$$;
+
+-- Admin: push holati — tokenlar, so'nggi sutkada yuborilganlar va Expo rad etganlar (oxirgi sababi bilan)
+create or replace function public.admin_push_health()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return jsonb_build_object(
+    'tokens',              (select count(*) from push_tokens),
+    'tokens_new_channels', (select count(*) from push_tokens where channels >= 1),
+    'sent_24h',            (select count(*) from notification_outbox where push_sent_at > now() - interval '24 hours'),
+    'errors_24h',          (select count(*) from notification_outbox
+                             where push_error is not null and push_sent_at > now() - interval '24 hours'),
+    'last_error',          (select push_error from notification_outbox where push_error is not null order by id desc limit 1),
+    'last_error_at',       (select push_sent_at from notification_outbox where push_error is not null order by id desc limit 1)
+  );
+end;
+$$;
+
+revoke execute on function public._is_quiet_now() from public, anon, authenticated;
+revoke execute on function public.admin_send_test_push(), public.admin_push_health() from public, anon;
+grant execute on function public.admin_send_test_push(), public.admin_push_health() to authenticated;

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
@@ -17,6 +18,7 @@ type Message struct {
 	Lang      string  // users.lang: "uzc" bo'lsa matn kirillga o'giriladi
 	Link      *string // ilovada ochiladigan sahifa
 	CreatedAt time.Time
+	Channels  int // push_tokens.channels: telefondagi ilova yaratgan kanallar versiyasi (channels.go)
 }
 
 // Store — push ishchisi ishlatadigan baza amallari (pgx'dagisi: store.go).
@@ -29,6 +31,8 @@ type Store interface {
 	Release(ctx context.Context, ids []int64) error
 	// DeleteTokens — ilova o'chirilgan yoki ruxsat olib qo'yilgan telefonlar tokenlari.
 	DeleteTokens(ctx context.Context, tokens []string) error
+	// MarkFailed — Expo rad etgan xabarlar sababi (notification_outbox.push_error; admin ko'radi).
+	MarkFailed(ctx context.Context, reasons map[int64]string) error
 }
 
 type Sender interface {
@@ -118,7 +122,10 @@ func (w *Worker) deliverOnce(ctx context.Context) (failed, full bool) {
 func (w *Worker) send(ctx context.Context, part []Message) bool {
 	msgs := make([]ExpoMessage, len(part))
 	for i, m := range part {
-		msgs[i] = ExpoMessage{To: m.Token, Title: title, Body: cyrillic.For(m.Lang, m.Text), Sound: "default", ChannelID: "default", Priority: "high"}
+		msgs[i] = ExpoMessage{
+			To: m.Token, Title: title, Body: cyrillic.For(m.Lang, m.Text), Sound: "default",
+			ChannelID: channelFor(m.Channels, m.Link, m.Text), Priority: "high",
+		}
 		if m.Link != nil {
 			msgs[i].Data = map[string]string{"url": *m.Link}
 		}
@@ -149,6 +156,7 @@ func (w *Worker) send(ctx context.Context, part []Message) bool {
 	}
 
 	var gone []string
+	failedWhy := map[int64]string{}
 	for i, t := range tickets {
 		if t.Status == "ok" {
 			continue
@@ -159,6 +167,16 @@ func (w *Worker) send(ctx context.Context, part []Message) bool {
 		}
 		// Masalan InvalidCredentials — EAS'ga FCM kaliti yuklanmagan
 		log.Printf("push: %d-xabar rad etildi: %s %s", part[i].ID, t.Details.Error, t.Message)
+		why := strings.TrimSpace(t.Details.Error + " " + t.Message)
+		if len(why) > 500 {
+			why = why[:500]
+		}
+		failedWhy[part[i].ID] = why
+	}
+	if len(failedWhy) > 0 {
+		if err := w.Store.MarkFailed(ctx, failedWhy); err != nil {
+			log.Printf("push: xato sababi yozilmadi: %v", err)
+		}
 	}
 	if len(gone) > 0 {
 		if err := w.Store.DeleteTokens(ctx, gone); err != nil {

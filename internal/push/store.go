@@ -28,7 +28,8 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 			returning o.id, o.user_id, o.message, o.link, o.created_at
 		)
 		select (select count(*)::int from u), u.id, t.token, u.message, u.link, u.created_at,
-		       coalesce(to_jsonb(usr)->>'lang', '') -- users.lang ustuni hali bo'lmasa ham xato bermaydi
+		       coalesce(to_jsonb(usr)->>'lang', ''), -- users.lang ustuni hali bo'lmasa ham xato bermaydi
+		       coalesce((to_jsonb(t)->>'channels')::int, 0) -- push_tokens.channels (2026-11-17) bo'lmasa ham
 		from u left join push_tokens t on t.user_id = u.user_id
 		left join users usr on usr.id = u.user_id
 		order by u.id`, limit)
@@ -40,7 +41,7 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 	for rows.Next() {
 		var m Message
 		var token *string
-		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang); err != nil {
+		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang, &m.Channels); err != nil {
 			rows.Close()
 			return 0, nil, err
 		}
@@ -54,6 +55,21 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 
 func (s *PgStore) Release(ctx context.Context, ids []int64) error {
 	_, err := s.DB.Exec(ctx, `update notification_outbox set push_sent_at = null where id = any($1)`, ids)
+	return err
+}
+
+// MarkFailed — notification_outbox.push_error (2026-11-17). Ustun hali bo'lmasa xato qaytadi — faqat log'ga.
+func (s *PgStore) MarkFailed(ctx context.Context, reasons map[int64]string) error {
+	ids := make([]int64, 0, len(reasons))
+	why := make([]string, 0, len(reasons))
+	for id, r := range reasons {
+		ids = append(ids, id)
+		why = append(why, r)
+	}
+	_, err := s.DB.Exec(ctx, `
+		update notification_outbox o set push_error = f.why
+		from unnest($1::bigint[], $2::text[]) as f(id, why)
+		where o.id = f.id`, ids, why)
 	return err
 }
 

@@ -17,6 +17,7 @@ type fakeStore struct {
 	released []int64
 	deleted  []string
 	claims   int
+	failed   map[int64]string
 }
 
 // Claim — soddalashtirilgan: navbatdagi hamma qatorni oladi; claimed — alohida xabarlar (ID) soni.
@@ -47,6 +48,16 @@ func (f *fakeStore) claimCount() int {
 
 func (f *fakeStore) Release(_ context.Context, ids []int64) error {
 	f.released = append(f.released, ids...)
+	return nil
+}
+
+func (f *fakeStore) MarkFailed(_ context.Context, reasons map[int64]string) error {
+	if f.failed == nil {
+		f.failed = map[int64]string{}
+	}
+	for id, r := range reasons {
+		f.failed[id] = r
+	}
 	return nil
 }
 
@@ -184,5 +195,50 @@ func TestRunWaitsForWake(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if st.claimCount() != 2 || len(*got) != 1 {
 		t.Fatalf("signaldan keyin bir marta tekshirib, 1 ta yuborishi kerak edi: tekshiruv %d, yuborilgan %d", st.claimCount(), len(*got))
+	}
+}
+
+func TestChannelForByTokenVersionAndType(t *testing.T) {
+	cases := []struct {
+		channels int
+		link     *string
+		text     string
+		want     string
+	}{
+		{0, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", ChannelDefault}, // eski ilova — faqat default kanal bor
+		{1, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", ChannelJobs},
+		{1, link("/job/1"), "🚨 Shoshilinch: \"Kran\"", ChannelJobs},
+		{1, link("/profile"), "📸 Profilingizni to'ldiring", ChannelReminders},
+		{1, link("/provider/x?review=1"), "⭐ Usta bilan ishladingizmi?", ChannelReminders},
+		{1, link("/chat/5"), "💬 Ali: salom", ChannelMessages},
+		{1, nil, "✅ Obunangiz faollashtirildi", ChannelMessages},
+	}
+	for _, c := range cases {
+		if got := channelFor(c.channels, c.link, c.text); got != c.want {
+			t.Errorf("channelFor(%d, %q) = %q, kutilgan %q", c.channels, c.text, got, c.want)
+		}
+	}
+}
+
+func TestDeliverUsesChannelsAndRecordsRejections(t *testing.T) {
+	expo, got := fakeExpo(t, 200, func(msgs []ExpoMessage) any {
+		return map[string]any{"data": []map[string]any{
+			{"status": "ok", "id": "x"},
+			{"status": "error", "message": "Unable to retrieve the FCM server key", "details": map[string]string{"error": "InvalidCredentials"}},
+		}}
+	})
+	st := &fakeStore{queue: []Message{
+		{ID: 1, Token: "ExponentPushToken[newappnewapp]", Text: "🆕 Yangi e'lon", Link: link("/job/1"), CreatedAt: time.Now(), Channels: 1},
+		{ID: 2, Token: "ExponentPushToken[oldappoldapp]", Text: "🆕 Yangi e'lon", Link: link("/job/1"), CreatedAt: time.Now()},
+	}}
+	(&Worker{Expo: expo, Store: st}).deliverOnce(context.Background())
+	if (*got)[0].ChannelID != ChannelJobs || (*got)[1].ChannelID != ChannelDefault {
+		t.Fatalf("kanallar = %q, %q", (*got)[0].ChannelID, (*got)[1].ChannelID)
+	}
+	if st.failed[2] == "" || st.failed[1] != "" {
+		t.Fatalf("rad etilgan xabar sababi yozilishi kerak: %v", st.failed)
+	}
+	if len(st.deleted) != 0 {
+		t.Fatalf("InvalidCredentials tokenni o'chirmasligi kerak: %v", st.deleted)
 	}
 }
