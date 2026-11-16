@@ -30,12 +30,21 @@ func AutoApprove(ctx context.Context, db Querier, activity <-chan struct{}, minG
 			if ctx.Err() == nil {
 				log.Printf("auto-approve: %v", err)
 			}
-			return 0
-		}
-		if n > 0 {
+			n = 0
+		} else if n > 0 {
 			log.Printf("auto-approve: %d ta shartnoma avtomatik yakunlandi", n)
 		}
-		return n
+		// Shu uyg'onishda boshqa davriy vazifalar ham (sql/app.sql: run_periodic_tasks — baho eslatmasi,
+		// 30 kunlik e'lon, profilni to'ldirish). Xatosi avto-qabulga ta'sir qilmaydi.
+		var m int
+		if err := db.QueryRow(ctx, `select public.run_periodic_tasks()`).Scan(&m); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("periodic: %v", err)
+			}
+		} else if m > 0 {
+			log.Printf("periodic: %d ta xabar navbatga qo'yildi", m)
+		}
+		return n + m
 	}
 	notify := func() {
 		if afterRun != nil {

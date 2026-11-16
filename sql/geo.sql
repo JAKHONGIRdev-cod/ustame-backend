@@ -145,6 +145,7 @@ begin
     'id', v_job.id, 'title', v_job.title, 'description', v_job.description,
     'category', v_job.category, 'district', v_job.district, 'budget', v_job.budget,
     'urgency', v_job.urgency, 'status', v_job.status, 'created_at', v_job.created_at,
+    'renewed_at', v_job.renewed_at, 'stale_notified_at', v_job.stale_notified_at,
     'has_photo', v_job.has_photo,
     'photos', _job_photos(v_job.id),
     'crew_needed', v_job.crew_needed,
@@ -214,7 +215,7 @@ begin
                              when y.distance_km < 25 then 3
                              when y.distance_km < 50 then 4
                              else 6 end,
-                        y.top_rated desc, y.score desc, y.distance_km asc nulls last,
+                        y.top_rated desc, y.completeness desc, y.score desc, y.distance_km asc nulls last,
                         y.completed desc, y.created_at desc) as ord
       from (
         select
@@ -239,6 +240,8 @@ begin
           (coalesce((s.stats ->> 'avg_rating')::numeric, 0) * coalesce((s.stats ->> 'reviews_count')::int, 0) + 4.0 * 2)
             / (coalesce((s.stats ->> 'reviews_count')::int, 0) + 2) as score,
           coalesce((s.stats ->> 'completed_jobs')::int, 0) as completed,
+          -- 2026-11-17: profil to'liqligi (rasm, ish joyi, ish rasmlari, tavsif) — to'liqlari yuqorida
+          4 - cardinality(_provider_missing(pp.user_id)) as completeness,
           pp.created_at
         from provider_profiles pp
         join profiles p on p.id = pp.user_id

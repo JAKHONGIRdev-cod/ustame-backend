@@ -24,17 +24,23 @@ func (r fakeRow) Scan(dest ...any) error {
 }
 
 type fakeDB struct {
-	calls atomic.Int32
-	n     int
-	err   error
+	calls     atomic.Int32 // faqat avto-qabul so'rovlari
+	periodic  atomic.Int32 // davriy vazifalar (run_periodic_tasks)
+	n         int
+	err       error
+	periodicN int
 }
 
 func (f *fakeDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
-	f.calls.Add(1)
-	if sql != `select public.auto_approve_overdue()` {
-		return fakeRow{err: errors.New("kutilmagan so'rov: " + sql)}
+	switch sql {
+	case `select public.auto_approve_overdue()`:
+		f.calls.Add(1)
+		return fakeRow{n: f.n, err: f.err}
+	case `select public.run_periodic_tasks()`:
+		f.periodic.Add(1)
+		return fakeRow{n: f.periodicN}
 	}
-	return fakeRow{n: f.n, err: f.err}
+	return fakeRow{err: errors.New("kutilmagan so'rov: " + sql)}
 }
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -105,4 +111,22 @@ func TestAutoApproveSurvivesErrors(t *testing.T) {
 	if db.calls.Load() < 2 {
 		t.Fatalf("xatodan keyin ham qayta urinishi kerak edi: %d", db.calls.Load())
 	}
+}
+
+func TestPeriodicTasksRunWithAutoApprove(t *testing.T) {
+	db := &fakeDB{periodicN: 3}
+	var notified atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go AutoApprove(ctx, db, nil, time.Hour, time.Hour, func() { notified.Add(1) })
+	// Ishga tushishda davriy vazifalar ham bajariladi; navbatga xabar qo'yilgani uchun ishchilar uyg'otiladi
+	waitFor(t, func() bool { return db.periodic.Load() == 1 && notified.Load() == 1 })
+}
+
+func TestPeriodicRunsEvenIfAutoApproveFails(t *testing.T) {
+	db := &fakeDB{err: errors.New("avto-qabul xatosi")}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go AutoApprove(ctx, db, nil, time.Hour, time.Hour, nil)
+	waitFor(t, func() bool { return db.periodic.Load() == 1 })
 }

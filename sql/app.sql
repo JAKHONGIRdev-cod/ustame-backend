@@ -272,6 +272,35 @@ create table if not exists public.reviews (
 
 create index if not exists reviews_reviewee_idx on public.reviews (reviewee_id, created_at desc);
 
+-- 2026-11-17: mijoz ustani topib, o'zi qo'ng'iroq qiladi (usta profilidagi telefon). Shartnoma bo'lmasa ham:
+--   provider_contacts — mijoz "Qo'ng'iroq qilish" / "Ish joyi xaritada" ni bosgani (ustaga statistika, baho huquqi);
+--   contact_reviews  — qo'ng'iroq qilgan mijozning ustaga bahosi (har juftlikka bitta, tahrirlash mumkin).
+-- Jadvallar shu yerda (provider_stats'dan oldin): u language sql — jadval yaratilishda mavjud bo'lishi shart.
+create table if not exists public.provider_contacts (
+  id                 bigint generated always as identity primary key,
+  client_id          uuid not null references public.users (id) on delete cascade,
+  provider_id        uuid not null references public.users (id) on delete cascade,
+  kind               text not null check (kind in ('call', 'map')),
+  created_at         timestamptz not null default now(),
+  review_reminded_at timestamptz
+);
+create index if not exists provider_contacts_provider_idx on public.provider_contacts (provider_id, created_at desc);
+create index if not exists provider_contacts_pair_idx on public.provider_contacts (client_id, provider_id);
+alter table public.provider_contacts enable row level security;
+
+create table if not exists public.contact_reviews (
+  id          uuid primary key default gen_random_uuid(),
+  client_id   uuid not null references public.users (id) on delete cascade,
+  provider_id uuid not null references public.users (id) on delete cascade,
+  rating      int not null check (rating between 1 and 5),
+  comment     text not null default '' check (char_length(comment) <= 1000),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz,
+  unique (client_id, provider_id)
+);
+create index if not exists contact_reviews_provider_idx on public.contact_reviews (provider_id, created_at desc);
+alter table public.contact_reviews enable row level security;
+
 alter table public.provider_profiles enable row level security;
 
 alter table public.jobs              enable row level security;
@@ -372,11 +401,16 @@ returns jsonb language sql stable security definer set search_path = public as $
   pp as (
     select status, reviewed_at, id_verified_at, tax_verified_at from provider_profiles where user_id = p_user_id
   ),
+  -- Baholar: shartnoma bo'yicha (ikki tomonlama yopiq) + 2026-11-17 dan qo'ng'iroqdan keyingi baho (contact_reviews)
   r as (
-    select count(*) as cnt, round(avg(rating)::numeric, 1) as avg
-    from reviews where reviewee_id = p_user_id
-      and exists (select 1 from contracts k where k.id = reviews.contract_id and k.provider_id = p_user_id)
-      and review_is_public(reviews.contract_id, reviews.reviewer_id, reviews.created_at)
+    select count(*) as cnt, round(avg(x.rating)::numeric, 1) as avg
+    from (
+      select rating from reviews where reviewee_id = p_user_id
+        and exists (select 1 from contracts k where k.id = reviews.contract_id and k.provider_id = p_user_id)
+        and review_is_public(reviews.contract_id, reviews.reviewer_id, reviews.created_at)
+      union all
+      select rating from contact_reviews where provider_id = p_user_id
+    ) x
   )
   select jsonb_build_object(
     'completed_jobs', c.completed,
@@ -1708,19 +1742,33 @@ begin
     'lng',               pp.lng,
     'stats',             provider_stats(p.id),
     'reviews', coalesce((
-      select jsonb_agg(jsonb_build_object(
-               'rating', r.rating, 'comment', r.comment, 'created_at', r.created_at,
-               'reviewer_name', case when v_uid is null then _public_name(rp.full_name) else rp.full_name end,
-               'job_title', j.title
-             ) order by r.created_at desc)
-      from (select * from reviews
-            where reviewee_id = p.id
-              and exists (select 1 from contracts k where k.id = reviews.contract_id and k.provider_id = p.id)
-            order by created_at desc limit 30) r
-      join profiles rp on rp.id = r.reviewer_id
-      join contracts k on k.id = r.contract_id
-      join jobs j on j.id = k.job_id
-      where review_is_public(r.contract_id, r.reviewer_id, r.created_at)
+      select jsonb_agg(v.item order by v.created_at desc)
+      from (
+        select jsonb_build_object(
+                 'rating', r.rating, 'comment', r.comment, 'created_at', r.created_at,
+                 'reviewer_name', case when v_uid is null then _public_name(rp.full_name) else rp.full_name end,
+                 'job_title', j.title
+               ) as item, r.created_at
+        from (select * from reviews
+              where reviewee_id = p.id
+                and exists (select 1 from contracts k where k.id = reviews.contract_id and k.provider_id = p.id)
+              order by created_at desc limit 30) r
+        join profiles rp on rp.id = r.reviewer_id
+        join contracts k on k.id = r.contract_id
+        join jobs j on j.id = k.job_id
+        where review_is_public(r.contract_id, r.reviewer_id, r.created_at)
+        union all
+        -- 2026-11-17: qo'ng'iroqdan keyingi baholar (shartnomasiz — job_title yo'q)
+        select jsonb_build_object(
+                 'rating', cr.rating, 'comment', cr.comment, 'created_at', cr.created_at,
+                 'reviewer_name', case when v_uid is null then _public_name(rp.full_name) else rp.full_name end,
+                 'job_title', null
+               ), cr.created_at
+        from contact_reviews cr join profiles rp on rp.id = cr.client_id
+        where cr.provider_id = p.id
+        order by 2 desc
+        limit 30
+      ) v
     ), '[]'::jsonb)
   )
   into v
@@ -4860,6 +4908,14 @@ begin
                                                    order by c.s desc)
                                    from (select category, sum(amount) as s, count(*) as n
                                            from earn group by category order by 2 desc limit 3) c), '[]'::jsonb),
+      -- 2026-11-17: mijozlar profilidan qo'ng'iroq qilgani va ish joyini xaritada ko'rgani
+      'calls_total',   (select count(*) from provider_contacts where provider_id = v_uid and kind = 'call'),
+      'calls_month',   (select count(*) from provider_contacts
+                         where provider_id = v_uid and kind = 'call' and created_at >= v_month),
+      'calls_30d',     (select count(*) from provider_contacts
+                         where provider_id = v_uid and kind = 'call' and created_at > now() - interval '30 days'),
+      'map_views_30d', (select count(*) from provider_contacts
+                         where provider_id = v_uid and kind = 'map' and created_at > now() - interval '30 days'),
       'stats', provider_stats(v_uid)
     )
   );
@@ -7343,3 +7399,245 @@ from public, anon, authenticated;
 grant execute on function public.submit_survey(text, jsonb), public.get_my_surveys(),
   public.admin_get_survey_results(text)
 to authenticated;
+
+
+-- ===== 2026-11-17: qo'ng'iroqlar, qo'ng'iroqdan keyingi baho, eski e'lonlar, profil to'liqligi =====
+-- Jadvallar (provider_contacts, contact_reviews) fayl boshida, reviews jadvalidan keyin.
+
+alter table public.jobs add column if not exists renewed_at timestamptz;
+alter table public.jobs add column if not exists stale_notified_at timestamptz;
+alter table public.provider_profiles add column if not exists completeness_nudged_at timestamptz;
+alter table public.provider_profiles add column if not exists completeness_nudges int not null default 0;
+
+-- Usta profilining yetishmayotgan qismlari: 'avatar' rasm, 'location' ish joyi, 'portfolio' ish rasmlari, 'bio' tavsif.
+-- Ro'yxatda tartib (search_providers) va "profilni to'ldiring" eslatmasi uchun.
+-- plpgsql: provider_profiles.lat geo.sql'da qo'shiladi (app.sql'dan keyin) — sql funksiya yaratilishda yiqilardi.
+create or replace function public._provider_missing(p_user_id uuid)
+returns text[] language plpgsql stable security definer set search_path = public as $$
+begin
+  return (
+  select array_remove(array[
+    case when u.avatar_updated_at is null then 'avatar' end,
+    case when pp.lat is null then 'location' end,
+    case when not exists (select 1 from files f
+                           where f.bucket = 'portfolio-photos' and f.path like pp.user_id::text || '/%')
+         then 'portfolio' end,
+    case when char_length(btrim(coalesce(pp.bio, ''))) < 30 then 'bio' end
+  ], null)
+  from provider_profiles pp join users u on u.id = pp.user_id
+  where pp.user_id = p_user_id);
+end;
+$$;
+
+-- Mijoz usta profilida "Qo'ng'iroq qilish" (call) yoki "Ish joyi xaritada" (map) ni bosdi. Bir juftlik va tur
+-- uchun 10 daqiqada bittadan ortiq yozilmaydi (qayta-qayta bosish statistikani shishirmasin).
+create or replace function public.log_provider_contact(p_provider_id uuid, p_kind text default 'call')
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+begin
+  if p_kind is null or p_kind not in ('call', 'map') then raise exception 'INVALID_INPUT'; end if;
+  if p_provider_id is null or p_provider_id = v_uid then return; end if;
+  if not exists (select 1 from provider_profiles where user_id = p_provider_id and status = 'approved') then
+    raise exception 'NOT_FOUND';
+  end if;
+  if exists (select 1 from provider_contacts
+              where client_id = v_uid and provider_id = p_provider_id and kind = p_kind
+                and created_at > now() - interval '10 minutes') then
+    return;
+  end if;
+  insert into provider_contacts (client_id, provider_id, kind) values (v_uid, p_provider_id, p_kind);
+end;
+$$;
+
+-- Usta profilida: joriy foydalanuvchi bu ustani baholay oladimi (oldin qo'ng'iroq qilgan) va avvalgi bahosi
+create or replace function public.get_my_contact_review(p_provider_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_r contact_reviews;
+begin
+  select * into v_r from contact_reviews where client_id = v_uid and provider_id = p_provider_id;
+  return jsonb_build_object(
+    'can_review', p_provider_id <> v_uid
+                  and not _blocked(v_uid, p_provider_id)
+                  and exists (select 1 from provider_contacts
+                               where client_id = v_uid and provider_id = p_provider_id and kind = 'call'),
+    'rating',  v_r.rating,
+    'comment', v_r.comment
+  );
+end;
+$$;
+
+-- Qo'ng'iroq qilgan mijozning bahosi (shartnomasiz). Har juftlikka bitta, qayta yuborilsa yangilanadi.
+create or replace function public.leave_contact_review(p_provider_id uuid, p_rating int, p_comment text default '')
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid     uuid := require_uid();
+  v_comment text := btrim(coalesce(p_comment, ''));
+  v_new     boolean;
+begin
+  if p_rating is null or p_rating not between 1 and 5 or char_length(v_comment) > 1000 then
+    raise exception 'INVALID_INPUT';
+  end if;
+  if p_provider_id is null or p_provider_id = v_uid or _blocked(v_uid, p_provider_id) then
+    raise exception 'NOT_ALLOWED';
+  end if;
+  if not exists (select 1 from provider_contacts
+                  where client_id = v_uid and provider_id = p_provider_id and kind = 'call') then
+    raise exception 'NOT_ALLOWED';
+  end if;
+  v_new := not exists (select 1 from contact_reviews where client_id = v_uid and provider_id = p_provider_id);
+  insert into contact_reviews (client_id, provider_id, rating, comment)
+  values (v_uid, p_provider_id, p_rating, v_comment)
+  on conflict (client_id, provider_id)
+  do update set rating = excluded.rating, comment = excluded.comment, updated_at = now();
+  if v_new then
+    perform queue_notification(p_provider_id,
+      format(E'⭐ Sizga yangi baho: %s/5. Baholar ko''p bo''lsa, ro''yxatda yuqoriroq chiqasiz.', p_rating),
+      '/provider/' || p_provider_id);
+  end if;
+end;
+$$;
+
+-- Mijoz: 30 kundan oshgan e'lonni yana 30 kun ochiq qoldirish ("Usta topdingizmi?" xabaridan keyin)
+create or replace function public.renew_job(p_job_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := require_uid();
+  v_job jobs;
+begin
+  select * into v_job from jobs where id = p_job_id for update;
+  if not found then raise exception 'NOT_FOUND'; end if;
+  if v_job.client_id <> v_uid then raise exception 'NOT_ALLOWED'; end if;
+  if v_job.status <> 'open' then raise exception 'JOB_NOT_OPEN'; end if;
+  update jobs set renewed_at = now(), stale_notified_at = null where id = p_job_id;
+end;
+$$;
+
+-- Davriy vazifalar — server avto-qabul bilan birga chaqiradi (internal/jobs: ishga tushganda, faollikda
+-- kamida 10 daqiqa oraliq bilan, aks holda har 6 soatda). Navbatga qo'yilgan xabarlar sonini qaytaradi.
+--   1) Qo'ng'iroqdan 20 soat - 14 kun o'tib, baho qo'ymagan mijozga bir marta "Ustani baholang"
+--   2) 30 kundan beri ochiq e'lon egasiga "Usta topdingizmi?" (yana 30 kun qoldirish yoki yopish)
+--   3) Shundan keyin 7 kun javob bo'lmasa — e'lon avtomatik yopiladi
+--   4) Profili to'liq bo'lmagan ustaga haftada bir, ko'pi bilan 3 marta "Profilingizni to'ldiring"
+create or replace function public.run_periodic_tasks()
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  r   record;
+  v_n int := 0;
+  v_missing text[];
+begin
+  -- 1) Baho eslatmasi (shartnoma bo'lgan juftlikka emas — u yerda o'z baholash tartibi bor)
+  for r in
+    select distinct on (c.client_id, c.provider_id) c.client_id, c.provider_id, p.full_name
+      from provider_contacts c
+      join profiles p on p.id = c.provider_id
+      join users u on u.id = c.client_id
+     where c.kind = 'call'
+       and c.created_at < now() - interval '20 hours'
+       and c.created_at > now() - interval '14 days'
+       and u.deleted_at is null and u.blocked_at is null
+       and not exists (select 1 from provider_contacts c2
+                        where c2.client_id = c.client_id and c2.provider_id = c.provider_id
+                          and c2.review_reminded_at is not null)
+       and not exists (select 1 from contact_reviews cr
+                        where cr.client_id = c.client_id and cr.provider_id = c.provider_id)
+       and not exists (select 1 from contracts k
+                        where k.client_id = c.client_id and k.provider_id = c.provider_id)
+     order by c.client_id, c.provider_id, c.created_at
+     limit 200
+  loop
+    perform queue_notification(r.client_id,
+      format(E'⭐ %s bilan ishladingizmi? Ustani baholang — bu boshqa mijozlarga yaxshi ustani tanlashga yordam beradi.',
+             r.full_name),
+      '/provider/' || r.provider_id || '?review=1');
+    update provider_contacts set review_reminded_at = now()
+     where client_id = r.client_id and provider_id = r.provider_id;
+    v_n := v_n + 1;
+  end loop;
+
+  -- 2) 30 kundan beri ochiq e'lon: egasidan so'rash
+  for r in
+    select j.id, j.client_id, j.title
+      from jobs j join users u on u.id = j.client_id
+     where j.status = 'open'
+       and coalesce(j.renewed_at, j.created_at) < now() - interval '30 days'
+       and j.stale_notified_at is null
+       and u.deleted_at is null and u.blocked_at is null
+     limit 200
+  loop
+    perform queue_notification(r.client_id,
+      format(E'\U0001F4C5 "%s" e''loningiz 30 kundan beri ochiq. Usta topdingizmi? Topgan bo''lsangiz e''lonni yoping, '
+             'hali kerak bo''lsa — "Yana 30 kun ochiq qoldirish"ni bosing. Javob bo''lmasa 7 kundan keyin e''lon yopiladi.',
+             r.title),
+      '/job/' || r.id);
+    update jobs set stale_notified_at = now() where id = r.id;
+    v_n := v_n + 1;
+  end loop;
+
+  -- 3) So'ralganidan 7 kun o'tdi, uzaytirilmadi — yopiladi
+  for r in
+    select j.id, j.client_id, j.title
+      from jobs j
+     where j.status = 'open'
+       and j.stale_notified_at is not null
+       and j.stale_notified_at < now() - interval '7 days'
+     limit 200
+  loop
+    update jobs set status = 'cancelled', closed_at = now() where id = r.id;
+    update proposals set status = 'closed', updated_at = now() where job_id = r.id and status = 'submitted';
+    perform queue_notification(r.client_id,
+      format(E'\U0001F4C5 "%s" e''loningiz 37 kun ochiq turgani uchun avtomatik yopildi. Kerak bo''lsa, yangi e''lon joylang.',
+             r.title),
+      '/job/' || r.id);
+    v_n := v_n + 1;
+  end loop;
+
+  -- 4) Profilni to'ldirish eslatmasi
+  for r in
+    select pp.user_id
+      from provider_profiles pp join users u on u.id = pp.user_id
+     where pp.status = 'approved'
+       and u.deleted_at is null and u.blocked_at is null
+       and pp.created_at < now() - interval '2 days'
+       and pp.completeness_nudges < 3
+       and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '7 days')
+     limit 200
+  loop
+    v_missing := _provider_missing(r.user_id);
+    if cardinality(v_missing) > 0 then
+      perform queue_notification(r.user_id,
+        format(E'\U0001F4F8 Profilingizni to''ldiring: %s. To''liq profilli ustalar ro''yxatda yuqorida chiqadi '
+               'va mijozlar ularga ko''proq qo''ng''iroq qiladi.',
+               array_to_string(array(
+                 select case m when 'avatar' then 'profil rasmi'
+                               when 'location' then 'ish joyi (xaritada)'
+                               when 'portfolio' then 'ishlaringiz rasmlari'
+                               when 'bio' then 'o''zingiz haqingizda'
+                        end
+                   from unnest(v_missing) m), ', ')),
+        '/profile');
+      update provider_profiles
+         set completeness_nudged_at = now(), completeness_nudges = completeness_nudges + 1
+       where user_id = r.user_id;
+      v_n := v_n + 1;
+    end if;
+  end loop;
+
+  return v_n;
+end;
+$$;
+
+revoke execute on function public._provider_missing(uuid), public.run_periodic_tasks()
+  from public, anon, authenticated;
+
+revoke execute on function
+  public.log_provider_contact(uuid, text), public.get_my_contact_review(uuid),
+  public.leave_contact_review(uuid, int, text), public.renew_job(uuid)
+  from public, anon;
+
+grant execute on function
+  public.log_provider_contact(uuid, text), public.get_my_contact_review(uuid),
+  public.leave_contact_review(uuid, int, text), public.renew_job(uuid)
+  to authenticated;
