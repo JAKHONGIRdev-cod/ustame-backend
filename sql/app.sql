@@ -1700,6 +1700,12 @@ begin
     'experience_years',  pp.experience_years,
     'status',            pp.status,
     'is_favorite',       exists (select 1 from favorites where client_id = v_uid and provider_id = p.id),
+    -- 2026-11-17: mijoz ustani topib, o'zi qo'ng'iroq qiladi — telefon va ish joyi kirgan foydalanuvchiga
+    -- ko'rinadi (bloklanganlarga emas). Mehmon (kirmagan) telefonni ko'rmaydi: kirishga undaladi.
+    'phone',             case when v_uid is not null and not _blocked(v_uid, p.id)
+                               then (select u.phone from users u where u.id = p.id) end,
+    'lat',               pp.lat,
+    'lng',               pp.lng,
     'stats',             provider_stats(p.id),
     'reviews', coalesce((
       select jsonb_agg(jsonb_build_object(
