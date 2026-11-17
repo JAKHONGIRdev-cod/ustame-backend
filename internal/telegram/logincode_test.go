@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 )
@@ -60,10 +61,95 @@ func TestPlainStartUnknownChatAsksContact(t *testing.T) {
 	if tg.sent[0].Text != msgHello || !askedForContact(tg.markups[0]) || len(st.issued) != 0 {
 		t.Fatalf("yuborilgan: %v %v", tg.sent, tg.markups)
 	}
-	// Raqamni qo'lda yozsa ham — tugmani ko'rsatamiz
-	w.handleUpdate(context.Background(), privateMsg(83, "+998901234567"))
-	if tg.sent[1].Text != msgHello || !askedForContact(tg.markups[1]) {
+	// Raqamni qo'lda yozsa — yozish shart emasligini aytib, tugmani ko'rsatamiz (kod bermaymiz)
+	w.handleUpdate(context.Background(), privateMsg(83, "+998 90 123-45-67"))
+	if tg.sent[1].Text != msgTypedPhone || !askedForContact(tg.markups[1]) || len(st.issued) != 0 {
+		t.Fatalf("qo'lda yozilgan raqamga tushuntirish va tugma kerak: %v", tg.sent)
+	}
+	// Boshqa matn — oddiy salom va tugma
+	w.handleUpdate(context.Background(), privateMsg(83, "salom"))
+	if tg.sent[2].Text != msgHello || !askedForContact(tg.markups[2]) {
 		t.Fatalf("matnga ham tugma bilan javob kerak: %v", tg.sent)
+	}
+}
+
+func TestLooksLikePhone(t *testing.T) {
+	for text, want := range map[string]bool{
+		"+998901234567": true, "+998 (90) 123-45-67": true, "901234567": true, "90 123 45 67": true,
+		"12345": false, "salom": false, "/start": false, "mening raqamim 901234567": false, "": false,
+		"1234567890123456789": false,
+	} {
+		if got := looksLikePhone(text); got != want {
+			t.Errorf("looksLikePhone(%q) = %v, kerak %v", text, got, want)
+		}
+	}
+}
+
+// /start'dan keyin raqam so'ralganda — rasmli ko'rsatma; keyingi javoblar oddiy matn
+func TestAskWithHelpPhoto(t *testing.T) {
+	w, tg, st := newCodeTest(t)
+	w.HelpPhotoURL = "https://ustame.com/tg-help/raqam-yuborish.png"
+	st.loginCodes["p1"] = true
+	ctx := context.Background()
+	w.handleUpdate(ctx, privateMsg(91, "/start login_p1"))
+	w.handleUpdate(ctx, privateMsg(92, "/start"))
+	w.handleUpdate(ctx, privateMsg(92, "salom"))
+
+	if tg.photos[0] != w.HelpPhotoURL || tg.sent[0].Text != msgLoginAsk || !askedForContact(tg.markups[0]) {
+		t.Fatalf("havoladan kelganga rasmli so'rov kerak: %v %v", tg.photos, tg.sent)
+	}
+	if tg.photos[1] != w.HelpPhotoURL || tg.sent[1].Text != msgHello {
+		t.Fatalf("/start'ga rasmli so'rov kerak: %v %v", tg.photos, tg.sent)
+	}
+	if tg.photos[2] != "" || tg.sent[2].Text != msgHello {
+		t.Fatalf("oddiy matnga rasm qayta yuborilmasin: %v %v", tg.photos, tg.sent)
+	}
+}
+
+// Rasm yuborilmasa (URL ishlamasa) — xuddi shu so'rov oddiy matn bilan
+func TestAskPhotoFallsBackToText(t *testing.T) {
+	w, tg, _ := newCodeTest(t)
+	w.HelpPhotoURL = "https://ustame.com/yoq.png"
+	tg.failPhoto = true
+	w.handleUpdate(context.Background(), privateMsg(93, "/start"))
+	if len(tg.sent) != 1 || tg.photos[0] != "" || tg.sent[0].Text != msgHello || !askedForContact(tg.markups[0]) {
+		t.Fatalf("rasm o'rniga matn kerak: %v %v", tg.photos, tg.sent)
+	}
+}
+
+// Raqam so'ralib yuborilmasa — ContactRemindAfter dan keyin bir marta eslatma; yuborgan yoki tanishga — yo'q
+func TestContactReminder(t *testing.T) {
+	w, tg, st := newCodeTest(t)
+	ctx := context.Background()
+	w.handleUpdate(ctx, privateMsg(94, "/start")) // yubormaydi
+	w.handleUpdate(ctx, privateMsg(95, "/start")) // raqamni yuboradi
+	w.handleUpdate(ctx, contactMsg(95, 95, "998901234567"))
+	w.handleUpdate(ctx, privateMsg(96, "/start")) // keyin boshqa yo'l bilan kirgan
+	st.known[96] = "998907654321"
+	sent := len(tg.sent)
+
+	now := time.Now()
+	w.remindDue(ctx, now.Add(time.Minute)) // hali erta
+	if len(tg.sent) != sent {
+		t.Fatalf("muddatidan oldin eslatilmasin: %v", tg.sent[sent:])
+	}
+	w.remindDue(ctx, now.Add(w.ContactRemindAfter+time.Second))
+	w.remindDue(ctx, now.Add(2*w.ContactRemindAfter+time.Second)) // ikkinchi marta eslatilmaydi
+	got := tg.sent[sent:]
+	if len(got) != 1 || got[0].ChatID != 94 || got[0].Text != msgLoginRemind || !askedForContact(tg.markups[sent]) {
+		t.Fatalf("faqat 94 ga bitta eslatma kerak: %v", got)
+	}
+}
+
+// Juda eski so'rov (odam allaqachon ketgan) eslatilmaydi
+func TestContactReminderSkipsStale(t *testing.T) {
+	w, tg, _ := newCodeTest(t)
+	ctx := context.Background()
+	w.handleUpdate(ctx, privateMsg(97, "/start"))
+	sent := len(tg.sent)
+	w.remindDue(ctx, time.Now().Add(contactRemindMaxAge+time.Minute))
+	if len(tg.sent) != sent {
+		t.Fatalf("eskirgan so'rovga eslatma ketmasin: %v", tg.sent[sent:])
 	}
 }
 

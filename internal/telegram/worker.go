@@ -85,7 +85,19 @@ type Worker struct {
 	loginLang sync.Map
 	// loginApp — kirish Android ilovadan boshlangan (chat_id → true): saytga qaytish tugmasi ko'rsatilmaydi
 	loginApp sync.Map
+
+	// HelpPhotoURL — /start'dan keyin raqam birinchi marta so'ralganda xabar shu rasm bilan (tugma qayerda va «OK» —
+	// ko'rsatma). Bo'sh bo'lsa yoki rasm yuborilmasa — oddiy matn.
+	HelpPhotoURL string
+	// ContactRemindAfter — raqam so'ralib, shuncha vaqt yuborilmasa bir marta eslatiladi (standart 2 daqiqa)
+	ContactRemindAfter time.Duration
+	// pendingAsk — raqam so'ralgan, hali yubormagan chatlar (chat_id → so'ralgan vaqt). Server qayta ishga tushsa
+	// yo'qoladi — eng ko'pi bir nechta eslatma ketmay qoladi.
+	pendingAsk sync.Map
 }
+
+// contactRemindMaxAge — shundan eski so'rov eslatilmaydi (odam allaqachon ketgan yoki boshqa yo'l bilan kirgan)
+const contactRemindMaxAge = 30 * time.Minute
 
 // Kirish havolasi oxiridagi belgilar (api/telegram_login.go): login_<kod>[_a][_c]
 const (
@@ -106,8 +118,8 @@ const (
 		"O'chirish uchun: /stop yoki ilovada Profil → Telegram → Uzish."
 	msgBadCode = "Havola eskirgan yoki noto'g'ri. Ilovada Profil → Telegram → «Botga ulanish» tugmasini qayta bosing."
 	msgHello   = "Assalomu alaykum! Bu Ustame boti.\n\n" +
-		"Ustame'ga kirish uchun pastdagi «" + contactButton + "» tugmasini bosing — kirish kodini yuboramiz 👇\n\n" +
-		"Tugma ko'rinmasa, xabar yozish joyi yonidagi klaviatura (🎛) belgisini bosing."
+		"Ustame'ga kirish uchun pastdagi katta «" + contactButton + "» tugmasini bosing — kirish kodini yuboramiz 👇\n\n" +
+		contactTrust
 	// msgHelloNoCode — kod berish o'chiq (OTPSecret yo'q) yoki guruh chati: oddiy /start javobi
 	msgHelloNoCode = "Assalomu alaykum! Bu Ustame bildirishnomalar boti.\n\n" +
 		"Ulash uchun ilovada Profil → Telegram → «Botga ulanish» tugmasini bosing."
@@ -117,8 +129,18 @@ const (
 	loginPrefix   = "login_" // t.me/<bot>?start=login_<kod>
 	contactButton = "📱 Raqamni yuborish"
 
-	msgLoginAsk = "Ustame ilovasiga kirish uchun pastdagi «" + contactButton + "» tugmasini bosing 👇\n\n" +
-		"Tugma ko'rinmasa, xabar yozish joyi yonidagi klaviatura (🎛) belgisini bosing."
+	// contactTrust — raqam so'ralganda: Telegram oynasida nima bosish va raqam nima uchun kerakligi (2026-11-17:
+	// botni ochganlarning bir qismi raqam yubormay to'xtab qolardi)
+	contactTrust = "Telegram «Raqamni ulashasizmi?» deb so'raganda «OK» ni bosing. " +
+		"Raqamingiz faqat Ustame hisobingizni ochish uchun kerak — uni qo'lda yozish shart emas."
+	msgLoginAsk = "Ustame ilovasiga kirish uchun pastdagi katta «" + contactButton + "» tugmasini bosing 👇\n\n" +
+		contactTrust
+	// msgTypedPhone — raqamni tugma o'rniga qo'lda yozgan (xavfsizlik uchun faqat Telegram yuborgan raqam qabul qilinadi)
+	msgTypedPhone = "Raqamni qo'lda yozish shart emas 🙂 Xavfsizlik uchun raqamni Telegram o'zi yuboradi: " +
+		"pastdagi katta «" + contactButton + "» tugmasini bosing, keyin «OK» ni bosing 👇"
+	// msgLoginRemind — raqam so'ralib, yuborilmasa bir marta (Worker.ContactRemindAfter o'tgach) eslatma
+	msgLoginRemind = "Kirish deyarli tayyor! Faqat pastdagi «" + contactButton + "» tugmasini bosing " +
+		"va Telegram so'raganda «OK» ni bosing 👇"
 	msgLoginBadCode   = "Kirish havolasi eskirgan. Ilovada «Telegram orqali kirish» tugmasini qayta bosing."
 	msgLoginNotOwn    = "Faqat o'zingizning raqamingizni yuboring: pastdagi «" + contactButton + "» tugmasini bosing."
 	msgLoginNotUz     = "Hozircha faqat O'zbekiston raqamlari (+998) bilan kirish mumkin."
@@ -155,8 +177,8 @@ const (
 	msgLoginCode = "🔑 Ustame'ga kirish kodingiz: %s\n\n" +
 		"Ilovada «Telegram orqali kirish» → «Telegram kodi bilan kirish» ni bosing, raqamingiz va shu kodni kiriting " +
 		"(yoki «Telegram orqali kirish» tugmasini qayta bosing). Kod 10 daqiqa amal qiladi.\n\nKodni hech kimga bermang."
-	msgLoginExpiredAsk = "Bu kirish havolasi eskirgan, lekin muammo yo'q: pastdagi «" + contactButton +
-		"» tugmasini bosing — kirish kodini yuboramiz 👇"
+	msgLoginExpiredAsk = "Bu kirish havolasi eskirgan, lekin muammo yo'q: pastdagi katta «" + contactButton +
+		"» tugmasini bosing — kirish kodini yuboramiz 👇\n\n" + contactTrust
 	msgCodeLimit = "Bu raqamga juda ko'p kod so'raldi. Bir soatdan keyin qayta urinib ko'ring."
 )
 
@@ -179,10 +201,14 @@ var botTexts = []BotTexts{
 }
 
 var (
+	// is_persistent: raqam yuborilguncha tugma doim ko'rinadi (oddiy klaviatura ochilganda ham 🎛 ortiga yashirinmaydi);
+	// one_time_keyboard: bosilgach o'zi yopiladi.
 	askContactKeyboard = map[string]any{
-		"keyboard":          [][]map[string]any{{{"text": contactButton, "request_contact": true}}},
-		"resize_keyboard":   true,
-		"one_time_keyboard": true,
+		"keyboard":                [][]map[string]any{{{"text": contactButton, "request_contact": true}}},
+		"resize_keyboard":         true,
+		"one_time_keyboard":       true,
+		"is_persistent":           true,
+		"input_field_placeholder": "👇 «" + contactButton + "» tugmasini bosing",
 	}
 	removeKeyboard = map[string]any{"remove_keyboard": true}
 )
@@ -199,6 +225,9 @@ func (w *Worker) defaults() {
 	}
 	if w.MaxMessageAge == 0 {
 		w.MaxMessageAge = 24 * time.Hour
+	}
+	if w.ContactRemindAfter == 0 {
+		w.ContactRemindAfter = 2 * time.Minute
 	}
 }
 
@@ -228,9 +257,10 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); w.pollUpdates(ctx) }()
 	go func() { defer wg.Done(); w.deliverLoop(ctx) }()
+	go func() { defer wg.Done(); w.remindLoop(ctx) }()
 	wg.Wait()
 }
 
@@ -280,6 +310,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		return
 	}
 	if m.Contact != nil {
+		w.pendingAsk.Delete(chatID)
 		if reply, markup := w.contactReply(ctx, m); reply != "" {
 			w.send(ctx, chatID, w.reply(chatID, reply), markup)
 		}
@@ -291,6 +322,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 
 	var reply string
 	var markup any
+	photo := false // /start'dan keyin raqam so'ralsa — rasmli ko'rsatma bilan
 	switch {
 	case cmd == "/start" && strings.HasPrefix(arg, loginPrefix):
 		if m.Chat.Type != "private" {
@@ -319,6 +351,7 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		default:
 			reply, markup = w.expiredReply(ctx, chatID)
 		}
+		photo = true
 	case cmd == "/start" && arg != "":
 		ok, err := w.Store.LinkChat(ctx, arg, chatID)
 		switch {
@@ -341,15 +374,92 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		// tanish chat'ga darhol kod, aks holda raqamni tugma orqali yuborishni so'raymiz
 		w.loginLang.Delete(chatID)
 		w.loginApp.Delete(chatID)
-		if phone := w.knownPhone(ctx, chatID); phone != "" {
+		switch phone := w.knownPhone(ctx, chatID); {
+		case phone != "":
 			reply, markup = w.codeReply(ctx, chatID, phone)
-		} else {
-			reply, markup = msgHello, askContactKeyboard
+		case looksLikePhone(m.Text):
+			reply, markup = msgTypedPhone, askContactKeyboard
+		default:
+			reply, markup, photo = msgHello, askContactKeyboard, cmd == "/start"
 		}
 	default:
 		reply = msgHelloNoCode
 	}
+	if isContactAsk(markup) {
+		// Raqam so'raldi: yuborilmasa ContactRemindAfter dan keyin bir marta eslatamiz (remindLoop)
+		w.pendingAsk.Store(chatID, time.Now())
+		if photo {
+			w.sendAsk(ctx, chatID, w.reply(chatID, reply), markup)
+			return
+		}
+	} else {
+		w.pendingAsk.Delete(chatID)
+	}
 	w.send(ctx, chatID, w.reply(chatID, reply), markup)
+}
+
+// isContactAsk — javob «Raqamni yuborish» (request_contact) tugmasi bilanmi
+func isContactAsk(markup any) bool {
+	m, ok := markup.(map[string]any)
+	return ok && m["keyboard"] != nil
+}
+
+// looksLikePhone — matn qo'lda yozilgan telefon raqamiga o'xshaydimi ("+998 90 123 45 67", "901234567")
+func looksLikePhone(text string) bool {
+	digits := 0
+	for _, r := range text {
+		switch {
+		case r >= '0' && r <= '9':
+			digits++
+		case r == ' ' || r == '+' || r == '-' || r == '(' || r == ')':
+		default:
+			return false
+		}
+	}
+	return digits >= 9 && digits <= 15
+}
+
+// sendAsk — raqam so'rovi rasmli ko'rsatma bilan (HelpPhotoURL); rasm yuborilmasa — oddiy matn
+func (w *Worker) sendAsk(ctx context.Context, chatID int64, text string, markup any) {
+	if w.HelpPhotoURL != "" {
+		err := w.TG.SendPhotoMarkup(ctx, chatID, w.HelpPhotoURL, text, markup)
+		if err == nil {
+			return
+		}
+		log.Printf("telegram: ko'rsatma rasmi yuborilmadi, matn bilan: %v", err)
+	}
+	w.send(ctx, chatID, text, markup)
+}
+
+// remindLoop — raqam so'ralib, yuborilmagan chatlarga bir marta eslatma (har 20 soniyada tekshiriladi)
+func (w *Worker) remindLoop(ctx context.Context) {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			w.remindDue(ctx, now)
+		}
+	}
+}
+
+// remindDue — muddati kelgan (ContactRemindAfter o'tgan) so'rovlarga eslatma; har so'rovga bir marta
+func (w *Worker) remindDue(ctx context.Context, now time.Time) {
+	w.pendingAsk.Range(func(k, v any) bool {
+		chatID, asked := k.(int64), v.(time.Time)
+		age := now.Sub(asked)
+		if age < w.ContactRemindAfter {
+			return true
+		}
+		w.pendingAsk.Delete(chatID)
+		if age > contactRemindMaxAge || w.knownPhone(ctx, chatID) != "" {
+			return true // eskirgan yoki allaqachon kirgan
+		}
+		w.send(ctx, chatID, w.reply(chatID, msgLoginRemind), askContactKeyboard)
+		return true
+	})
 }
 
 func (w *Worker) codesEnabled() bool { return len(w.OTPSecret) > 0 }

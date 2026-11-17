@@ -14,10 +14,12 @@ import (
 // fakeTG — Telegram Bot API o'rnida: sendMessage chaqiruvlarini yozib oladi,
 // chat_id bo'yicha oldindan berilgan xatoni qaytaradi.
 type fakeTG struct {
-	mu      sync.Mutex
-	sent    []sentMsg
-	markups []any            // har bir yuborilgan xabarning reply_markup'i (yo'q bo'lsa nil)
-	errFor  map[int64]string // chat_id -> butun JSON javob
+	mu        sync.Mutex
+	sent      []sentMsg
+	markups   []any            // har bir yuborilgan xabarning reply_markup'i (yo'q bo'lsa nil)
+	photos    []string         // har bir yuborilgan xabarning rasmi (sendPhoto; oddiy xabarda "")
+	failPhoto bool             // sendPhoto xato qaytarsin (rasm URL ishlamayotgandek)
+	errFor    map[int64]string // chat_id -> butun JSON javob
 }
 
 type sentMsg struct {
@@ -39,6 +41,19 @@ func (f *fakeTG) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.sent = append(f.sent, sentMsg{chat, p["text"].(string)})
 		f.markups = append(f.markups, p["reply_markup"])
+		f.photos = append(f.photos, "")
+		w.Write([]byte(`{"ok":true,"result":{}}`))
+	case strings.HasSuffix(r.URL.Path, "/sendPhoto"):
+		chat := int64(p["chat_id"].(float64))
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.failPhoto {
+			w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: wrong type of the web page content"}`))
+			return
+		}
+		f.sent = append(f.sent, sentMsg{chat, p["caption"].(string)})
+		f.markups = append(f.markups, p["reply_markup"])
+		f.photos = append(f.photos, p["photo"].(string))
 		w.Write([]byte(`{"ok":true,"result":{}}`))
 	case strings.HasSuffix(r.URL.Path, "/getMe"):
 		w.Write([]byte(`{"ok":true,"result":{"username":"UstameTestBot"}}`))

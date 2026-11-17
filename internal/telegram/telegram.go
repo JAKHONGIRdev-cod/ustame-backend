@@ -144,6 +144,16 @@ func (c *Client) SendMessageMarkup(ctx context.Context, chatID int64, text strin
 	return c.call(ctx, "sendMessage", params, nil)
 }
 
+// SendPhotoMarkup — rasm (URL bo'yicha, Telegram o'zi yuklab oladi), izoh va klaviatura bilan (2026-11-17: raqam
+// yuborish ko'rsatmasi).
+func (c *Client) SendPhotoMarkup(ctx context.Context, chatID int64, photoURL, caption string, markup any) error {
+	params := map[string]any{"chat_id": chatID, "photo": photoURL, "caption": caption}
+	if markup != nil {
+		params["reply_markup"] = markup
+	}
+	return c.call(ctx, "sendPhoto", params, nil)
+}
+
 // BotTexts — botning profil matnlari: description — bo'sh chatda «START» tugmasi ustida ko'rinadi,
 // short — bot profilida va ulashilganda.
 type BotTexts struct {
