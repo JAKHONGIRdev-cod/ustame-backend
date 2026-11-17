@@ -32,7 +32,7 @@ func (e *APIError) Error() string {
 type Update struct {
 	UpdateID   int64       `json:"update_id"`
 	Message    *Message    `json:"message"`
-	PollAnswer *PollAnswer `json:"poll_answer"` // so'rovnomadagi ovoz (faqat nomi oshkor poll'lar)
+	PollAnswer *PollAnswer `json:"poll_answer"` // eski so'rovnoma ovozi — e'tiborsiz qoldiriladi (worker.handleUpdate)
 }
 
 // PollAnswer — foydalanuvchi poll'da variant tanladi (OptionIDs bo'sh — ovozini qaytarib oldi).
@@ -126,7 +126,7 @@ func (c *Client) GetMe(ctx context.Context) (*User, error) {
 func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout int) ([]Update, error) {
 	var ups []Update
 	err := c.call(ctx, "getUpdates", map[string]any{
-		"offset": offset, "timeout": timeout, "allowed_updates": []string{"message", "poll_answer"},
+		"offset": offset, "timeout": timeout, "allowed_updates": []string{"message"},
 	}, &ups)
 	return ups, err
 }
@@ -187,22 +187,4 @@ func (c *Client) EnsureTexts(ctx context.Context, t BotTexts) error {
 			map[string]any{"short_description": t.Short, "language_code": t.Lang}, nil)
 	}
 	return nil
-}
-
-// SendPoll — nomi oshkor (is_anonymous: false) so'rovnoma: javoblar poll_answer bilan keladi. Poll id qaytaradi.
-func (c *Client) SendPoll(ctx context.Context, chatID int64, question string, options []string, multi bool) (string, error) {
-	opts := make([]map[string]string, len(options))
-	for i, o := range options {
-		opts[i] = map[string]string{"text": o}
-	}
-	var msg struct {
-		Poll struct {
-			ID string `json:"id"`
-		} `json:"poll"`
-	}
-	err := c.call(ctx, "sendPoll", map[string]any{
-		"chat_id": chatID, "question": question, "options": opts,
-		"is_anonymous": false, "allows_multiple_answers": multi,
-	}, &msg)
-	return msg.Poll.ID, err
 }

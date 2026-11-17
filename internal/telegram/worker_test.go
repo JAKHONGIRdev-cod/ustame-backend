@@ -79,7 +79,6 @@ type fakeStore struct {
 	issued      map[string][]string // raqam -> bot bergan kod xeshlari
 	codeLimited bool                // IssueLoginCode limitga yetgan
 
-	survey *surveyFake // so'rovnoma (survey_test.go)
 }
 
 func (s *fakeStore) IssueLoginCode(_ context.Context, phone, hash string) (bool, error) {
@@ -292,5 +291,14 @@ func TestErrorsDoNotLeakToken(t *testing.T) {
 	err := c.SendMessage(context.Background(), 1, "x")
 	if err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("xato matnida token bo'lmasligi kerak: %v", err)
+	}
+}
+
+// So'rovnoma yopilgan (2026-11-17): eski poll'larga kelgan ovoz jim e'tiborsiz qoldiriladi — xabar ham, xato ham yo'q
+func TestOldPollAnswerIgnored(t *testing.T) {
+	w, tg, _ := newTest(t)
+	w.handleUpdate(context.Background(), Update{PollAnswer: &PollAnswer{PollID: "eski-poll", OptionIDs: []int{0}}})
+	if len(tg.sent) != 0 {
+		t.Fatalf("eski poll ovoziga javob ketmasligi kerak: %v", tg.sent)
 	}
 }

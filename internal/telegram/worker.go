@@ -43,15 +43,6 @@ type Store interface {
 	// false — shu raqamga oxirgi soatda juda ko'p kod berilgan.
 	IssueLoginCode(ctx context.Context, phone, codeHash string) (bool, error)
 
-	// So'rovnoma (survey.go). SurveyLang — users.lang (bo'lmasa "uz"); start — bu raqamga so'rovnoma hali
-	// yuborilmagan va ilovada ham javob berilmagan.
-	SurveyLang(ctx context.Context, phone, survey string) (lang string, start bool, err error)
-	SaveSurveyQuestion(ctx context.Context, ref SurveyRef) error
-	SurveyPoll(ctx context.Context, pollID string) (SurveyRef, bool, error)
-	// PendingSurveyText — shu chat'da javob kutilayotgan ochiq savol (oxirgi kun ichida)
-	PendingSurveyText(ctx context.Context, chatID int64) (SurveyRef, bool, error)
-	// SaveSurveyAnswer — javobni survey_responses ga qo'shadi; first — bu savolga birinchi javob
-	SaveSurveyAnswer(ctx context.Context, ref SurveyRef, value any) (first bool, err error)
 	// ClaimNotifications — yuborilmagan xabarlarni "yuborildi" deb belgilab oladi
 	// (ikki nusxa bir vaqtda ishlasa ham bir xabar ikki marta ketmasin).
 	ClaimNotifications(ctx context.Context, limit int) ([]Notification, error)
@@ -77,8 +68,6 @@ type Worker struct {
 	OTPSecret []byte
 	// SiteURL — saytga qaytish tugmasi uchun (standart https://ustame.com)
 	SiteURL string
-	// SurveyAfterLogin — Telegram orqali kirgandan shuncha vaqt keyin ustalar so'rovnomasi yuboriladi (0 — o'chiq)
-	SurveyAfterLogin time.Duration
 
 	// loginLang — kirish havolasidan kelgan til (chat_id → "uzc"): ilovada kirill tanlangan bo'lsa,
 	// kirish oqimidagi javoblar (kontakt yuborilgandan keyingisi ham) kirillda.
@@ -296,8 +285,9 @@ func (w *Worker) pollUpdates(ctx context.Context) {
 }
 
 func (w *Worker) handleUpdate(ctx context.Context, u Update) {
+	// Ustalar so'rovnomasi (pros_v1) 2026-11-17 da yopildi: eski poll'larga kelgan ovozlar jim e'tiborsiz qoldiriladi.
+	// Javoblar bazada (survey_responses, telegram_survey_polls) saqlanib qoladi.
 	if u.PollAnswer != nil {
-		w.handlePollAnswer(ctx, u.PollAnswer)
 		return
 	}
 	m := u.Message
@@ -305,10 +295,6 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		return
 	}
 	chatID := m.Chat.ID
-	// So'rovnomaning ochiq savoliga javob (oddiy matn, buyruq emas)
-	if m.Chat.Type == "private" && m.Contact == nil && w.SurveyAfterLogin > 0 && w.surveyTextReply(ctx, chatID, m.Text) {
-		return
-	}
 	if m.Contact != nil {
 		w.pendingAsk.Delete(chatID)
 		if reply, markup := w.contactReply(ctx, m); reply != "" {
@@ -498,9 +484,6 @@ func (w *Worker) issueCode(ctx context.Context, phone string) (code string, limi
 // codeReply — kirish kodi xabari (saytdan kelganga — bir bosishda kirish tugmasi bilan) yoki limit/xato matni
 func (w *Worker) codeReply(ctx context.Context, chatID int64, phone string) (string, any) {
 	code, limited := w.issueCode(ctx, phone)
-	if code != "" {
-		w.scheduleSurvey(ctx, chatID, phone)
-	}
 	switch {
 	case code != "" && w.fromApp(chatID):
 		return fmt.Sprintf(msgLoginCode, code), removeKeyboard
@@ -556,7 +539,6 @@ func (w *Worker) loginReply(ctx context.Context, chatID int64) (string, any) {
 			log.Printf("telegram: kirishni tasdiqlashda xato: %v", err)
 		}
 		if ok {
-			w.scheduleSurvey(ctx, chatID, phone)
 			code, _ := w.issueCode(ctx, phone)
 			switch {
 			case code != "" && w.fromApp(chatID):
@@ -593,7 +575,6 @@ func (w *Worker) contactReply(ctx context.Context, m *Message) (string, any) {
 		return w.codeReply(ctx, m.Chat.ID, phone)
 	}
 	// Tasdiqlandi: kutayotgan oyna o'zi kiradi. Zaxira kod ham — u oyna yopilib qolgan bo'lsa ham kiradi
-	w.scheduleSurvey(ctx, m.Chat.ID, phone)
 	code, _ := w.issueCode(ctx, phone)
 	switch {
 	case code != "" && w.fromApp(m.Chat.ID):

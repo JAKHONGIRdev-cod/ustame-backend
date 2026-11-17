@@ -77,8 +77,6 @@ func main() {
 			Wake:  outbox.Subscribe(),
 			// Bot kirish kodini ham bera oladi (havola ishlamasa): /api/auth/verify shu kalit bilan tekshiradi
 			OTPSecret: cfg.OTPSecret,
-			// Telegram orqali kirgandan 30 s keyin ustalar so'rovnomasi (poll'lar) — avval kirish tugasin
-			SurveyAfterLogin: 30 * time.Second,
 			// Raqam so'ralganda: «Raqamni yuborish» tugmasi qayerda va «OK» — rasmli ko'rsatma (saytdagi fayl)
 			HelpPhotoURL: "https://ustame.com/tg-help/raqam-yuborish.png",
 		}
