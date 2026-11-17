@@ -24,18 +24,27 @@ type availability struct {
 // get: eslab qolingan javob eskirmagan bo'lsa — o'sha, aks holda fetch() bilan yangilaydi.
 // fetch xato bersa, SMS'ni to'smaymiz (Eskiz vaqtincha javob bermasa ham kirish ishlayversin).
 func (a *availability) get(now time.Time, fetch func() (bool, error)) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.checked.IsZero() && now.Sub(a.checked) < roleCacheTTL {
-		return a.ok
-	}
-	ok, err := fetch()
+	ok, err := a.lookup(now, fetch)
 	if err != nil {
 		log.Printf("eskiz: hisob holatini tekshirib bo'lmadi: %v", err)
 		return true
 	}
-	a.ok, a.checked = ok, now
 	return ok
+}
+
+// lookup — eslab qolingan javob yoki fetch() natijasi; xato eslab qolinmaydi (keyingi so'rov qayta tekshiradi).
+func (a *availability) lookup(now time.Time, fetch func() (bool, error)) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.checked.IsZero() && now.Sub(a.checked) < roleCacheTTL {
+		return a.ok, nil
+	}
+	ok, err := fetch()
+	if err != nil {
+		return false, err
+	}
+	a.ok, a.checked = ok, now
+	return ok, nil
 }
 
 // CanSendOTP — foydalanuvchiga kodli SMS haqiqatan yetib boradimi. Test rejimida (TestMode) yoki
@@ -52,6 +61,28 @@ func (c *Client) CanSendOTP(ctx context.Context) bool {
 		}
 		return role != "test", nil
 	})
+}
+
+// OTPReady — kirish sahifasi uchun: «SMS kod bilan kirish» ko'rsatilsinmi. CanSendOTP'dan farqi: Eskiz javob
+// bermasa yoki xato bo'lsa — false (ishlamaydigan tugma ko'rsatilmaydi) va 5 soniyadan ortiq kutilmaydi.
+func (c *Client) OTPReady(ctx context.Context) bool {
+	if c.TestMode {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ok, err := c.avail.lookup(time.Now(), func() (bool, error) {
+		role, err := c.accountRole(ctx)
+		if err != nil {
+			return false, err
+		}
+		return role != "test", nil
+	})
+	if err != nil {
+		log.Printf("eskiz: SMS holati noma'lum (kirish sahifasida SMS ko'rsatilmaydi): %v", err)
+		return false
+	}
+	return ok
 }
 
 func (c *Client) accountRole(ctx context.Context) (string, error) {

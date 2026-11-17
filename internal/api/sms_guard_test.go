@@ -1,9 +1,24 @@
 package api
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/eskiz"
 )
+
+// Eskiz test rejimida kirish sahifasi SMS'ni ko'rsatmaydi
+func TestAuthMethodsHidesSMSInTestMode(t *testing.T) {
+	s := &Server{sms: &eskiz.Client{TestMode: true}}
+	rec := httptest.NewRecorder()
+	s.authMethods(rec, httptest.NewRequest(http.MethodGet, "/api/auth/methods", nil))
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != `{"sms":false}` {
+		t.Fatalf("javob: %d %s", rec.Code, rec.Body.String())
+	}
+}
 
 func TestSMSLimiterUsesOwnMax(t *testing.T) {
 	l := hourLimiter{max: smsPerIPPerHour}

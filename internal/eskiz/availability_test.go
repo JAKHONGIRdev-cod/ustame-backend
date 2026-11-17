@@ -1,6 +1,7 @@
 package eskiz
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -47,6 +48,25 @@ func TestAvailabilityErrorDoesNotBlock(t *testing.T) {
 	}
 	if !a.checked.IsZero() {
 		t.Fatal("xato javob eslab qolinmasligi kerak")
+	}
+}
+
+// Kirish sahifasi uchun: xato bo'lsa SMS ko'rsatilmaydi va xato eslab qolinmaydi
+func TestAvailabilityLookupStrict(t *testing.T) {
+	var a availability
+	now := time.Now()
+	if ok, err := a.lookup(now, func() (bool, error) { return true, errors.New("tarmoq") }); ok || err == nil {
+		t.Fatalf("xatoda false va xato kerak: %v %v", ok, err)
+	}
+	if ok, err := a.lookup(now, func() (bool, error) { return true, nil }); !ok || err != nil {
+		t.Fatalf("xatodan keyin qayta tekshirilishi kerak: %v %v", ok, err)
+	}
+}
+
+func TestOTPReadyTestMode(t *testing.T) {
+	c := &Client{TestMode: true}
+	if c.OTPReady(context.Background()) {
+		t.Fatal("test rejimida SMS ko'rsatilmasligi kerak")
 	}
 }
 

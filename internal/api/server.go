@@ -67,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
+	mux.HandleFunc("GET /api/auth/methods", s.authMethods)
 	mux.HandleFunc("POST /api/auth/send-code", s.sendCode)
 	mux.HandleFunc("POST /api/auth/verify", s.verify)
 	mux.HandleFunc("POST /api/auth/telegram/start", s.telegramStart)

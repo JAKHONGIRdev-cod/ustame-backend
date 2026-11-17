@@ -35,6 +35,13 @@ func randomCode() (string, error) {
 	return fmt.Sprint(100000 + n.Int64()), nil
 }
 
+// GET /api/auth/methods -> { sms }: kirish sahifasi «SMS kod bilan kirish»ni shunga qarab ko'rsatadi. Eskiz test
+// rejimidan chiqqan (shablon tasdiqlangan) zahoti ilova va saytda yangi build'siz ochiladi.
+func (s *Server) authMethods(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=60")
+	writeJSON(w, http.StatusOK, map[string]bool{"sms": s.sms.OTPReady(r.Context())})
+}
+
 // POST /api/auth/send-code  { phone }
 func (s *Server) sendCode(w http.ResponseWriter, r *http.Request) {
 	var body struct {
