@@ -280,10 +280,14 @@ create table if not exists public.provider_contacts (
   id                 bigint generated always as identity primary key,
   client_id          uuid not null references public.users (id) on delete cascade,
   provider_id        uuid not null references public.users (id) on delete cascade,
-  kind               text not null check (kind in ('call', 'map')),
+  kind               text not null check (kind in ('call', 'map', 'message')),
   created_at         timestamptz not null default now(),
   review_reminded_at timestamptz
 );
+-- 2026-11-17: 'message' — mijoz ustaga (yoki brigada boshlig'iga) Telegram'da yozdi
+alter table public.provider_contacts drop constraint if exists provider_contacts_kind_check;
+alter table public.provider_contacts add constraint provider_contacts_kind_check
+  check (kind in ('call', 'map', 'message'));
 create index if not exists provider_contacts_provider_idx on public.provider_contacts (provider_id, created_at desc);
 create index if not exists provider_contacts_pair_idx on public.provider_contacts (client_id, provider_id);
 alter table public.provider_contacts enable row level security;
@@ -3910,16 +3914,25 @@ $$;
 create or replace function public.get_team(p_team_id uuid)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
 declare
-  v_uid uuid := require_uid();
+  -- 2026-11-17: mehmon (kirmagan) ham ko'radi — katalogdan bosilganda sahifa ochilmay qolardi
+  v_uid uuid := auth.uid();
   v_team teams;
 begin
   select * into v_team from teams where id = p_team_id;
-  if not found or (v_team.status <> 'approved' and v_team.owner_id <> v_uid) then raise exception 'NOT_FOUND'; end if;
+  if not found or (v_team.status <> 'approved' and v_team.owner_id is distinct from v_uid) then
+    raise exception 'NOT_FOUND';
+  end if;
   return jsonb_build_object(
     'id', v_team.id, 'kind', v_team.kind, 'name', v_team.name, 'description', v_team.description,
     'size', v_team.size, 'categories', v_team.categories, 'districts', v_team.districts,
     'status', v_team.status, 'created_at', v_team.created_at,
     'owner', (select jsonb_build_object('id', p.id, 'full_name', p.full_name) from profiles p where p.id = v_team.owner_id),
+    -- Aloqa — brigada boshlig'i orqali (usta profilidagi qoida): telefon kirgan va bloklanmagan foydalanuvchiga,
+    -- ish joyi — boshliqning usta profilidagi joylashuvi
+    'phone', case when v_uid is not null and not _blocked(v_uid, v_team.owner_id)
+                  then (select u.phone from users u where u.id = v_team.owner_id) end,
+    'lat', (select pp.lat from provider_profiles pp where pp.user_id = v_team.owner_id),
+    'lng', (select pp.lng from provider_profiles pp where pp.user_id = v_team.owner_id),
     'members', _team_members_json(v_team.id, false),
     'stats', team_stats(v_team.id)
   );
@@ -4031,6 +4044,8 @@ grant execute on function public.team_stats(uuid), public.save_team(text, text, 
   public.search_teams(text, text, int, int), public.set_job_crew(uuid, boolean),
   public.admin_get_pending_teams(), public.admin_review_team(uuid, boolean, text)
 to authenticated;
+-- Brigada sahifasi mehmonga ham ochiq (telefon faqat kirganlarga — get_team ichida)
+grant execute on function public.get_team(uuid) to anon;
 
 
 -- ===== ilova ichidagi bildirishnomalar =====
@@ -7444,7 +7459,7 @@ returns void language plpgsql security definer set search_path = public as $$
 declare
   v_uid uuid := require_uid();
 begin
-  if p_kind is null or p_kind not in ('call', 'map') then raise exception 'INVALID_INPUT'; end if;
+  if p_kind is null or p_kind not in ('call', 'map', 'message') then raise exception 'INVALID_INPUT'; end if;
   if p_provider_id is null or p_provider_id = v_uid then return; end if;
   if not exists (select 1 from provider_profiles where user_id = p_provider_id and status = 'approved') then
     raise exception 'NOT_FOUND';
