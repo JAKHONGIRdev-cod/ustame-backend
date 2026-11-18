@@ -7464,6 +7464,10 @@ begin
   if not exists (select 1 from provider_profiles where user_id = p_provider_id and status = 'approved') then
     raise exception 'NOT_FOUND';
   end if;
+  -- 2026-11-18: admin analitikasi (call_click) — o'z takror qoidasi bilan (30 daqiqa), pastdagi 10 daqiqalikdan oldin
+  if p_kind = 'call' then
+    perform _log_provider_event(p_provider_id, 'call_click', v_uid, null);
+  end if;
   if exists (select 1 from provider_contacts
               where client_id = v_uid and provider_id = p_provider_id and kind = p_kind
                 and created_at > now() - interval '10 minutes') then
@@ -7711,3 +7715,242 @@ $$;
 revoke execute on function public._is_quiet_now() from public, anon, authenticated;
 revoke execute on function public.admin_send_test_push(), public.admin_push_health() from public, anon;
 grant execute on function public.admin_send_test_push(), public.admin_push_health() to authenticated;
+
+-- ===== 2026-11-18: usta profili analitikasi — ko'rish, telefon ko'rsatilishi, qo'ng'iroq tugmasi =====
+-- Maqsad: qaysi ustalarga talab ko'p ekanini bilish. Hodisalar:
+--   profile_view — usta profili ochildi (mehmon ham sanaladi: ilova o'zi yaratgan tasodifiy qurilma kaliti bilan);
+--   phone_reveal — profil ochilganda telefon raqami haqiqatan ko'rsatildi (kirgan, bloklanmagan foydalanuvchi).
+--                  Raqam avvalgidek to'g'ridan-to'g'ri ko'rinadi — alohida "raqamni ochish" tugmasi yo'q, shuning
+--                  uchun server raqamni ko'rsatgan paytni yozadi;
+--   call_click   — "Qo'ng'iroq qilish" bosildi (log_provider_contact 'call'). Bu qo'ng'iroq bo'lganini anglatmaydi.
+-- Takrorlar: bitta tashrifchi (foydalanuvchi yoki qurilma) bitta usta bo'yicha bitta hodisani 30 daqiqada bir marta
+-- yozadi. O'zini ko'rish va adminlar sanalmaydi. Mehmonlardan bitta ustaga 10 daqiqada 60 tadan ortiq yozilmaydi
+-- (soxta kalitlar bilan shishirishga to'siq; IP cheklovi Go serverda).
+-- Admin statistikasi kunlik yig'ma jadvaldan (provider_event_daily) o'qiladi — xom jadval katta bo'lsa ham tez.
+
+create table if not exists public.provider_events (
+  id          bigint generated always as identity primary key,
+  provider_id uuid not null references public.users (id) on delete cascade,
+  event_type  text not null check (event_type in ('profile_view', 'phone_reveal', 'call_click')),
+  viewer_id   uuid references public.users (id) on delete set null,
+  visitor     text not null check (char_length(visitor) between 3 and 80),
+  source      text check (source ~ '^[a-z_]{1,20}$'),
+  job_id      uuid references public.jobs (id) on delete set null,
+  created_at  timestamptz not null default now()
+);
+create index if not exists provider_events_dedup_idx
+  on public.provider_events (provider_id, visitor, event_type, created_at desc);
+create index if not exists provider_events_provider_idx on public.provider_events (provider_id, created_at desc);
+create index if not exists provider_events_created_idx on public.provider_events (created_at);
+alter table public.provider_events enable row level security;
+
+create table if not exists public.provider_event_daily (
+  provider_id   uuid not null references public.users (id) on delete cascade,
+  day           date not null,
+  views         int not null default 0,
+  phone_reveals int not null default 0,
+  call_clicks   int not null default 0,
+  primary key (provider_id, day)
+);
+create index if not exists provider_event_daily_day_idx on public.provider_event_daily (day);
+alter table public.provider_event_daily enable row level security;
+revoke all on public.provider_events, public.provider_event_daily from public, anon, authenticated;
+
+-- Ichki: bitta hodisani yozadi (takror bo'lsa yozmaydi). true — yozildi.
+create or replace function public._log_provider_event(p_provider_id uuid, p_event text, p_viewer uuid,
+                                                     p_anon_id text, p_source text default null,
+                                                     p_job_id uuid default null)
+returns boolean language plpgsql security definer set search_path = public as $$
+declare
+  v_visitor text;
+  v_day     date := (now() at time zone 'Asia/Tashkent')::date;
+begin
+  if p_provider_id is null or p_event not in ('profile_view', 'phone_reveal', 'call_click') then return false; end if;
+  if p_viewer is not null then
+    if p_viewer = p_provider_id or coalesce((select is_admin from users where id = p_viewer), false) then
+      return false;
+    end if;
+    v_visitor := 'u:' || p_viewer::text;
+  elsif p_anon_id ~ '^[A-Za-z0-9_-]{16,64}$' then
+    v_visitor := 'a:' || p_anon_id;
+    if (select count(*) from provider_events
+         where provider_id = p_provider_id and viewer_id is null
+           and created_at > now() - interval '10 minutes') >= 60 then
+      return false;
+    end if;
+  else
+    return false;
+  end if;
+  if exists (select 1 from provider_events
+              where provider_id = p_provider_id and visitor = v_visitor and event_type = p_event
+                and created_at > now() - interval '30 minutes') then
+    return false;
+  end if;
+
+  insert into provider_events (provider_id, event_type, viewer_id, visitor, source, job_id)
+  values (p_provider_id, p_event, p_viewer, v_visitor,
+          case when p_source ~ '^[a-z_]{1,20}$' then p_source end,
+          case when p_job_id is not null and exists (select 1 from jobs where id = p_job_id) then p_job_id end);
+
+  insert into provider_event_daily (provider_id, day, views, phone_reveals, call_clicks)
+  values (p_provider_id, v_day,
+          (p_event = 'profile_view')::int, (p_event = 'phone_reveal')::int, (p_event = 'call_click')::int)
+  on conflict (provider_id, day) do update set
+    views         = provider_event_daily.views + excluded.views,
+    phone_reveals = provider_event_daily.phone_reveals + excluded.phone_reveals,
+    call_clicks   = provider_event_daily.call_clicks + excluded.call_clicks;
+  return true;
+end;
+$$;
+
+-- Usta profili ochildi (provider/[id].tsx, fon rejimida). Mehmon ham chaqiradi (p_anon_id — qurilma kaliti).
+-- Kirgan foydalanuvchiga raqam ko'rsatilgan bo'lsa (get_provider_profile bilan bir xil shart), phone_reveal ham yoziladi.
+-- Hech qachon xato qaytarmaydi (noma'lum usta, noto'g'ri manba — jim o'tkazib yuboriladi): ekran unga bog'liq emas.
+create or replace function public.log_provider_view(p_provider_id uuid, p_source text default null,
+                                                   p_job_id uuid default null, p_anon_id text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if p_provider_id is null
+     or not exists (select 1 from provider_profiles where user_id = p_provider_id and status = 'approved') then
+    return;
+  end if;
+  perform _log_provider_event(p_provider_id, 'profile_view', v_uid, p_anon_id, p_source, p_job_id);
+  if v_uid is not null and not _blocked(v_uid, p_provider_id)
+     and exists (select 1 from users where id = p_provider_id and phone is not null) then
+    perform _log_provider_event(p_provider_id, 'phone_reveal', v_uid, null, p_source, p_job_id);
+  end if;
+end;
+$$;
+
+-- Sana oralig'i (Toshkent sanasi, ikkala chegara kiradi; ko'pi bilan 366 kun). Bo'sh bo'lsa — oxirgi 30 kun.
+create or replace function public._analytics_range(p_from date, p_to date, out d_from date, out d_to date)
+language plpgsql stable as $$
+begin
+  d_to   := coalesce(p_to, (now() at time zone 'Asia/Tashkent')::date);
+  d_from := coalesce(p_from, d_to - 29);
+  if d_from > d_to or d_to - d_from > 365 then raise exception 'INVALID_INPUT'; end if;
+end;
+$$;
+
+-- Admin: umumiy dashboard — jami, konversiyalar, kun/hafta/oy bo'yicha qatorlar, uchta TOP 10 va har bir usta.
+create or replace function public.admin_get_provider_analytics(p_from date default null, p_to date default null,
+                                                              p_bucket text default 'day')
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  r   record;
+  v   jsonb;
+begin
+  perform require_admin();
+  if coalesce(p_bucket, 'day') not in ('day', 'week', 'month') then raise exception 'INVALID_INPUT'; end if;
+  select * into r from _analytics_range(p_from, p_to);
+
+  with d as (
+    select * from provider_event_daily where day between r.d_from and r.d_to
+  ), per as (
+    select provider_id, sum(views)::int views, sum(phone_reveals)::int reveals, sum(call_clicks)::int calls
+    from d group by provider_id
+  ), named as (
+    select per.*, u.full_name, pp.categories
+    from per join users u on u.id = per.provider_id
+    left join provider_profiles pp on pp.user_id = per.provider_id
+  ), tot as (
+    select coalesce(sum(views), 0)::int views, coalesce(sum(phone_reveals), 0)::int reveals,
+           coalesce(sum(call_clicks), 0)::int calls
+    from d
+  ), series as (
+    select date_trunc(coalesce(p_bucket, 'day'), day::timestamp)::date as period,
+           sum(views)::int views, sum(phone_reveals)::int reveals, sum(call_clicks)::int calls
+    from d group by 1
+  )
+  select jsonb_build_object(
+    'from', r.d_from, 'to', r.d_to, 'bucket', coalesce(p_bucket, 'day'),
+    'totals', (select jsonb_build_object(
+                 'views', t.views, 'phone_reveals', t.reveals, 'call_clicks', t.calls,
+                 'view_to_reveal', case when t.views > 0 then round(100.0 * t.reveals / t.views, 1) end,
+                 'reveal_to_call', case when t.reveals > 0 then round(100.0 * t.calls / t.reveals, 1) end,
+                 'providers', (select count(*) from per))
+               from tot t),
+    'series', coalesce((select jsonb_agg(jsonb_build_object('period', s.period, 'views', s.views,
+                                 'phone_reveals', s.reveals, 'call_clicks', s.calls) order by s.period)
+                        from series s), '[]'::jsonb),
+    'top_views',   coalesce((select jsonb_agg(jsonb_build_object('id', x.provider_id, 'full_name', x.full_name,
+                                   'value', x.views) order by x.views desc, x.full_name)
+                             from (select * from named where views > 0 order by views desc, full_name limit 10) x),
+                            '[]'::jsonb),
+    'top_reveals', coalesce((select jsonb_agg(jsonb_build_object('id', x.provider_id, 'full_name', x.full_name,
+                                   'value', x.reveals) order by x.reveals desc, x.full_name)
+                             from (select * from named where reveals > 0 order by reveals desc, full_name limit 10) x),
+                            '[]'::jsonb),
+    'top_calls',   coalesce((select jsonb_agg(jsonb_build_object('id', x.provider_id, 'full_name', x.full_name,
+                                   'value', x.calls) order by x.calls desc, x.full_name)
+                             from (select * from named where calls > 0 order by calls desc, full_name limit 10) x),
+                            '[]'::jsonb),
+    'providers', coalesce((select jsonb_agg(jsonb_build_object(
+                     'id', x.provider_id, 'full_name', x.full_name, 'categories', coalesce(x.categories, '{}'),
+                     'views', x.views, 'phone_reveals', x.reveals, 'call_clicks', x.calls,
+                     'view_to_reveal', case when x.views > 0 then round(100.0 * x.reveals / x.views, 1) end,
+                     'reveal_to_call', case when x.reveals > 0 then round(100.0 * x.calls / x.reveals, 1) end)
+                   order by x.views desc, x.calls desc, x.full_name)
+                 from (select * from named order by views desc, calls desc, full_name limit 300) x), '[]'::jsonb)
+  ) into v;
+  return v;
+end;
+$$;
+
+-- Admin: bitta usta — jami, konversiyalar, noyob tashrifchilar, profil qayerdan ochilgani, kunlik qator
+create or replace function public.admin_get_provider_event_stats(p_provider_id uuid, p_from date default null,
+                                                                p_to date default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  r      record;
+  v_from timestamptz;
+  v_to   timestamptz;
+  v      jsonb;
+begin
+  perform require_admin();
+  select * into r from _analytics_range(p_from, p_to);
+  if not exists (select 1 from users where id = p_provider_id) then raise exception 'NOT_FOUND'; end if;
+  v_from := r.d_from::timestamp at time zone 'Asia/Tashkent';
+  v_to   := (r.d_to + 1)::timestamp at time zone 'Asia/Tashkent';
+
+  with d as (
+    select * from provider_event_daily where provider_id = p_provider_id and day between r.d_from and r.d_to
+  ), t as (
+    select coalesce(sum(views), 0)::int views, coalesce(sum(phone_reveals), 0)::int reveals,
+           coalesce(sum(call_clicks), 0)::int calls from d
+  ), e as (
+    select * from provider_events
+    where provider_id = p_provider_id and created_at >= v_from and created_at < v_to
+  )
+  select jsonb_build_object(
+    'id', p_provider_id,
+    'full_name', (select full_name from users where id = p_provider_id),
+    'from', r.d_from, 'to', r.d_to,
+    'views', t.views, 'phone_reveals', t.reveals, 'call_clicks', t.calls,
+    'view_to_reveal', case when t.views > 0 then round(100.0 * t.reveals / t.views, 1) end,
+    'reveal_to_call', case when t.reveals > 0 then round(100.0 * t.calls / t.reveals, 1) end,
+    'unique_viewers', (select count(distinct visitor) from e where event_type = 'profile_view'),
+    'guest_views',    (select count(*) from e where event_type = 'profile_view' and viewer_id is null),
+    'sources', coalesce((select jsonb_agg(jsonb_build_object('source', s.source, 'views', s.n) order by s.n desc)
+                         from (select coalesce(source, 'other') source, count(*)::int n from e
+                               where event_type = 'profile_view' group by 1) s), '[]'::jsonb),
+    'series', coalesce((select jsonb_agg(jsonb_build_object('period', day, 'views', views,
+                                 'phone_reveals', phone_reveals, 'call_clicks', call_clicks) order by day)
+                        from d), '[]'::jsonb)
+  ) into v
+  from t;
+  return v;
+end;
+$$;
+
+revoke execute on function
+  public._log_provider_event(uuid, text, uuid, text, text, uuid), public._analytics_range(date, date),
+  public.log_provider_view(uuid, text, uuid, text),
+  public.admin_get_provider_analytics(date, date, text), public.admin_get_provider_event_stats(uuid, date, date)
+from public, anon, authenticated;
+grant execute on function public.log_provider_view(uuid, text, uuid, text) to anon, authenticated;
+grant execute on function
+  public.admin_get_provider_analytics(date, date, text), public.admin_get_provider_event_stats(uuid, date, date)
+to authenticated;
