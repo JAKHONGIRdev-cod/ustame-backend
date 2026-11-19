@@ -7711,3 +7711,136 @@ $$;
 revoke execute on function public._is_quiet_now() from public, anon, authenticated;
 revoke execute on function public.admin_send_test_push(), public.admin_push_health() from public, anon;
 grant execute on function public.admin_send_test_push(), public.admin_push_health() to authenticated;
+
+-- ===== KPI nazorat ro'yxati (2026-11-19) =====
+-- Admin → KPI: 12 ko'rsatkich (jami va so'nggi 30 kun). Mavjud jadvallardan hisoblanadi; quyidagi ikki jadval yangi
+-- kuzatuv uchun (shu sanadan boshlab yig'iladi):
+--   user_activity_days — foydalanuvchi ilovani ochgan kunlar (MAU uchun; ilova har ochilishda track_activity());
+--   kpi_events         — usta profili ko'rilishi va telefon raqami ochilishi (ilova track_event() ni chaqiradi).
+create table if not exists public.user_activity_days (
+  user_id uuid not null references public.users (id) on delete cascade,
+  day     date not null,
+  primary key (user_id, day)
+);
+create index if not exists user_activity_days_day_idx on public.user_activity_days (day);
+alter table public.user_activity_days enable row level security;
+
+create table if not exists public.kpi_events (
+  id         bigint generated always as identity primary key,
+  kind       text not null check (kind in ('profile_view', 'phone_view')),
+  user_id    uuid references public.users (id) on delete set null,
+  target_id  uuid not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists kpi_events_kind_idx on public.kpi_events (kind, created_at);
+create index if not exists kpi_events_dedupe_idx on public.kpi_events (user_id, kind, target_id, created_at desc);
+alter table public.kpi_events enable row level security;
+
+-- Ilova ochildi: bugungi kun (Toshkent vaqti) belgilanadi, kuniga bitta qator
+create or replace function public.track_activity()
+returns void language sql security definer set search_path = public as $$
+  insert into user_activity_days (user_id, day)
+  values (require_uid(), (now() at time zone 'Asia/Tashkent')::date)
+  on conflict do nothing;
+$$;
+
+-- Usta profili ko'rildi / telefon raqami ochildi. O'z profili hisoblanmaydi; bitta odam bitta ustani
+-- 1 soat ichida qayta ochsa — bitta hodisa (ro'yxat yangilanishi ko'rsatkichni shishirmasin).
+create or replace function public.track_event(p_kind text, p_target uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_uid uuid := require_uid();
+begin
+  if p_kind not in ('profile_view', 'phone_view') or p_target is null then raise exception 'INVALID_INPUT'; end if;
+  if p_target = v_uid then return; end if;
+  if exists (select 1 from kpi_events
+              where user_id = v_uid and kind = p_kind and target_id = p_target
+                and created_at > now() - interval '1 hour') then
+    return;
+  end if;
+  insert into kpi_events (kind, user_id, target_id) values (p_kind, v_uid, p_target);
+end;
+$$;
+
+-- Admin: KPI. Har ko'rsatkich {total, d30}; ta'riflar:
+--   mijoz — hisobi o'chirilmagan, usta va do'kon profili yo'q foydalanuvchi; usta — usta profili bor (approved alohida);
+--   MAU — so'nggi 30 kunda ilovani ochgan YOKI amal qilgan (e'lon, taklif, xabar, qo'ng'iroq, profil ko'rish);
+--   bajarilgan ish — 'completed' shartnoma; takroriy mijoz — 2+ e'lon joylagan yoki 2+ turli ustaga qo'ng'iroq qilgan,
+--   foiz — kamida bitta e'lon/qo'ng'iroqli mijozlarga nisbatan; daromad — usta obunasi to'lovlari (so'm).
+create or replace function public.admin_get_kpi()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_since timestamptz := now() - interval '30 days';
+  v_day   date := ((now() - interval '30 days') at time zone 'Asia/Tashkent')::date;
+  v_active_clients int;
+  v_active_pros    int;
+  v_repeat  int;
+  v_buyers  int;
+begin
+  perform require_admin();
+
+  with active as (
+    select user_id from user_activity_days where day >= v_day
+    union select client_id from jobs where created_at >= v_since
+    union select provider_id from proposals where created_at >= v_since
+    union select sender_id from messages where created_at >= v_since
+    union select client_id from provider_contacts where created_at >= v_since
+    union select user_id from kpi_events where created_at >= v_since and user_id is not null
+  )
+  select count(*) filter (where pp.user_id is null and sp.user_id is null),
+         count(*) filter (where pp.user_id is not null)
+    into v_active_clients, v_active_pros
+    from active a
+    join users u on u.id = a.user_id and u.deleted_at is null
+    left join provider_profiles pp on pp.user_id = a.user_id
+    left join shop_profiles sp on sp.user_id = a.user_id;
+
+  with orders as (
+    select client_id, count(*) as n from jobs group by client_id
+    union all
+    select client_id, count(distinct provider_id) from provider_contacts where kind = 'call' group by client_id
+  ), per_client as (
+    select client_id, sum(n) as n from orders group by client_id
+  )
+  select count(*) filter (where n >= 2), count(*) into v_repeat, v_buyers from per_client;
+
+  return jsonb_build_object(
+    'clients', jsonb_build_object(
+      'total', (select count(*) from users u where u.deleted_at is null
+                 and not exists (select 1 from provider_profiles pp where pp.user_id = u.id)
+                 and not exists (select 1 from shop_profiles sp where sp.user_id = u.id)),
+      'd30',   (select count(*) from users u where u.deleted_at is null and u.created_at >= v_since
+                 and not exists (select 1 from provider_profiles pp where pp.user_id = u.id)
+                 and not exists (select 1 from shop_profiles sp where sp.user_id = u.id))),
+    'providers', jsonb_build_object(
+      'total',    (select count(*) from provider_profiles pp join users u on u.id = pp.user_id where u.deleted_at is null),
+      'approved', (select count(*) from provider_profiles pp join users u on u.id = pp.user_id
+                    where u.deleted_at is null and pp.status = 'approved'),
+      'd30',      (select count(*) from provider_profiles pp join users u on u.id = pp.user_id
+                    where u.deleted_at is null and pp.created_at >= v_since)),
+    'mau_clients',    jsonb_build_object('total', v_active_clients),
+    'mau_providers',  jsonb_build_object('total', v_active_pros),
+    'jobs',           jsonb_build_object('total', (select count(*) from jobs),
+                                         'd30',   (select count(*) from jobs where created_at >= v_since)),
+    'proposals',      jsonb_build_object('total', (select count(*) from proposals),
+                                         'd30',   (select count(*) from proposals where created_at >= v_since)),
+    'profile_views',  jsonb_build_object('total', (select count(*) from kpi_events where kind = 'profile_view'),
+                                         'd30',   (select count(*) from kpi_events where kind = 'profile_view' and created_at >= v_since)),
+    'phone_views',    jsonb_build_object('total', (select count(*) from kpi_events where kind = 'phone_view'),
+                                         'd30',   (select count(*) from kpi_events where kind = 'phone_view' and created_at >= v_since)),
+    'calls',          jsonb_build_object('total', (select count(*) from provider_contacts where kind = 'call'),
+                                         'd30',   (select count(*) from provider_contacts where kind = 'call' and created_at >= v_since)),
+    'completed_jobs', jsonb_build_object('total', (select count(*) from contracts where status = 'completed'),
+                                         'd30',   (select count(*) from contracts where status = 'completed' and completed_at >= v_since)),
+    'repeat_clients', jsonb_build_object('total', v_repeat, 'of', v_buyers,
+                                         'percent', case when v_buyers > 0 then round(v_repeat * 100.0 / v_buyers, 1) else 0 end),
+    'revenue',        jsonb_build_object('total', (select coalesce(sum(amount), 0) from subscription_payments),
+                                         'd30',   (select coalesce(sum(amount), 0) from subscription_payments where created_at >= v_since)),
+    'tracking_since', (select min(day) from user_activity_days)
+  );
+end;
+$$;
+
+revoke execute on function public.track_activity(), public.track_event(text, uuid), public.admin_get_kpi()
+  from public, anon;
+grant execute on function public.track_activity(), public.track_event(text, uuid), public.admin_get_kpi()
+  to authenticated;
