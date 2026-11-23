@@ -63,12 +63,19 @@ func main() {
 	// (API faolligi, 10 daqiqada ko'pi bilan bir marta) yoki zaxira sifatida 6 soatda bir marta
 	go jobs.AutoApprove(ctx, db, activity.Subscribe(), 10*time.Minute, 6*time.Hour, outbox.Notify)
 	// Telefonlarga push-bildirishnomalar (Expo) — Telegram botidan mustaqil
+	expo := &push.Client{AccessToken: cfg.ExpoAccessToken, HTTP: &http.Client{Timeout: 20 * time.Second}}
+	pushStore := &push.PgStore{DB: db}
+	// Push yuborilgach ~15 daqiqada Expo receipt'lari: telefonga yetdimi, o'lik tokenlar o'chiriladi (2026-11-23)
+	pushSent := make(chan struct{}, 1)
 	pusher := &push.Worker{
-		Expo:  &push.Client{AccessToken: cfg.ExpoAccessToken, HTTP: &http.Client{Timeout: 20 * time.Second}},
-		Store: &push.PgStore{DB: db},
+		Expo:  expo,
+		Store: pushStore,
 		Wake:  outbox.Subscribe(),
+		Sent:  pushSent,
 	}
 	go pusher.Run(ctx)
+	receipts := &push.ReceiptWorker{Expo: expo, Store: pushStore, Kick: pushSent}
+	go receipts.Run(ctx)
 
 	if cfg.TelegramBotToken != "" {
 		bot := &telegram.Worker{

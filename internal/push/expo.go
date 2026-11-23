@@ -11,11 +11,15 @@ import (
 	"net/http"
 )
 
-const defaultURL = "https://exp.host/--/api/v2/push/send"
+const (
+	defaultURL         = "https://exp.host/--/api/v2/push/send"
+	defaultReceiptsURL = "https://exp.host/--/api/v2/push/getReceipts"
+)
 
 // Client — Expo Push API'ning bizga kerakli qismi.
 type Client struct {
 	URL         string // bo'sh bo'lsa Expo'ning manzili (testlarda soxta server beriladi)
+	ReceiptsURL string // bo'sh bo'lsa Expo'ning getReceipts manzili
 	AccessToken string // ixtiyoriy: Expo'da "enhanced push security" yoqilgan bo'lsa
 	HTTP        *http.Client
 }
@@ -31,12 +35,23 @@ type ExpoMessage struct {
 	Priority  string            `json:"priority"`
 }
 
-// Ticket — Expo'ning har bir xabarga javobi (yuborilgan tartibda).
+// Ticket — Expo'ning har bir xabarga javobi (yuborilgan tartibda). Status "ok" bo'lsa ID beriladi —
+// telefonga yetganini keyin shu ID bo'yicha receipt'dan bilamiz (receipts.go).
 type Ticket struct {
 	Status  string `json:"status"` // "ok" | "error"
+	ID      string `json:"id"`
 	Message string `json:"message"`
 	Details struct {
 		Error string `json:"error"` // masalan "DeviceNotRegistered"
+	} `json:"details"`
+}
+
+// Receipt — Expo'ning ticket bo'yicha yakuniy javobi: telefon xizmatiga (FCM/APNs) yetdimi.
+type Receipt struct {
+	Status  string `json:"status"` // "ok" | "error"
+	Message string `json:"message"`
+	Details struct {
+		Error string `json:"error"` // DeviceNotRegistered, MessageTooBig, MessageRateExceeded, InvalidCredentials...
 	} `json:"details"`
 }
 
@@ -84,6 +99,46 @@ func (c *Client) Send(ctx context.Context, msgs []ExpoMessage) ([]Ticket, error)
 	}
 	if len(out.Data) != len(msgs) {
 		return nil, fmt.Errorf("expo push: %d ta xabarga %d ta javob keldi", len(msgs), len(out.Data))
+	}
+	return out.Data, nil
+}
+
+// GetReceipts — ticket id'lar bo'yicha receipt'lar (1000 tagacha). Javobda hali tayyor bo'lmagan id bo'lmaydi.
+func (c *Client) GetReceipts(ctx context.Context, ids []string) (map[string]Receipt, error) {
+	body, err := json.Marshal(map[string][]string{"ids": ids})
+	if err != nil {
+		return nil, err
+	}
+	url := c.ReceiptsURL
+	if url == "" {
+		url = defaultReceiptsURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if c.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	}
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if res.StatusCode != http.StatusOK {
+		return nil, &HTTPError{Status: res.StatusCode, Body: string(raw)}
+	}
+	var out struct {
+		Data map[string]Receipt `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("expo receipts javobi o'qilmadi: %w", err)
+	}
+	if out.Data == nil {
+		out.Data = map[string]Receipt{}
 	}
 	return out.Data, nil
 }

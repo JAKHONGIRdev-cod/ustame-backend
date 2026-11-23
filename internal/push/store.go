@@ -2,6 +2,7 @@ package push
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -76,4 +77,79 @@ func (s *PgStore) MarkFailed(ctx context.Context, reasons map[int64]string) erro
 func (s *PgStore) DeleteTokens(ctx context.Context, tokens []string) error {
 	_, err := s.DB.Exec(ctx, `delete from push_tokens where token = any($1)`, tokens)
 	return err
+}
+
+// SaveTickets — Expo qabul qilgan xabarlarning ticket id'lari (push_receipts, 2026-11-23).
+func (s *PgStore) SaveTickets(ctx context.Context, tickets []TicketRef) error {
+	ids := make([]string, len(tickets))
+	outbox := make([]int64, len(tickets))
+	tokens := make([]string, len(tickets))
+	for i, t := range tickets {
+		ids[i], outbox[i], tokens[i] = t.TicketID, t.OutboxID, t.Token
+	}
+	_, err := s.DB.Exec(ctx, `
+		insert into push_receipts (ticket_id, outbox_id, token)
+		select f.id, f.outbox, f.token from unnest($1::text[], $2::bigint[], $3::text[]) as f(id, outbox, token)
+		on conflict (ticket_id) do nothing`, ids, outbox, tokens)
+	return err
+}
+
+// PendingReceipts — tekshirilmagan va olderThan dan oldin yuborilgan ticket'lar (eng eskisi birinchi).
+func (s *PgStore) PendingReceipts(ctx context.Context, olderThan time.Duration, limit int) ([]TicketRef, error) {
+	rows, err := s.DB.Query(ctx, `
+		select ticket_id, coalesce(outbox_id, 0), token, created_at from push_receipts
+		where checked_at is null and created_at < now() - make_interval(secs => $1)
+		order by created_at limit $2`, olderThan.Seconds(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TicketRef
+	for rows.Next() {
+		var t TicketRef
+		if err := rows.Scan(&t.TicketID, &t.OutboxID, &t.Token, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// SaveReceipts — natijalar. Rad etilganlar sababi notification_outbox.push_error ga ham (bo'sh bo'lsa) yoziladi —
+// admin panel shu yerdan ko'radi. 7 kundan eski receipt'lar shu yerda tozalanadi (jadval o'smasin).
+func (s *PgStore) SaveReceipts(ctx context.Context, results []ReceiptResult) error {
+	ids := make([]string, len(results))
+	status := make([]string, len(results))
+	why := make([]string, len(results))
+	for i, r := range results {
+		ids[i], status[i], why[i] = r.TicketID, r.Status, r.Error
+	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		update push_receipts r set checked_at = now(), status = f.status, error = nullif(f.why, '')
+		from unnest($1::text[], $2::text[], $3::text[]) as f(id, status, why)
+		where r.ticket_id = f.id`, ids, status, why); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		update notification_outbox o set push_error = left('receipt: ' || r.error, 500)
+		from push_receipts r
+		where r.ticket_id = any($1) and r.status = 'error' and r.outbox_id = o.id and o.push_error is null`, ids); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `delete from push_receipts where created_at < now() - interval '7 days'`); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// HasPendingReceipts — hali tekshirilmagan ticket bormi.
+func (s *PgStore) HasPendingReceipts(ctx context.Context) (bool, error) {
+	var ok bool
+	err := s.DB.QueryRow(ctx, `select exists (select 1 from push_receipts where checked_at is null)`).Scan(&ok)
+	return ok, err
 }

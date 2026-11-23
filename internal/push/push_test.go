@@ -18,6 +18,7 @@ type fakeStore struct {
 	deleted  []string
 	claims   int
 	failed   map[int64]string
+	tickets  []TicketRef // SaveTickets (receipts_test.go)
 }
 
 // Claim — soddalashtirilgan: navbatdagi hamma qatorni oladi; claimed — alohida xabarlar (ID) soni.
@@ -63,6 +64,13 @@ func (f *fakeStore) MarkFailed(_ context.Context, reasons map[int64]string) erro
 
 func (f *fakeStore) DeleteTokens(_ context.Context, tokens []string) error {
 	f.deleted = append(f.deleted, tokens...)
+	return nil
+}
+
+func (f *fakeStore) SaveTickets(_ context.Context, tickets []TicketRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tickets = append(f.tickets, tickets...)
 	return nil
 }
 

@@ -33,6 +33,16 @@ type Store interface {
 	DeleteTokens(ctx context.Context, tokens []string) error
 	// MarkFailed — Expo rad etgan xabarlar sababi (notification_outbox.push_error; admin ko'radi).
 	MarkFailed(ctx context.Context, reasons map[int64]string) error
+	// SaveTickets — qabul qilingan xabarlarning ticket id'lari (push_receipts): yetkazilganini keyin tekshirish uchun.
+	SaveTickets(ctx context.Context, tickets []TicketRef) error
+}
+
+// TicketRef — Expo qabul qilgan bitta xabar (bitta telefon uchun) va uning ticket id'si.
+type TicketRef struct {
+	TicketID  string
+	OutboxID  int64
+	Token     string
+	CreatedAt time.Time // receipt tekshiruvida: qachon yuborilgan
 }
 
 type Sender interface {
@@ -49,6 +59,10 @@ type Worker struct {
 	IdlePoll   time.Duration // signalsiz zaxira tekshiruv oralig'i (standart 6 soat)
 	RetryDelay time.Duration // xatodan keyin kutish (standart 10 s)
 	MaxAge     time.Duration // shundan eski xabar telefonga yuborilmaydi (standart 6 soat)
+
+	// Sent — xabarlar Expo'ga topshirilgach signal (ReceiptWorker ~15 daqiqadan keyin receipt'larni tekshiradi).
+	// nil bo'lsa — signal yuborilmaydi. Kanal bufferli bo'lsin: signal kutib qolmaydi.
+	Sent chan<- struct{}
 }
 
 const (
@@ -156,9 +170,13 @@ func (w *Worker) send(ctx context.Context, part []Message) bool {
 	}
 
 	var gone []string
+	var accepted []TicketRef
 	failedWhy := map[int64]string{}
 	for i, t := range tickets {
 		if t.Status == "ok" {
+			if t.ID != "" {
+				accepted = append(accepted, TicketRef{TicketID: t.ID, OutboxID: part[i].ID, Token: part[i].Token})
+			}
 			continue
 		}
 		if t.Details.Error == "DeviceNotRegistered" {
@@ -181,6 +199,18 @@ func (w *Worker) send(ctx context.Context, part []Message) bool {
 	if len(gone) > 0 {
 		if err := w.Store.DeleteTokens(ctx, gone); err != nil {
 			log.Printf("push: eskirgan tokenlar o'chirilmadi: %v", err)
+		}
+	}
+	// Ticket'lar saqlansa — ReceiptWorker'ga signal: ~15 daqiqadan keyin yetkazilganini tekshiradi.
+	// Saqlanmasa — faqat log (xabar baribir yuborilgan, faqat yetkazilish statistikasi bo'lmaydi).
+	if len(accepted) > 0 {
+		if err := w.Store.SaveTickets(ctx, accepted); err != nil {
+			log.Printf("push: ticket'lar yozilmadi: %v", err)
+		} else if w.Sent != nil {
+			select {
+			case w.Sent <- struct{}{}:
+			default: // signal allaqachon kutmoqda
+			}
 		}
 	}
 	return false

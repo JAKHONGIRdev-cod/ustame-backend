@@ -7844,3 +7844,47 @@ revoke execute on function public.track_activity(), public.track_event(text, uui
   from public, anon;
 grant execute on function public.track_activity(), public.track_event(text, uuid), public.admin_get_kpi()
   to authenticated;
+
+-- ===== Push receipts (2026-11-23) =====
+-- Expo xabarni qabul qilgach "ticket" (id) beradi; telefonga haqiqatan yetganini ~15 daqiqadan keyin "receipt" aytadi
+-- (getReceipts). Backend (internal/push/receipts.go) ticket id'larni shu jadvalga yozadi, keyin tekshiradi:
+--   ok — yetkazildi; error — rad etildi (sababi `error` da, notification_outbox.push_error ga ham yoziladi;
+--   DeviceNotRegistered bo'lsa token o'chiriladi); unknown — 24 soatda receipt kelmadi. 7 kundan eskilari o'chiriladi.
+create table if not exists public.push_receipts (
+  ticket_id  text primary key,
+  outbox_id  bigint references public.notification_outbox (id) on delete cascade,
+  token      text not null,
+  created_at timestamptz not null default now(),
+  checked_at timestamptz,
+  status     text check (status in ('ok', 'error', 'unknown')),
+  error      text check (char_length(error) <= 500)
+);
+create index if not exists push_receipts_pending_idx on public.push_receipts (created_at) where checked_at is null;
+create index if not exists push_receipts_created_idx on public.push_receipts (created_at);
+alter table public.push_receipts enable row level security;
+
+-- Admin: push holati + so'nggi 24 soatda yuborilganlarning telefonga yetkazilishi (receipt bo'yicha, telefonlar soni)
+create or replace function public.admin_push_health()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform require_admin();
+  return jsonb_build_object(
+    'tokens',              (select count(*) from push_tokens),
+    'tokens_new_channels', (select count(*) from push_tokens where channels >= 1),
+    'sent_24h',            (select count(*) from notification_outbox where push_sent_at > now() - interval '24 hours'),
+    'errors_24h',          (select count(*) from notification_outbox
+                             where push_error is not null and push_sent_at > now() - interval '24 hours'),
+    'delivered_24h',       (select count(*) from push_receipts
+                             where status = 'ok' and created_at > now() - interval '24 hours'),
+    'failed_24h',          (select count(*) from push_receipts
+                             where status = 'error' and created_at > now() - interval '24 hours'),
+    'pending_24h',         (select count(*) from push_receipts
+                             where checked_at is null and created_at > now() - interval '24 hours'),
+    'last_error',          (select push_error from notification_outbox where push_error is not null order by id desc limit 1),
+    'last_error_at',       (select push_sent_at from notification_outbox where push_error is not null order by id desc limit 1)
+  );
+end;
+$$;
+
+revoke execute on function public.admin_push_health() from public, anon;
+grant execute on function public.admin_push_health() to authenticated;
