@@ -7390,7 +7390,7 @@ from public, anon, authenticated;
 grant execute on function public.get_my_shop_subscription(), public.admin_extend_shop_subscription(uuid, int)
 to authenticated;
 
--- ===== so'rovnomalar (ilova ichida) =====
+-- ===== so'rovnomalar (ilova ichida) — 2026-11-23 dan yopiq, javoblar saqlanadi =====
 -- Ilovaga kirganda bir marta chiqadigan so'rovnoma (masalan ustalar uchun 'pros_v1'). Javoblar jsonb:
 -- tanlov savollari — variant id'lari massivi {"q1": ["plumbing"]}, matnli javoblar — satr {"q1_other": "...", "q10": "..."}.
 create table if not exists public.survey_responses (
@@ -7488,13 +7488,12 @@ begin
 end;
 $$;
 
+-- 2026-11-23: so'rovnoma butunlay yopildi (ilovadan ham, botdan ham olib tashlandi). Javoblar (survey_responses,
+-- telegram_survey_polls) saqlanadi — jadvallar o'chirilmaydi, natijalar scripts/export-survey.mjs bilan olinadi.
+-- Funksiyalar qoladi, lekin ilova (authenticated) va mehmon (anon) ularni chaqira olmaydi: yangi javob yozilmaydi.
 revoke execute on function public.submit_survey(text, jsonb), public.get_my_surveys(),
   public.admin_get_survey_results(text)
 from public, anon, authenticated;
-
-grant execute on function public.submit_survey(text, jsonb), public.get_my_surveys(),
-  public.admin_get_survey_results(text)
-to authenticated;
 
 
 -- ===== 2026-11-17: qo'ng'iroqlar, qo'ng'iroqdan keyingi baho, eski e'lonlar, profil to'liqligi =====
