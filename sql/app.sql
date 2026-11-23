@@ -7503,6 +7503,9 @@ alter table public.jobs add column if not exists renewed_at timestamptz;
 alter table public.jobs add column if not exists stale_notified_at timestamptz;
 alter table public.provider_profiles add column if not exists completeness_nudged_at timestamptz;
 alter table public.provider_profiles add column if not exists completeness_nudges int not null default 0;
+-- 2026-11-23: alohida "ish joyini belgilang" eslatmasi (faqat joylashuvi yo'q ustalarga) — run_periodic_tasks 5-bandi
+alter table public.provider_profiles add column if not exists location_nudged_at timestamptz;
+alter table public.provider_profiles add column if not exists location_nudges int not null default 0;
 
 -- Usta profilining yetishmayotgan qismlari: 'avatar' rasm, 'location' ish joyi, 'portfolio' ish rasmlari, 'bio' tavsif.
 -- Ro'yxatda tartib (search_providers) va "profilni to'ldiring" eslatmasi uchun.
@@ -7710,7 +7713,8 @@ begin
        and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '7 days')
      limit 200
   loop
-    v_missing := _provider_missing(r.user_id);
+    -- Ish joyi bu ro'yxatga kirmaydi: unga alohida eslatma bor (5-band), ikki marta so'ramaymiz
+    v_missing := array_remove(_provider_missing(r.user_id), 'location');
     if cardinality(v_missing) > 0 then
       perform queue_notification(r.user_id,
         format(E'\U0001F4F8 Profilingizni to''ldiring: %s. To''liq profilli ustalar ro''yxatda yuqorida chiqadi '
@@ -7728,6 +7732,31 @@ begin
        where user_id = r.user_id;
       v_n := v_n + 1;
     end if;
+  end loop;
+
+  -- 5) Ish joyi eslatmasi (2026-11-23) — FAQAT joylashuvi belgilanmagan tasdiqlangan ustalarga. Joyini belgilagan
+  --    ustaga hech qachon bormaydi. 5 kunda bir marta, ko'pi bilan 3 marta, tunda emas; profil eslatmasidan keyin
+  --    kamida 3 kun o'tgan bo'lsin (bir kunda ikki xil eslatma bormasin).
+  for r in
+    select pp.user_id
+      from provider_profiles pp join users u on u.id = pp.user_id
+     where not v_quiet and pp.status = 'approved'
+       and u.deleted_at is null and u.blocked_at is null
+       and (pp.lat is null or pp.lng is null)
+       and pp.created_at < now() - interval '1 day'
+       and pp.location_nudges < 3
+       and (pp.location_nudged_at is null or pp.location_nudged_at < now() - interval '5 days')
+       and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '3 days')
+     limit 200
+  loop
+    perform queue_notification(r.user_id,
+      E'\U0001F4CD Ish joyingizni xaritada belgilang — yaqin atrofdagi mijozlar sizni ro''yxatda birinchi ko''radi '
+      'va qancha uzoqdaligingizni biladi. Bir daqiqalik ish.',
+      '/become-provider');
+    update provider_profiles
+       set location_nudged_at = now(), location_nudges = location_nudges + 1
+     where user_id = r.user_id;
+    v_n := v_n + 1;
   end loop;
 
   return v_n;
