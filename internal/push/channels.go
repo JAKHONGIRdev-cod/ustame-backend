@@ -20,7 +20,7 @@ const AdminChannelVersion = 2
 // Xabar matnining boshidagi belgi bo'yicha (sql/app.sql dagi queue_notification matnlari)
 var (
 	jobPrefixes      = []string{"🆕", "🚨", "🔔"}
-	reminderPrefixes = []string{"📸", "📅", "⭐"}
+	reminderPrefixes = []string{"📸", "📅", "⭐", "📍"} // 📍 — ish joyi eslatmasi (2026-11-23)
 )
 
 // channelFor — xabar qaysi kanalga tushadi. channels — tokendagi kanal versiyasi (push_tokens.channels):

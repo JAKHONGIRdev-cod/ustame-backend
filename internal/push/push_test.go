@@ -219,6 +219,7 @@ func TestChannelForByTokenVersionAndType(t *testing.T) {
 		{1, link("/job/1"), "🚨 Shoshilinch: \"Kran\"", "provider", ChannelJobs},
 		{1, link("/profile"), "📸 Profilingizni to'ldiring", "provider", ChannelReminders},
 		{1, link("/provider/x?review=1"), "⭐ Usta bilan ishladingizmi?", "client", ChannelReminders},
+		{1, link("/become-provider"), "📍 Ish joyingizni xaritada belgilang", "provider", ChannelReminders},
 		{1, link("/chat/5"), "💬 Ali: salom", "client", ChannelMessages},
 		{1, nil, "✅ Obunangiz faollashtirildi", "provider", ChannelMessages},
 		// Admin xabarlari: "admin" kanali faqat uni yaratgan ilovada (channels >= 2), eskisida — oddiy qoida
