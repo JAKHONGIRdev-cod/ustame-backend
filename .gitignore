@@ -2,3 +2,6 @@
 !.env.example
 /bin/
 *.exe
+
+# Railway IaC SDK (.railway/railway.ts)
+node_modules/

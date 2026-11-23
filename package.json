@@ -1,0 +1,19 @@
+{
+  "name": "ustame-backend-iac",
+  "version": "1.0.0",
+  "description": "Railway IaC (.railway/railway.ts) uchun; Go server bunga bog'liq emas",
+  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JAKHONGIRdev-cod/ustame-backend.git"
+  },
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/JAKHONGIRdev-cod/ustame-backend/issues"
+  },
+  "homepage": "https://github.com/JAKHONGIRdev-cod/ustame-backend#readme",
+  "private": true,
+  "devDependencies": {
+    "railway": "3.17.0"
+  }
+}
