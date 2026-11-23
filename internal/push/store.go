@@ -13,6 +13,13 @@ type PgStore struct {
 	DB *pgxpool.Pool
 }
 
+// multiRoleSQL — foydalanuvchi bir nechta rolda: admin, usta profili, e'lon bergan mijoz, do'kon (2 va ko'p).
+// usr — users jadvali, u.user_id — xabar egasi.
+const multiRoleSQL = `(coalesce((to_jsonb(usr)->>'is_admin')::boolean, false)::int
+		       + exists (select 1 from provider_profiles pp where pp.user_id = u.user_id)::int
+		       + exists (select 1 from jobs j where j.client_id = u.user_id)::int
+		       + exists (select 1 from shop_profiles sp where sp.user_id = u.user_id)::int) > 1`
+
 func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) {
 	// Tokeni yo'q foydalanuvchining xabari ham belgilanadi va "claimed" ga kiradi (select count(*) from u);
 	// left join'da token null bo'lgan qator — yuboriladigan telefon yo'q.
@@ -26,11 +33,13 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 		), u as (
 			update notification_outbox o set push_sent_at = now()
 			from c where o.id = c.id
-			returning o.id, o.user_id, o.message, o.link, o.created_at
+			returning o.id, o.user_id, o.message, o.link, o.created_at,
+			          coalesce(to_jsonb(o)->>'audience', '') as audience -- ustun (2026-11-23) bo'lmasa ham xato bermaydi
 		)
 		select (select count(*)::int from u), u.id, t.token, u.message, u.link, u.created_at,
 		       coalesce(to_jsonb(usr)->>'lang', ''), -- users.lang ustuni hali bo'lmasa ham xato bermaydi
-		       coalesce((to_jsonb(t)->>'channels')::int, 0) -- push_tokens.channels (2026-11-17) bo'lmasa ham
+		       coalesce((to_jsonb(t)->>'channels')::int, 0), -- push_tokens.channels (2026-11-17) bo'lmasa ham
+		       u.audience, `+multiRoleSQL+` -- bir nechta rolli odam (matn boshidagi belgi uchun)
 		from u left join push_tokens t on t.user_id = u.user_id
 		left join users usr on usr.id = u.user_id
 		order by u.id`, limit)
@@ -42,7 +51,7 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 	for rows.Next() {
 		var m Message
 		var token *string
-		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang, &m.Channels); err != nil {
+		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang, &m.Channels, &m.Audience, &m.MultiRole); err != nil {
 			rows.Close()
 			return 0, nil, err
 		}

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/audience"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
 )
@@ -22,6 +23,10 @@ type Notification struct {
 	Text      string
 	Lang      string // users.lang: "uzc" bo'lsa matn kirillga o'giriladi
 	CreatedAt time.Time
+	// Audience — kimga (admin | provider | client | shop); MultiRole — odam bir nechta rolda. Matn boshidagi
+	// belgi shulardan: "🛡 Admin · " doim, usta/mijoz/do'kon — faqat bir nechta rolli odamga (internal/audience).
+	Audience  string
+	MultiRole bool
 }
 
 // Store — bot ishlatadigan baza amallari (pgx'dagi amalga oshirilishi: store.go).
@@ -651,7 +656,7 @@ func (w *Worker) deliverOnce(ctx context.Context) (wait time.Duration, full bool
 		if n.ChatID == nil {
 			continue // botga ulanmagan foydalanuvchi — xabar shunchaki "yuborilgan" qoladi
 		}
-		err := w.TG.SendMessage(ctx, *n.ChatID, cyrillic.For(n.Lang, n.Text))
+		err := w.TG.SendMessage(ctx, *n.ChatID, cyrillic.For(n.Lang, audience.Prefix(n.Audience, n.MultiRole)+n.Text))
 		if err == nil {
 			continue
 		}

@@ -118,13 +118,18 @@ func (s *PgStore) ClaimNotifications(ctx context.Context, limit int) ([]Notifica
 		update notification_outbox o set sent_at = now()
 		from c, users u
 		where o.id = c.id and u.id = o.user_id
-		returning o.id, u.telegram_chat_id, o.message, o.created_at, coalesce(to_jsonb(u)->>'lang', '')`, limit)
+		returning o.id, u.telegram_chat_id, o.message, o.created_at, coalesce(to_jsonb(u)->>'lang', ''),
+		          coalesce(to_jsonb(o)->>'audience', ''), -- ustun (2026-11-23) bo'lmasa ham xato bermaydi
+		          (coalesce((to_jsonb(u)->>'is_admin')::boolean, false)::int
+		           + exists (select 1 from provider_profiles pp where pp.user_id = u.id)::int
+		           + exists (select 1 from jobs j where j.client_id = u.id)::int
+		           + exists (select 1 from shop_profiles sp where sp.user_id = u.id)::int) > 1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	list, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Notification, error) {
 		var n Notification
-		err := row.Scan(&n.ID, &n.ChatID, &n.Text, &n.CreatedAt, &n.Lang)
+		err := row.Scan(&n.ID, &n.ChatID, &n.Text, &n.CreatedAt, &n.Lang, &n.Audience, &n.MultiRole)
 		return n, err
 	})
 	if err != nil {

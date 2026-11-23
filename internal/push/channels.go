@@ -9,7 +9,13 @@ const (
 	ChannelJobs      = "jobs"      // yangi e'lon, shoshilinch, shaxsiy taklif — eng baland, o'z ovozi
 	ChannelMessages  = "messages"  // taklif, chat, shartnoma, nizo — tepadan tushadi, ovozli
 	ChannelReminders = "reminders" // baho, eski e'lon, profilni to'ldirish — jim
+	// ChannelAdmin — admin xabarlari (2026-11-23): ilova uni yaratib tokenni channels=2 bilan ro'yxatdan o'tkazganda;
+	// id "admin", nomi "Admin xabarlari", HIGH, o'z ovozi (ilova tomoni — src/lib/push.ts).
+	ChannelAdmin = "admin"
 )
+
+// AdminChannelVersion — "admin" kanali bor ilova versiyasi (push_tokens.channels >= 2)
+const AdminChannelVersion = 2
 
 // Xabar matnining boshidagi belgi bo'yicha (sql/app.sql dagi queue_notification matnlari)
 var (
@@ -18,10 +24,14 @@ var (
 )
 
 // channelFor — xabar qaysi kanalga tushadi. channels — tokendagi kanal versiyasi (push_tokens.channels):
-// 0 bo'lsa (eski ilova) doim "default", aks holda turiga qarab.
-func channelFor(channels int, link *string, text string) string {
+// 0 bo'lsa (eski ilova) doim "default", aks holda turiga qarab. Admin xabarlari (aud="admin") — ilovada
+// "admin" kanali bo'lsa (channels >= 2) o'sha yerga, aks holda oddiy qoida.
+func channelFor(channels int, link *string, text, aud string) string {
 	if channels < 1 {
 		return ChannelDefault
+	}
+	if aud == "admin" && channels >= AdminChannelVersion {
+		return ChannelAdmin
 	}
 	t := strings.TrimSpace(text)
 	for _, p := range jobPrefixes {

@@ -1902,10 +1902,66 @@ begin
 end;
 $$;
 
+-- 2026-11-23: har bildirishnoma aniq bitta rolga tegishli — admin, usta (provider), mijoz (client) yoki do'kon (shop).
+-- Bir odam bir nechta rolda bo'lsa (admin ham usta, usta ham e'lon bergan) xabarlar aralashmasin: push/Telegram'da belgi,
+-- ilovada filtr shu ustundan.
+alter table public.notification_outbox add column if not exists audience text;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'notification_outbox_audience_check') then
+    alter table public.notification_outbox add constraint notification_outbox_audience_check
+      check (audience in ('admin', 'provider', 'client', 'shop'));
+  end if;
+end $$;
+
+-- Xabar qabul qiluvchining qaysi roli uchun: havola va shu yozuvdagi o'rni bo'yicha (shartnoma, kelishuv, taklif,
+-- e'lon). Admin xabarlari doim /admin/... ga olib boradi. Havoladan bilinmasa — qabul qiluvchining asosiy roli.
+create or replace function public._notification_audience(p_user_id uuid, p_link text)
+returns text language plpgsql stable security definer set search_path = public as $$
+declare
+  v_link text := coalesce(p_link, '');
+  v_path text := split_part(coalesce(p_link, ''), '?', 1);
+  v_id   text := split_part(split_part(coalesce(p_link, ''), '?', 1), '/', 3);
+  v_r    text;
+begin
+  if v_path like '/admin%' then
+    return 'admin';
+  elsif v_path like '/contract/%' or v_path like '/chat/%' then
+    select case when k.client_id = p_user_id then 'client' when k.provider_id = p_user_id then 'provider' end
+      into v_r from contracts k where k.id::text = v_id;
+  elsif v_path like '/agreement/%' then
+    select case when a.client_id = p_user_id then 'client' when a.provider_id = p_user_id then 'provider' end
+      into v_r from agreements a where a.id::text = v_id;
+  elsif v_path like '/proposal-chat/%' then
+    select case when p.provider_id = p_user_id then 'provider' else 'client' end
+      into v_r from proposals p where p.id::text = v_id;
+  elsif v_path like '/job/%' then
+    select case when j.client_id = p_user_id then 'client' else 'provider' end
+      into v_r from jobs j where j.id::text = v_id;
+  elsif v_path like '/provider/%' then
+    v_r := case when v_link like '%review=1%' then 'client' else 'provider' end;
+  elsif v_path in ('/become-provider', '/my-team', '/subscription') then
+    v_r := 'provider';
+  elsif v_path in ('/become-shop', '/shop-subscription') then
+    v_r := 'shop';
+  end if;
+  if v_r is not null then
+    return v_r;
+  end if;
+  return case
+    when exists (select 1 from provider_profiles pp where pp.user_id = p_user_id) then 'provider'
+    when exists (select 1 from shop_profiles sp where sp.user_id = p_user_id) then 'shop'
+    else 'client'
+  end;
+end;
+$$;
+
 drop function if exists public.queue_notification(uuid, text);
-create or replace function public.queue_notification(p_user_id uuid, p_message text, p_link text default null)
+drop function if exists public.queue_notification(uuid, text, text);
+create or replace function public.queue_notification(p_user_id uuid, p_message text, p_link text default null,
+                                                     p_audience text default null)
 returns void language sql security definer set search_path = public as $$
-  insert into notification_outbox (user_id, message, link) values (p_user_id, p_message, p_link);
+  insert into notification_outbox (user_id, message, link, audience)
+  values (p_user_id, p_message, p_link, coalesce(p_audience, _notification_audience(p_user_id, p_link)));
 $$;
 
 create or replace function public.notify_new_proposal()
@@ -2067,7 +2123,7 @@ grant execute on function public.register_push_token(text, text, int), public.un
   to authenticated;
 
 revoke execute on function
-  public.queue_notification(uuid, text, text), public.notify_new_proposal(),
+  public.queue_notification(uuid, text, text, text), public._notification_audience(uuid, text), public.notify_new_proposal(),
   public.notify_proposal_accepted(), public.notify_job_invite(),
   public.notify_new_message(), public.notify_contract_status()
   from public, anon, authenticated;
@@ -2112,7 +2168,7 @@ begin
       then E'✅ Tabriklaymiz! Usta profilingiz tasdiqlandi — endi ishlarga taklif yubora olasiz.'
       else format(E'❌ Usta profilingiz rad etildi. Sabab: %s', coalesce(p_reason, '-'))
     end,
-    case when p_approve then '/' else '/become-provider' end);
+    case when p_approve then '/home' else '/become-provider' end, 'provider');
 end;
 $$;
 
@@ -4061,14 +4117,31 @@ end $$;
 
 create index if not exists notification_outbox_user_idx on public.notification_outbox (user_id, created_at desc);
 
-create or replace function public.get_my_notifications()
+-- 2026-11-23: har yozuvda audience (admin | provider | client | shop); p_audience — faqat shu rol xabarlari
+drop function if exists public.get_my_notifications();
+create or replace function public.get_my_notifications(p_audience text default null)
 returns jsonb language sql stable security definer set search_path = public as $$
   select coalesce(jsonb_agg(jsonb_build_object('id', n.id, 'message', n.message, 'link', n.link,
-                                               'created_at', n.created_at, 'read', n.read_at is not null)
+                                               'created_at', n.created_at, 'read', n.read_at is not null,
+                                               'audience', n.audience)
                             order by n.created_at desc), '[]'::jsonb)
   from (select * from notification_outbox
          where user_id = auth.uid() and created_at > now() - interval '30 days'
+           and (p_audience is null or audience = p_audience)
          order by created_at desc limit 100) n;
+$$;
+
+-- Rol bo'yicha o'qilmaganlar: {"admin": 1, "provider": 3, "client": 0, "shop": 0, "total": 4}
+create or replace function public.get_notification_counts()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'admin',    count(*) filter (where audience = 'admin'),
+    'provider', count(*) filter (where audience = 'provider'),
+    'client',   count(*) filter (where audience = 'client'),
+    'shop',     count(*) filter (where audience = 'shop'),
+    'total',    count(*))
+  from notification_outbox
+  where user_id = auth.uid() and read_at is null and created_at > now() - interval '30 days';
 $$;
 
 create or replace function public.get_unread_notifications()
@@ -4191,12 +4264,12 @@ drop trigger if exists trg_notify_new_job on public.jobs;
 create trigger trg_notify_new_job after insert on public.jobs
 for each row execute function public.notify_new_job();
 
-revoke execute on function public.get_my_notifications(), public.get_unread_notifications(),
-  public.mark_notifications_read()
+revoke execute on function public.get_my_notifications(text), public.get_unread_notifications(),
+  public.mark_notifications_read(), public.get_notification_counts()
 from public, anon, authenticated;
 
-grant execute on function public.get_my_notifications(), public.get_unread_notifications(),
-  public.mark_notifications_read()
+grant execute on function public.get_my_notifications(text), public.get_unread_notifications(),
+  public.mark_notifications_read(), public.get_notification_counts()
 to authenticated;
 
 
@@ -4326,7 +4399,7 @@ begin
   delete from files where bucket = 'id-docs' and path like p_user_id::text || '/%';
   if p_verified then
     perform queue_notification(p_user_id,
-      E'\U0001F6E1 Shaxsingiz tasdiqlandi — profilingizda "Shaxsi tasdiqlangan" belgisi chiqadi.', '/');
+      E'\U0001F6E1 Shaxsingiz tasdiqlandi — profilingizda "Shaxsi tasdiqlangan" belgisi chiqadi.', '/become-provider', 'provider');
   end if;
 end;
 $$;
@@ -6746,7 +6819,7 @@ begin
       then format(E'✅ "%s" do''koningiz tasdiqlandi — endi mijozlar sizni ro''yxatda va xaritada ko''radi.', v_s.name)
       else format(E'❌ "%s" do''koni arizasi rad etildi. Sabab: %s', v_s.name, v_reason)
     end,
-    case when p_approve then '/home' else '/become-shop' end);
+    case when p_approve then '/home' else '/become-shop' end, 'shop');
 end;
 $$;
 
@@ -7888,3 +7961,6 @@ $$;
 
 revoke execute on function public.admin_push_health() from public, anon;
 grant execute on function public.admin_push_health() to authenticated;
+
+-- ===== Bildirishnomalar rol bo'yicha: eski yozuvlarga audience (2026-11-23) =====
+update public.notification_outbox set audience = public._notification_audience(user_id, link) where audience is null;

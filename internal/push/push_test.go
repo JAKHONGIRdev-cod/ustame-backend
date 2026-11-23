@@ -211,20 +211,50 @@ func TestChannelForByTokenVersionAndType(t *testing.T) {
 		channels int
 		link     *string
 		text     string
+		aud      string
 		want     string
 	}{
-		{0, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", ChannelDefault}, // eski ilova — faqat default kanal bor
-		{1, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", ChannelJobs},
-		{1, link("/job/1"), "🚨 Shoshilinch: \"Kran\"", ChannelJobs},
-		{1, link("/profile"), "📸 Profilingizni to'ldiring", ChannelReminders},
-		{1, link("/provider/x?review=1"), "⭐ Usta bilan ishladingizmi?", ChannelReminders},
-		{1, link("/chat/5"), "💬 Ali: salom", ChannelMessages},
-		{1, nil, "✅ Obunangiz faollashtirildi", ChannelMessages},
+		{0, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", "provider", ChannelDefault}, // eski ilova — faqat default kanal bor
+		{1, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", "provider", ChannelJobs},
+		{1, link("/job/1"), "🚨 Shoshilinch: \"Kran\"", "provider", ChannelJobs},
+		{1, link("/profile"), "📸 Profilingizni to'ldiring", "provider", ChannelReminders},
+		{1, link("/provider/x?review=1"), "⭐ Usta bilan ishladingizmi?", "client", ChannelReminders},
+		{1, link("/chat/5"), "💬 Ali: salom", "client", ChannelMessages},
+		{1, nil, "✅ Obunangiz faollashtirildi", "provider", ChannelMessages},
+		// Admin xabarlari: "admin" kanali faqat uni yaratgan ilovada (channels >= 2), eskisida — oddiy qoida
+		{1, link("/admin/reports"), "🚩 Yangi shikoyat", "admin", ChannelMessages},
+		{2, link("/admin/reports"), "🚩 Yangi shikoyat", "admin", ChannelAdmin},
+		{2, link("/admin/waiting"), "🚨 Yangi shoshilinch e'lon", "admin", ChannelAdmin},
+		{2, link("/job/1"), "🆕 Yangi e'lon: \"Kran\"", "provider", ChannelJobs},
 	}
 	for _, c := range cases {
-		if got := channelFor(c.channels, c.link, c.text); got != c.want {
-			t.Errorf("channelFor(%d, %q) = %q, kutilgan %q", c.channels, c.text, got, c.want)
+		if got := channelFor(c.channels, c.link, c.text, c.aud); got != c.want {
+			t.Errorf("channelFor(%d, %q, %q) = %q, kutilgan %q", c.channels, c.text, c.aud, got, c.want)
 		}
+	}
+}
+
+// Rol belgisi: admin xabari doim, usta/mijoz — faqat bir nechta rolli odamga.
+func TestDeliverAddsRolePrefix(t *testing.T) {
+	expo, got := fakeExpo(t, 200, okTickets)
+	store := &fakeStore{}
+	w := &Worker{Expo: expo, Store: store}
+	now := time.Now()
+	store.add(Message{ID: 1, Token: "A", Text: "🚩 Yangi shikoyat", Audience: "admin", CreatedAt: now, Channels: 2})
+	store.add(Message{ID: 2, Token: "B", Text: "🆕 Yangi e'lon", Audience: "provider", CreatedAt: now})
+	store.add(Message{ID: 3, Token: "C", Text: "🔔 Yangi taklif", Audience: "client", MultiRole: true, CreatedAt: now})
+	w.deliverOnce(context.Background())
+	if len(*got) != 3 {
+		t.Fatalf("3 ta xabar kutilgan, keldi %d", len(*got))
+	}
+	want := []string{"🛡 Admin · 🚩 Yangi shikoyat", "🆕 Yangi e'lon", "🏠 Mijoz · 🔔 Yangi taklif"}
+	for i, m := range *got {
+		if m.Body != want[i] {
+			t.Errorf("%d-xabar matni %q, kutilgan %q", i, m.Body, want[i])
+		}
+	}
+	if (*got)[0].ChannelID != ChannelAdmin {
+		t.Errorf("admin xabari admin kanaliga tushishi kerak: %q", (*got)[0].ChannelID)
 	}
 }
 

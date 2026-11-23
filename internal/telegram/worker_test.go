@@ -302,3 +302,30 @@ func TestOldPollAnswerIgnored(t *testing.T) {
 		t.Fatalf("eski poll ovoziga javob ketmasligi kerak: %v", tg.sent)
 	}
 }
+
+// Rol belgisi: admin xabari doim "🛡 Admin · ", usta/mijoz — faqat bir nechta rolli odamga.
+func TestDeliverAddsRolePrefix(t *testing.T) {
+	w, tg, st := newTest(t)
+	now := time.Now()
+	st.queue = []Notification{
+		{ID: 1, ChatID: chat(1), Text: "🚩 Yangi shikoyat", Audience: "admin", CreatedAt: now},
+		{ID: 2, ChatID: chat(2), Text: "🆕 Yangi e'lon", Audience: "provider", CreatedAt: now},
+		{ID: 3, ChatID: chat(3), Text: "🆕 Yangi e'lon", Audience: "provider", MultiRole: true, CreatedAt: now},
+		{ID: 4, ChatID: chat(4), Text: "🔔 Yangi taklif", Audience: "client", MultiRole: true, CreatedAt: now},
+	}
+	w.deliverOnce(context.Background())
+	want := []sentMsg{
+		{1, "🛡 Admin · 🚩 Yangi shikoyat"},
+		{2, "🆕 Yangi e'lon"},
+		{3, "🔧 Usta · 🆕 Yangi e'lon"},
+		{4, "🏠 Mijoz · 🔔 Yangi taklif"},
+	}
+	if len(tg.sent) != len(want) {
+		t.Fatalf("yuborilgan: %v", tg.sent)
+	}
+	for i := range want {
+		if tg.sent[i] != want[i] {
+			t.Errorf("%d: %v, kutilgan %v", i, tg.sent[i], want[i])
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/audience"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/cyrillic"
 )
 
@@ -19,6 +20,10 @@ type Message struct {
 	Link      *string // ilovada ochiladigan sahifa
 	CreatedAt time.Time
 	Channels  int // push_tokens.channels: telefondagi ilova yaratgan kanallar versiyasi (channels.go)
+	// Audience — kimga: admin | provider | client | shop (notification_outbox.audience); MultiRole — odam bir nechta
+	// rolda (admin, usta, e'lon bergan mijoz, do'kon). Matn boshidagi belgi shulardan (internal/audience).
+	Audience  string
+	MultiRole bool
 }
 
 // Store — push ishchisi ishlatadigan baza amallari (pgx'dagisi: store.go).
@@ -137,8 +142,8 @@ func (w *Worker) send(ctx context.Context, part []Message) bool {
 	msgs := make([]ExpoMessage, len(part))
 	for i, m := range part {
 		msgs[i] = ExpoMessage{
-			To: m.Token, Title: title, Body: cyrillic.For(m.Lang, m.Text), Sound: "default",
-			ChannelID: channelFor(m.Channels, m.Link, m.Text), Priority: "high",
+			To: m.Token, Title: title, Body: cyrillic.For(m.Lang, audience.Prefix(m.Audience, m.MultiRole)+m.Text),
+			Sound: "default", ChannelID: channelFor(m.Channels, m.Link, m.Text, m.Audience), Priority: "high",
 		}
 		if m.Link != nil {
 			msgs[i].Data = map[string]string{"url": *m.Link}
