@@ -223,10 +223,11 @@ $$;
 
 -- search_providers: + lat/lng (yaxlitlangan). Kirmagan mehmon ham qidira oladi (usta profillari ochiq).
 -- 2026-11-13: mijoz joylashuvi (p_lat/p_lng) berilsa — yaqinlik va sharhlar bo'yicha tartib:
---   1) masofa oralig'i: 0-2, 2-5, 5-10, 10-25, 25-50 km; keyin joylashuvi belgilanmagan ustalar; keyin 50 km dan uzoq;
+--   1) masofa oralig'i: 0-2, 2-5, 5-10, 10-25, 25-50 km, 50 km dan uzoq; joylashuvi belgilanmagan ustalar — eng oxirida;
 --   2) bir oraliq ichida: top_rated, sharhlar soni bilan tekislangan reyting (bayes: 2 ta 4.0 "virtual" baho), masofa.
 -- Masofa yaxlitlangan koordinatadan (approx_coord, ~1 km) hisoblanadi — ustaning aniq joyi chiqib qolmasin.
--- Joylashuv berilmasa — eski tartib (top_rated, reyting, bajarilgan ishlar).
+-- Joylashuv berilmasa — avval ish joyini belgilagan ustalar, keyin eski tartib (top_rated, reyting, bajarilgan ishlar).
+-- 2026-11-23: joylashuvi bor ustalar har doim joylashuvsizlardan yuqorida (mijoz ruxsat bermagan bo'lsa ham).
 drop function if exists public.search_providers(text, text, text, int, int);
 create or replace function public.search_providers(
   p_category text default null,
@@ -257,13 +258,14 @@ begin
     from (
       select y.*,
              row_number() over (
-               order by case when y.distance_km is null then 5
+               order by case when y.distance_km is null then 6
                              when y.distance_km < 2  then 0
                              when y.distance_km < 5  then 1
                              when y.distance_km < 10 then 2
                              when y.distance_km < 25 then 3
                              when y.distance_km < 50 then 4
-                             else 6 end,
+                             else 5 end,
+                        y.has_location desc,
                         y.top_rated desc, y.completeness desc, y.score desc, y.distance_km asc nulls last,
                         y.completed desc, y.created_at desc) as ord
       from (
@@ -285,6 +287,7 @@ begin
             111.32 * sqrt(power(approx_coord(pp.lat) - v_lat, 2)
                           + power((approx_coord(pp.lng) - v_lng) * cos(radians(v_lat)), 2))
           end as distance_km,
+          (pp.lat is not null and pp.lng is not null) as has_location,
           coalesce((s.stats ->> 'top_rated')::boolean, false) as top_rated,
           (coalesce((s.stats ->> 'avg_rating')::numeric, 0) * coalesce((s.stats ->> 'reviews_count')::int, 0) + 4.0 * 2)
             / (coalesce((s.stats ->> 'reviews_count')::int, 0) + 2) as score,
