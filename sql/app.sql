@@ -1966,12 +1966,15 @@ $$;
 
 create or replace function public.notify_new_proposal()
 returns trigger language plpgsql security definer set search_path = public as $$
-declare v_client_id uuid; v_job_title text; v_provider_name text;
+declare v_client_id uuid; v_job_title text; v_provider_name text; v_n int;
 begin
   select client_id, title into v_client_id, v_job_title from jobs where id = new.job_id;
   select full_name into v_provider_name from profiles where id = new.provider_id;
+  -- 2026-11-24: xabarda narx va jami takliflar soni — mijoz narxni ko'rib, ilovaga qaytsin
+  select count(*) into v_n from proposals where job_id = new.job_id and status = 'submitted';
   perform queue_notification(v_client_id, format(
-    E'\U0001F514 "%s" e''loningizga yangi taklif keldi.\n%s', v_job_title, v_provider_name),
+    E'\U0001F514 "%s" e''loningizga taklif: %s, %s so''m.%s', v_job_title, v_provider_name, _som(new.price),
+    case when v_n > 1 then format(' Jami %s ta taklif.', v_n) else '' end),
     '/job/' || new.job_id);
   return new;
 end;
@@ -7501,6 +7504,9 @@ from public, anon, authenticated;
 
 alter table public.jobs add column if not exists renewed_at timestamptz;
 alter table public.jobs add column if not exists stale_notified_at timestamptz;
+-- 2026-11-24: mijoz ochmagan takliflar eslatmasi (run_periodic_tasks 1b-bandi), ko'pi bilan 2 marta
+alter table public.jobs add column if not exists proposals_reminded_at timestamptz;
+alter table public.jobs add column if not exists proposals_reminders int not null default 0;
 alter table public.provider_profiles add column if not exists completeness_nudged_at timestamptz;
 alter table public.provider_profiles add column if not exists completeness_nudges int not null default 0;
 -- 2026-11-23: alohida "ish joyini belgilang" eslatmasi (faqat joylashuvi yo'q ustalarga) — run_periodic_tasks 5-bandi
@@ -7638,10 +7644,20 @@ declare
 begin
   -- 1) Baho eslatmasi (shartnoma bo'lgan juftlikka emas — u yerda o'z baholash tartibi bor)
   for r in
-    select distinct on (c.client_id, c.provider_id) c.client_id, c.provider_id, p.full_name
+    select distinct on (c.client_id, c.provider_id) c.client_id, c.provider_id, p.full_name,
+           m.job_id, m.proposal_id, m.title
       from provider_contacts c
       join profiles p on p.id = c.provider_id
       join users u on u.id = c.client_id
+      -- 2026-11-24: mijozning ochiq e'loniga shu usta qo'ng'iroqdan oldin taklif bergan bo'lsa
+      left join lateral (
+        select j.id as job_id, pr.id as proposal_id, j.title
+          from proposals pr join jobs j on j.id = pr.job_id
+         where j.client_id = c.client_id and pr.provider_id = c.provider_id
+           and j.status = 'open' and pr.status = 'submitted' and pr.created_at < c.created_at
+         order by pr.created_at desc
+         limit 1
+      ) m on true
      where not v_quiet and c.kind = 'call'
        and c.created_at < now() - interval '20 hours'
        and c.created_at > now() - interval '14 days'
@@ -7656,12 +7672,52 @@ begin
      order by c.client_id, c.provider_id, c.created_at
      limit 200
   loop
-    perform queue_notification(r.client_id,
-      format(E'⭐ %s bilan ishladingizmi? Ustani baholang — bu boshqa mijozlarga yaxshi ustani tanlashga yordam beradi.',
-             r.full_name),
-      '/provider/' || r.provider_id || '?review=1');
+    if r.proposal_id is not null then
+      -- Telefonda kelishgan bo'lishi mumkin: ilovada belgilasa — taklif qabul qilinadi, shartnoma ochiladi
+      perform queue_notification(r.client_id,
+        format(E'\U0001F91D %s bilan "%s" ishi bo''yicha kelishdingizmi? Kelishgan bo''lsangiz, ilovada belgilab qo''ying: '
+               'narx va shartlar yozilib qoladi, ish tugagach ustani baholaysiz.', r.full_name, r.title),
+        '/job/' || r.job_id || '?agreed=' || r.proposal_id);
+    else
+      perform queue_notification(r.client_id,
+        format(E'⭐ %s bilan ishladingizmi? Ustani baholang — bu boshqa mijozlarga yaxshi ustani tanlashga yordam beradi.',
+               r.full_name),
+        '/provider/' || r.provider_id || '?review=1');
+    end if;
     update provider_contacts set review_reminded_at = now()
      where client_id = r.client_id and provider_id = r.provider_id;
+    v_n := v_n + 1;
+  end loop;
+
+  -- 1b) 2026-11-24: mijoz ochmagan takliflar eslatmasi — birinchisi birinchi taklifdan 3 soat keyin, ikkinchisi
+  --     yana 21 soatdan keyin, ko'pi bilan 2 marta. Mijoz takliflarni ochsa (client_viewed_at) — eslatma to'xtaydi.
+  for r in
+    select j.id, j.client_id, j.title, x.n, x.min_price
+      from jobs j
+      join users u on u.id = j.client_id
+      cross join lateral (
+        select count(*)::int as n, min(p.price) as min_price, min(p.created_at) as first_at
+          from proposals p
+         where p.job_id = j.id and p.status = 'submitted' and p.client_viewed_at is null
+      ) x
+     where not v_quiet and j.status = 'open'
+       and u.deleted_at is null and u.blocked_at is null
+       and x.n > 0
+       and j.proposals_reminders < 2
+       and x.first_at < now() - interval '3 hours'
+       and (j.proposals_reminded_at is null or j.proposals_reminded_at < now() - interval '21 hours')
+     limit 200
+  loop
+    perform queue_notification(r.client_id,
+      case when r.n = 1 then
+        format(E'\U0001F514 "%s" e''loningizga taklif keldi: %s so''m. Usta javobingizni kutyapti.',
+               r.title, _som(r.min_price))
+      else
+        format(E'\U0001F514 "%s" e''loningizga %s ta taklif keldi, eng arzoni %s so''m. Ustalar javobingizni kutyapti.',
+               r.title, r.n, _som(r.min_price))
+      end,
+      '/job/' || r.id);
+    update jobs set proposals_reminded_at = now(), proposals_reminders = proposals_reminders + 1 where id = r.id;
     v_n := v_n + 1;
   end loop;
 
