@@ -7315,11 +7315,11 @@ grant execute on function public.get_shop_prices(uuid), public.quote_estimate(js
 to anon, authenticated;
 
 -- ===== do'kon obunasi =====
--- Do'konlar ham oylik obuna to'laydi (subscription_settings.shop_price, 399 000 so'm). Bepul davrda (free_until gacha)
+-- Do'konlar ham oylik obuna to'laydi (subscription_settings.shop_price, 499 000 so'm; 2026-11-25 gacha 399 000). Bepul davrda (free_until gacha)
 -- hamma do'kon to'liq ishlaydi. Keyin obunasiz do'kon ro'yxat va xaritada bepul qoladi, lekin narxlari (do'kon
 -- sahifasi va "smeta qaysi do'konda qancha" — get_shop_prices, quote_estimate) faqat obunasi faol bo'lsa ko'rinadi.
 -- To'lov hozircha qo'lda: admin admin_extend_shop_subscription bilan uzaytiradi (subscription_payments, kind='shop').
-alter table public.subscription_settings add column if not exists shop_price int not null default 399000
+alter table public.subscription_settings add column if not exists shop_price int not null default 499000
   check (shop_price > 0);
 alter table public.subscription_payments add column if not exists kind text not null default 'provider'
   check (kind in ('provider', 'shop'));
