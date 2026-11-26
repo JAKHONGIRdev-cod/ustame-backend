@@ -7509,7 +7509,8 @@ alter table public.jobs add column if not exists proposals_reminded_at timestamp
 alter table public.jobs add column if not exists proposals_reminders int not null default 0;
 alter table public.provider_profiles add column if not exists completeness_nudged_at timestamptz;
 alter table public.provider_profiles add column if not exists completeness_nudges int not null default 0;
--- 2026-11-23: alohida "ish joyini belgilang" eslatmasi (faqat joylashuvi yo'q ustalarga) — run_periodic_tasks 5-bandi
+-- 2026-11-23: alohida "ish joyini belgilang" eslatmasi edi; 2026-11-26 dan profil eslatmasiga qo'shildi va boshqa
+-- yuborilmaydi. Hisoblagich saqlanadi: avval olinganlari ham ikkala eslatmaning umumiy chegarasiga (2) kiradi.
 alter table public.provider_profiles add column if not exists location_nudged_at timestamptz;
 alter table public.provider_profiles add column if not exists location_nudges int not null default 0;
 
@@ -7633,7 +7634,7 @@ $$;
 --   1) Qo'ng'iroqdan 20 soat - 14 kun o'tib, baho qo'ymagan mijozga bir marta "Ustani baholang"
 --   2) 30 kundan beri ochiq e'lon egasiga "Usta topdingizmi?" (yana 30 kun qoldirish yoki yopish)
 --   3) Shundan keyin 7 kun javob bo'lmasa — e'lon avtomatik yopiladi
---   4) Profili to'liq bo'lmagan ustaga haftada bir, ko'pi bilan 3 marta "Profilingizni to'ldiring"
+--   4) Profili to'liq bo'lmagan ustaga (ish joyi ham shu xabarda) jami ko'pi bilan 2 marta "Profilingizni to'ldiring"
 create or replace function public.run_periodic_tasks()
 returns int language plpgsql security definer set search_path = public as $$
 declare
@@ -7758,59 +7759,36 @@ begin
     v_n := v_n + 1;
   end loop;
 
-  -- 4) Profilni to'ldirish eslatmasi
+  -- 4) Profilni to'ldirish eslatmasi (2026-11-26: ish joyi ham shu bitta xabarda). Ilovani o'chirgan ustalar
+  --    faqat eslatma olgan edi (profil 3 + ish joyi 3, jami 6 tagacha). Endi: tasdiqlangandan 3 kun o'tib birinchisi,
+  --    kamida 7 kundan keyin ikkinchisi, jami ko'pi bilan 2 marta. Eski "ish joyi" eslatmalari (location_nudges)
+  --    ham shu 2 taga kiradi. Profili to'liq ustalar tanlanmaydi (limit 200 ularga band bo'lib qolmasin).
   for r in
     select pp.user_id
       from provider_profiles pp join users u on u.id = pp.user_id
      where not v_quiet and pp.status = 'approved'
        and u.deleted_at is null and u.blocked_at is null
-       and pp.created_at < now() - interval '2 days'
-       and pp.completeness_nudges < 3
-       and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '7 days')
+       and pp.created_at < now() - interval '3 days'
+       and pp.completeness_nudges + pp.location_nudges < 2
+       and coalesce(greatest(pp.completeness_nudged_at, pp.location_nudged_at), '-infinity') < now() - interval '7 days'
+       and cardinality(_provider_missing(pp.user_id)) > 0
      limit 200
   loop
-    -- Ish joyi bu ro'yxatga kirmaydi: unga alohida eslatma bor (5-band), ikki marta so'ramaymiz
-    v_missing := array_remove(_provider_missing(r.user_id), 'location');
-    if cardinality(v_missing) > 0 then
-      perform queue_notification(r.user_id,
-        format(E'\U0001F4F8 Profilingizni to''ldiring: %s. To''liq profilli ustalar ro''yxatda yuqorida chiqadi '
-               'va mijozlar ularga ko''proq qo''ng''iroq qiladi.',
-               array_to_string(array(
-                 select case m when 'avatar' then 'profil rasmi'
-                               when 'location' then 'ish joyi (xaritada)'
-                               when 'portfolio' then 'ishlaringiz rasmlari'
-                               when 'bio' then 'o''zingiz haqingizda'
-                        end
-                   from unnest(v_missing) m), ', ')),
-        '/profile');
-      update provider_profiles
-         set completeness_nudged_at = now(), completeness_nudges = completeness_nudges + 1
-       where user_id = r.user_id;
-      v_n := v_n + 1;
-    end if;
-  end loop;
-
-  -- 5) Ish joyi eslatmasi (2026-11-23) — FAQAT joylashuvi belgilanmagan tasdiqlangan ustalarga. Joyini belgilagan
-  --    ustaga hech qachon bormaydi. 5 kunda bir marta, ko'pi bilan 3 marta, tunda emas; profil eslatmasidan keyin
-  --    kamida 3 kun o'tgan bo'lsin (bir kunda ikki xil eslatma bormasin).
-  for r in
-    select pp.user_id
-      from provider_profiles pp join users u on u.id = pp.user_id
-     where not v_quiet and pp.status = 'approved'
-       and u.deleted_at is null and u.blocked_at is null
-       and (pp.lat is null or pp.lng is null)
-       and pp.created_at < now() - interval '1 day'
-       and pp.location_nudges < 3
-       and (pp.location_nudged_at is null or pp.location_nudged_at < now() - interval '5 days')
-       and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '3 days')
-     limit 200
-  loop
+    v_missing := _provider_missing(r.user_id);
     perform queue_notification(r.user_id,
-      E'\U0001F4CD Ish joyingizni xaritada belgilang — yaqin atrofdagi mijozlar sizni ro''yxatda birinchi ko''radi '
-      'va qancha uzoqdaligingizni biladi. Bir daqiqalik ish.',
-      '/become-provider');
+      format(E'\U0001F4F8 Profilingizni to''ldiring: %s. To''liq profilli ustalar ro''yxatda yuqorida chiqadi '
+             'va mijozlar ularga ko''proq qo''ng''iroq qiladi.',
+             array_to_string(array(
+               select case m when 'avatar' then 'profil rasmi'
+                             when 'location' then 'ish joyi (xaritada)'
+                             when 'portfolio' then 'ishlaringiz rasmlari'
+                             when 'bio' then 'o''zingiz haqingizda'
+                      end
+                 from unnest(v_missing) m), ', ')),
+      -- Ish joyi, tavsif va ish rasmlari usta anketasida; faqat profil rasmi qolgan bo'lsa — profil sahifasi
+      case when 'location' = any (v_missing) then '/become-provider' else '/profile' end);
     update provider_profiles
-       set location_nudged_at = now(), location_nudges = location_nudges + 1
+       set completeness_nudged_at = now(), completeness_nudges = completeness_nudges + 1
      where user_id = r.user_id;
     v_n := v_n + 1;
   end loop;
