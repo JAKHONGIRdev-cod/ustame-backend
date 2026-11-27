@@ -44,6 +44,10 @@ type Store interface {
 	// KnownLoginPhone — shu chat'dan avval Telegram orqali kirib raqami tasdiqlangan (bloklanmagan) foydalanuvchi
 	// raqami; bo'lmasa "". Faqat bildirishnoma uchun ulangan chat hisobga olinmaydi.
 	KnownLoginPhone(ctx context.Context, chatID int64) (string, error)
+	// RememberChat — chat o'z raqamini yubordi (Telegram tasdiqlagan kontakt): bazada bor, bloklanmagan foydalanuvchi
+	// shu chat'ga bog'lanadi — keyingi safar bot raqamni qayta so'ramaydi (KnownLoginPhone). Yangi hisob yaratilmaydi;
+	// chat boshqa profilga bog'langan bo'lsa, o'shandan uziladi.
+	RememberChat(ctx context.Context, chatID int64, phone string) error
 	// IssueLoginCode — raqamga bir martalik kirish kodini yozadi (otp_codes; saytdagi /api/auth/verify tekshiradi).
 	// false — shu raqamga oxirgi soatda juda ko'p kod berilgan.
 	IssueLoginCode(ctx context.Context, phone, codeHash string) (bool, error)
@@ -654,6 +658,11 @@ func (w *Worker) contactReply(ctx context.Context, m *Message) (string, any) {
 	phone, ok := uzPhone(m.Contact.PhoneNumber)
 	if !ok {
 		return msgLoginNotUz, removeKeyboard
+	}
+	// Raqamni Telegram tasdiqladi (o'z kontakti): chat eslab qolinadi — keyingi safar raqam so'ralmaydi, sayt
+	// orqali kirish tugallanmasa ham (2026-11-28: START bosilmay qolib, sinov raqami bot tomonidan tanilmadi)
+	if err := w.Store.RememberChat(ctx, m.Chat.ID, phone); err != nil {
+		log.Printf("telegram: chat eslab qolinmadi: %v", err)
 	}
 	ok, err := w.Store.CompleteLogin(ctx, m.Chat.ID, phone)
 	switch {

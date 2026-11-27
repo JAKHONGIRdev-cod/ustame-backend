@@ -84,6 +84,17 @@ func (s *PgStore) KnownLoginPhone(ctx context.Context, chatID int64) (string, er
 	return phone, err
 }
 
+// RememberChat — api/telegram_login.go dagi kabi bitta so'rov: chat shu raqam egasiga o'tadi, boshqa profildan
+// uziladi (telegram_login_chat_id unikal emas, lekin bitta chat — bitta foydalanuvchi). Raqam bazada yo'q bo'lsa
+// faqat eski bog'lanish uziladi (chat endi boshqa raqamni tasdiqladi).
+func (s *PgStore) RememberChat(ctx context.Context, chatID int64, phone string) error {
+	_, err := s.DB.Exec(ctx, `
+		update users set telegram_login_chat_id = case when phone = $2 then $1::bigint end
+		where (phone = $2 and blocked_at is null and deleted_at is null) or telegram_login_chat_id = $1::bigint`,
+		chatID, phone)
+	return err
+}
+
 func (s *PgStore) CompleteLogin(ctx context.Context, chatID int64, phone string) (bool, error) {
 	tag, err := s.DB.Exec(ctx, `
 		update telegram_logins set phone = $2

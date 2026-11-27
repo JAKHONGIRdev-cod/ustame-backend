@@ -194,10 +194,11 @@ func TestLoginFlowCyrillic(t *testing.T) {
 		t.Errorf("raqam so'raydigan tugma bo'lishi kerak: %v", tg.markups[0])
 	}
 
-	// Keyingi lotin havola bilan kirish — yana lotincha
+	// Keyingi lotin havola bilan kirish — yana lotincha. Chat birinchi kirishda eslab qolingan (RememberChat),
+	// shuning uchun raqam qayta so'ralmaydi — «avval tasdiqlangansiz»
 	st.loginCodes["k10"] = true
 	w.handleUpdate(ctx, privateMsg(90, "/start login_k10"))
-	if last := tg.sent[len(tg.sent)-1].Text; last != msgLoginAsk {
+	if last := tg.sent[len(tg.sent)-1].Text; last != msgLoginKnown {
 		t.Errorf("lotin havoladan keyin javob lotincha bo'lishi kerak: %q", last)
 	}
 }

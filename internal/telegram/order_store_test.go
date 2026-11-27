@@ -197,6 +197,30 @@ func TestPgOrderStore(t *testing.T) {
 	if src != "telegram_bot" || campaign != "" {
 		t.Fatalf("manbasiz tashrif: %q %q", src, campaign)
 	}
+
+	// RememberChat (botda o'z raqamini yuborgan chat): chat raqam egasiga o'tadi, eskisidan uziladi
+	if err := s.RememberChat(ctx, chat+5, phone); err != nil {
+		t.Fatalf("RememberChat: %v", err)
+	}
+	if got, _ := s.KnownLoginPhone(ctx, chat+5); got != phone {
+		t.Fatalf("yangi chat tanilmadi: %q", got)
+	}
+	if got, _ := s.KnownLoginPhone(ctx, chat); got != "" {
+		t.Fatalf("eski chat uzilmadi: %q", got)
+	}
+	// Bazada yo'q raqam — hisob yaratilmaydi; bloklangan foydalanuvchi — bog'lanmaydi
+	if err := s.RememberChat(ctx, chat+6, newPhone(7)); err != nil {
+		t.Fatal(err)
+	}
+	if count(`select count(*)::int from users where phone = $1`, newPhone(7)) != 0 {
+		t.Fatal("RememberChat hisob yaratdi")
+	}
+	if err := s.RememberChat(ctx, chat+7, "998900000066"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.KnownLoginPhone(ctx, chat+7); got != "" {
+		t.Fatalf("bloklangan foydalanuvchi tanildi: %q", got)
+	}
 }
 
 // hostOf — xato xabarida parol ko'rinmasin

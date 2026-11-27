@@ -130,6 +130,11 @@ func (s *fakeStore) KnownLoginPhone(_ context.Context, chat int64) (string, erro
 	return s.known[chat], nil
 }
 
+func (s *fakeStore) RememberChat(_ context.Context, chat int64, phone string) error {
+	s.known[chat] = phone
+	return nil
+}
+
 func (s *fakeStore) SaveBotUsername(_ context.Context, u string) error { s.username = u; return nil }
 func (s *fakeStore) LastUpdateID(context.Context) (int64, error)       { return 0, nil }
 func (s *fakeStore) SaveLastUpdateID(context.Context, int64) error     { return nil }

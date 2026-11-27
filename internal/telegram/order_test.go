@@ -464,6 +464,32 @@ func TestOrderTestMode(t *testing.T) {
 	}
 }
 
+// 2026-11-28: sinov raqami botda o'z raqamini yuborgach (saytdagi «Telegram orqali kirish»siz) bot uni taniydi
+func TestContactRemembersChatForTestMode(t *testing.T) {
+	w, tg, st, _ := newOrderTest(t)
+	w.OrderMode = OrdersTest
+	w.OrderTestPhones = map[string]bool{"998770000001": true}
+
+	// Hali tanilmagan: /usta oqimni ochmaydi (oddiy salom, raqam so'raladi)
+	if text, _ := say(t, w, tg, privateMsg(300, orderCommand)); text == msgOrderStart {
+		t.Fatal("tanilmagan chatga oqim ochildi")
+	}
+	// Begona kontakt eslab qolinmaydi
+	say(t, w, tg, contactMsg(300, 999, "+998 77 000 00 01"))
+	if st.known[300] != "" {
+		t.Fatalf("begona kontakt eslab qolindi: %v", st.known)
+	}
+	// O'z raqami (kutilayotgan kirish yo'q): kirish kodi beriladi va chat eslab qolinadi
+	text, _ := say(t, w, tg, contactMsg(300, 300, "+998 77 000 00 01"))
+	sentCode(t, w, st, text, "998770000001")
+	if st.known[300] != "998770000001" {
+		t.Fatalf("chat eslab qolinmadi: %v", st.known)
+	}
+	if text, _ := say(t, w, tg, privateMsg(300, orderCommand)); text != msgOrderStart {
+		t.Fatalf("raqamdan keyin /usta: %q", text)
+	}
+}
+
 // Hamma uchun yoqilganda ham sinov raqami (notanish chatdan raqam yuborsa ham) dry-run bo'ladi
 func TestOrderOnModeTestPhoneIsDryRun(t *testing.T) {
 	w, tg, _, ord := newOrderTest(t)
