@@ -88,6 +88,20 @@ type Worker struct {
 	// pendingAsk — raqam so'ralgan, hali yubormagan chatlar (chat_id → so'ralgan vaqt). Server qayta ishga tushsa
 	// yo'qoladi — eng ko'pi bir nechta eslatma ketmay qoladi.
 	pendingAsk sync.Map
+
+	// Orders — «Usta chaqirish» (order.go): mijoz botda e'lon beradi. nil yoki OrderMode = OrdersOff — o'chiq.
+	Orders    OrderStore
+	OrderMode OrderMode
+	// OrderTestPhones — sinov raqamlari (ORDER_TEST_PHONES): ularning e'loni tekshiriladi, lekin saqlanmaydi va
+	// ustalarga bormaydi; OrdersTest holatida oqim faqat shu raqamlarga ochiq.
+	OrderTestPhones map[string]bool
+	// STT — ovozli xabarni matnga aylantirish; nil bo'lsa bot muammoni yozib yuborishni so'raydi.
+	STT Transcriber
+	// STTName — ovoz yuboriladigan xizmat nomi (foydalanuvchiga oldindan aytiladi), masalan "OpenAI"
+	STTName string
+	// OutboxNotify — e'lon joylangach bildirishnoma ishchilarini (Telegram, push) darhol uyg'otadi
+	OutboxNotify func()
+	drafts       orders
 }
 
 // contactRemindMaxAge — shundan eski so'rov eslatilmaydi (odam allaqachon ketgan yoki boshqa yo'l bilan kirgan)
@@ -194,6 +208,32 @@ var botTexts = []BotTexts{
 	},
 }
 
+// orderBotTexts — «Usta chaqirish» hamma uchun yoqilganda (TELEGRAM_ORDERS=on): kirish matni o'zgarmaydi,
+// oxiriga e'lon berish qo'shiladi.
+var orderBotTexts = []BotTexts{
+	{
+		Lang:        "",
+		Description: botTexts[0].Description + "\n\n🛠 Usta kerakmi? «START», keyin «" + btnOrder + "» — 1 daqiqada e'lon.",
+		Short:       "Usta chaqirish va Ustame'ga kirish. Ustalar va e'lonlar: ustame.com",
+	},
+	{
+		Lang:        "ru",
+		Description: botTexts[1].Description + "\n\n🛠 Нужен мастер? «START», затем «" + btnOrder + "» — заявка за минуту.",
+		Short:       "Вызов мастера и вход в Ustame. Мастера и заказы: ustame.com",
+	},
+}
+
+// String — jurnal uchun
+func (m OrderMode) String() string {
+	switch m {
+	case OrdersOn:
+		return "on"
+	case OrdersTest:
+		return "test"
+	}
+	return "off"
+}
+
 var (
 	// is_persistent: raqam yuborilguncha tugma doim ko'rinadi (oddiy klaviatura ochilganda ham 🎛 ortiga yashirinmaydi);
 	// one_time_keyboard: bosilgach o'zi yopiladi.
@@ -205,7 +245,29 @@ var (
 		"input_field_placeholder": "👇 «" + contactButton + "» tugmasini bosing",
 	}
 	removeKeyboard = map[string]any{"remove_keyboard": true}
+
+	// helloOrderKeyboard — havolasiz /start (notanish chat): kirish va «Usta chaqirish» (order.go)
+	helloOrderKeyboard = map[string]any{
+		"keyboard": [][]map[string]any{
+			{{"text": contactButton, "request_contact": true}},
+			{{"text": btnOrder}},
+		},
+		"resize_keyboard":         true,
+		"one_time_keyboard":       true,
+		"is_persistent":           true,
+		"input_field_placeholder": "👇 Tugmani tanlang",
+	}
+
+	// botCommands — chatdagi «Menu» tugmasi (Orders yoqilganda)
+	botCommands = []BotCommand{
+		{Command: "usta", Description: "🛠 Usta chaqirish — e'lon berish"},
+		{Command: "start", Description: "🔑 Ustame'ga kirish"},
+	}
 )
+
+const msgHelloOrder = "Assalomu alaykum! Bu Ustame boti.\n\n" +
+	"🛠 Usta kerakmi? «" + btnOrder + "» tugmasini bosing — 1 daqiqada e'lon beramiz, ustalar o'zlari narx taklif qiladi.\n\n" +
+	"🔑 Ustame'ga kirish uchun «" + contactButton + "» tugmasini bosing — kirish kodini yuboramiz.\n\n" + contactTrust
 
 func (w *Worker) defaults() {
 	if w.PollTimeout == 0 {
@@ -237,11 +299,7 @@ func (w *Worker) Run(ctx context.Context) {
 				log.Printf("telegram: bot nomini saqlab bo'lmadi: %v", err)
 			}
 			log.Printf("telegram: @%s boti ishga tushdi", me.Username)
-			for _, t := range botTexts {
-				if err := w.TG.EnsureTexts(ctx, t); err != nil {
-					log.Printf("telegram: bot tavsifi (%q) o'rnatilmadi: %v", t.Lang, err)
-				}
-			}
+			w.ensureProfile(ctx)
 			break
 		}
 		log.Printf("telegram: getMe xato (token to'g'rimi?): %v", err)
@@ -256,6 +314,28 @@ func (w *Worker) Run(ctx context.Context) {
 	go func() { defer wg.Done(); w.deliverLoop(ctx) }()
 	go func() { defer wg.Done(); w.remindLoop(ctx) }()
 	wg.Wait()
+}
+
+// ensureProfile — bot tavsifi va menyusi. «Usta chaqirish» hamma uchun yoqilgandagina (on) tavsifga e'lon berish
+// qo'shiladi va menyu (/usta, /start) o'rnatiladi; off va test holatida prod'dagi profil avvalgidek qoladi, menyuga
+// umuman tegilmaydi (BotFather'da qo'lda qo'yilgan buyruqlar o'chib ketmasin).
+func (w *Worker) ensureProfile(ctx context.Context) {
+	texts := botTexts
+	if w.ordersPublic() {
+		texts = orderBotTexts
+		if err := w.TG.EnsureCommands(ctx, botCommands); err != nil {
+			log.Printf("telegram: bot menyusi o'rnatilmadi: %v", err)
+		}
+	}
+	for _, t := range texts {
+		if err := w.TG.EnsureTexts(ctx, t); err != nil {
+			log.Printf("telegram: bot tavsifi (%q) o'rnatilmadi: %v", t.Lang, err)
+		}
+	}
+	if w.Orders != nil {
+		log.Printf("telegram: «Usta chaqirish» holati: %s, sinov raqamlari: %d, ovoz: %v",
+			w.OrderMode, len(w.OrderTestPhones), w.voiceEnabled())
+	}
 }
 
 func (w *Worker) pollUpdates(ctx context.Context) {
@@ -300,6 +380,9 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 		return
 	}
 	chatID := m.Chat.ID
+	if w.handleOrder(ctx, m) {
+		return
+	}
 	if m.Contact != nil {
 		w.pendingAsk.Delete(chatID)
 		if reply, markup := w.contactReply(ctx, m); reply != "" {
@@ -370,6 +453,8 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) {
 			reply, markup = w.codeReply(ctx, chatID, phone)
 		case looksLikePhone(m.Text):
 			reply, markup = msgTypedPhone, askContactKeyboard
+		case w.ordersPublic():
+			reply, markup, photo = msgHelloOrder, helloOrderKeyboard, cmd == "/start"
 		default:
 			reply, markup, photo = msgHello, askContactKeyboard, cmd == "/start"
 		}

@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"slices"
 )
 
 // Client — Telegram Bot API'ning bizga kerakli qismi.
@@ -50,10 +52,39 @@ type Message struct {
 	} `json:"chat"`
 	From    *Sender  `json:"from"`
 	Contact *Contact `json:"contact"`
+
+	// «Usta chaqirish» oqimi (order.go): ovozli xabar, joylashuv, rasm va rasm izohi
+	Voice    *Media      `json:"voice"`
+	Audio    *Media      `json:"audio"`
+	Location *Location   `json:"location"`
+	Photo    []PhotoSize `json:"photo"`
+	Caption  string      `json:"caption"`
 }
 
 type Sender struct {
-	ID int64 `json:"id"`
+	ID        int64  `json:"id"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+// Media — ovozli xabar yoki audio fayl
+type Media struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"` // soniya
+	FileSize int    `json:"file_size"`
+}
+
+type Location struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+
+// PhotoSize — Telegram bitta rasmni bir nechta o'lchamda beradi (kichigidan kattasiga)
+type PhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int    `json:"file_size"`
 }
 
 // Contact — "Raqamni yuborish" tugmasi yoki ulashilgan kontakt. UserID — kontakt egasining
@@ -152,6 +183,66 @@ func (c *Client) SendPhotoMarkup(ctx context.Context, chatID int64, photoURL, ca
 		params["reply_markup"] = markup
 	}
 	return c.call(ctx, "sendPhoto", params, nil)
+}
+
+// maxDownload — botga yuborilgan fayldan shuncha baytdan ko'pi o'qilmaydi (ovoz va rasm uchun yetarli)
+const maxDownload = 10 << 20
+
+// DownloadFile — Telegram serveridagi faylni (ovoz, rasm) file_id bo'yicha yuklab oladi.
+func (c *Client) DownloadFile(ctx context.Context, fileID string) ([]byte, error) {
+	var f struct {
+		FilePath string `json:"file_path"`
+		FileSize int    `json:"file_size"`
+	}
+	if err := c.call(ctx, "getFile", map[string]any{"file_id": fileID}, &f); err != nil {
+		return nil, err
+	}
+	if f.FilePath == "" || f.FileSize > maxDownload {
+		return nil, fmt.Errorf("telegram getFile: fayl juda katta yoki yo'q")
+	}
+	base := c.BaseURL
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		base+"/file/bot"+url.PathEscape(c.Token)+"/"+f.FilePath, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("telegram faylni yuklab bo'lmadi") // xato matnida token bo'lmasin
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("telegram fayl: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownload+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxDownload {
+		return nil, fmt.Errorf("telegram fayl juda katta")
+	}
+	return data, nil
+}
+
+// BotCommand — bot menyusidagi buyruq (chatdagi «Menu» tugmasi)
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// EnsureCommands — menyudagi buyruqlar farq qilsagina o'rnatadi (EnsureTexts kabi, 429 dan qochish uchun).
+func (c *Client) EnsureCommands(ctx context.Context, cmds []BotCommand) error {
+	var cur []BotCommand
+	if err := c.call(ctx, "getMyCommands", struct{}{}, &cur); err != nil {
+		return err
+	}
+	if slices.Equal(cur, cmds) {
+		return nil
+	}
+	return c.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil)
 }
 
 // BotTexts — botning profil matnlari: description — bo'sh chatda «START» tugmasi ustida ko'rinadi,

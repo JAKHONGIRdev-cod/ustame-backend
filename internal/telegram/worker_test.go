@@ -20,6 +20,7 @@ type fakeTG struct {
 	photos    []string         // har bir yuborilgan xabarning rasmi (sendPhoto; oddiy xabarda "")
 	failPhoto bool             // sendPhoto xato qaytarsin (rasm URL ishlamayotgandek)
 	errFor    map[int64]string // chat_id -> butun JSON javob
+	profile   []string         // bot profilini o'zgartirgan chaqiruvlar: "setMyDescription:<matn>", "setMyCommands" ...
 }
 
 type sentMsg struct {
@@ -55,6 +56,25 @@ func (f *fakeTG) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.markups = append(f.markups, p["reply_markup"])
 		f.photos = append(f.photos, p["photo"].(string))
 		w.Write([]byte(`{"ok":true,"result":{}}`))
+	case strings.HasSuffix(r.URL.Path, "/getMyDescription"):
+		w.Write([]byte(`{"ok":true,"result":{"description":""}}`))
+	case strings.HasSuffix(r.URL.Path, "/getMyShortDescription"):
+		w.Write([]byte(`{"ok":true,"result":{"short_description":""}}`))
+	case strings.HasSuffix(r.URL.Path, "/getMyCommands"):
+		w.Write([]byte(`{"ok":true,"result":[]}`))
+	case strings.Contains(r.URL.Path, "/setMy"):
+		f.mu.Lock()
+		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		if d, ok := p["description"].(string); ok {
+			method += ":" + d
+		}
+		f.profile = append(f.profile, method)
+		f.mu.Unlock()
+		w.Write([]byte(`{"ok":true,"result":true}`))
+	case strings.HasSuffix(r.URL.Path, "/getFile"):
+		w.Write([]byte(`{"ok":true,"result":{"file_path":"media/` + p["file_id"].(string) + `","file_size":3}}`))
+	case strings.Contains(r.URL.Path, "/file/bot"):
+		w.Write([]byte("BIN")) // ovoz yoki rasmning o'zi
 	case strings.HasSuffix(r.URL.Path, "/getMe"):
 		w.Write([]byte(`{"ok":true,"result":{"username":"UstameTestBot"}}`))
 	default:

@@ -31,6 +31,18 @@ type Config struct {
 	// SMS_DAILY_LIMIT — 24 soatda yuboriladigan kod SMS'lari chegarasi (test raqamlarsiz). Bot ko'p
 	// raqamga kod so'rab Eskiz balansini bo'shatmasligi uchun; yetganda faqat Telegram orqali kirish qoladi.
 	SMSDailyLimit int
+
+	// TELEGRAM_ORDERS — botdagi «Usta chaqirish» (e'lon berish): off (standart, bo'sh ham) | test | on.
+	// test — faqat ORDER_TEST_PHONES uchun; on — hamma uchun.
+	TelegramOrders string
+	// ORDER_TEST_PHONES="998901234567,998..." — sinov raqamlari: botdagi e'loni tekshiriladi, lekin saqlanmaydi va
+	// ustalarga yuborilmaydi (bot faqat kimga xabar ketishini aytadi).
+	OrderTestPhones []string
+	// Ovozli xabarni matnga aylantirish (OpenAI /v1/audio/transcriptions ga mos xizmat). STT_API_KEY bo'sh bo'lsa
+	// bot ovozli xabarni qabul qilmaydi va muammoni yozib yuborishni so'raydi.
+	STTAPIKey string
+	STTURL    string // bo'sh — https://api.openai.com/v1/audio/transcriptions
+	STTModel  string // bo'sh — gpt-4o-transcribe
 }
 
 func Load() (*Config, error) {
@@ -51,6 +63,12 @@ func Load() (*Config, error) {
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		ExpoAccessToken:  os.Getenv("EXPO_ACCESS_TOKEN"),
 		SMSDailyLimit:    300,
+
+		TelegramOrders:  os.Getenv("TELEGRAM_ORDERS"),
+		OrderTestPhones: parsePhoneList(os.Getenv("ORDER_TEST_PHONES")),
+		STTAPIKey:       os.Getenv("STT_API_KEY"),
+		STTURL:          os.Getenv("STT_URL"),
+		STTModel:        os.Getenv("STT_MODEL"),
 	}
 	if v := os.Getenv("SMS_DAILY_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -95,6 +113,24 @@ func parseTestPhones(s string) map[string]string {
 		}
 	}
 	return m
+}
+
+// parsePhoneList: "+998 90 123 45 67, 998901112233" -> ["998901234567", "998901112233"] (faqat raqamlar,
+// bazadagi ko'rinishda; vergul yoki nuqtali vergul bilan ajratiladi)
+func parsePhoneList(s string) []string {
+	var out []string
+	for _, item := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' }) {
+		digits := strings.Map(func(r rune) rune {
+			if r >= '0' && r <= '9' {
+				return r
+			}
+			return -1
+		}, item)
+		if digits != "" {
+			out = append(out, digits)
+		}
+	}
+	return out
 }
 
 // loadDotenv KEY=VALUE qatorlarini o'qiydi; muhitda allaqachon bor o'zgaruvchilar ustidan yozmaydi.

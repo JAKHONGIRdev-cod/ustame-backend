@@ -78,14 +78,33 @@ func main() {
 	go receipts.Run(ctx)
 
 	if cfg.TelegramBotToken != "" {
+		tgStore := &telegram.PgStore{DB: db}
 		bot := &telegram.Worker{
 			TG:    &telegram.Client{Token: cfg.TelegramBotToken, HTTP: &http.Client{Timeout: 40 * time.Second}},
-			Store: &telegram.PgStore{DB: db},
+			Store: tgStore,
 			Wake:  outbox.Subscribe(),
 			// Bot kirish kodini ham bera oladi (havola ishlamasa): /api/auth/verify shu kalit bilan tekshiradi
 			OTPSecret: cfg.OTPSecret,
 			// Raqam so'ralganda: «Raqamni yuborish» tugmasi qayerda va «OK» — rasmli ko'rsatma (saytdagi fayl)
 			HelpPhotoURL: "https://ustame.com/tg-help/raqam-yuborish.png",
+		}
+		// «Usta chaqirish»: mijoz botning o'zida e'lon beradi (internal/telegram/order.go).
+		// TELEGRAM_ORDERS: off (standart) | test (faqat ORDER_TEST_PHONES) | on (hamma uchun)
+		if mode := telegram.ParseOrderMode(cfg.TelegramOrders); mode != telegram.OrdersOff {
+			bot.Orders = tgStore
+			bot.OrderMode = mode
+			bot.OrderTestPhones = map[string]bool{}
+			for _, p := range cfg.OrderTestPhones {
+				bot.OrderTestPhones[p] = true
+			}
+			bot.OutboxNotify = outbox.Notify
+			if cfg.STTAPIKey != "" {
+				bot.STT = &telegram.OpenAISTT{APIKey: cfg.STTAPIKey, URL: cfg.STTURL, Model: cfg.STTModel,
+					HTTP: &http.Client{Timeout: 45 * time.Second}}
+				bot.STTName = telegram.STTProviderName(cfg.STTURL)
+			} else {
+				log.Print("STT_API_KEY berilmagan — bot ovozli xabarni qabul qilmaydi (faqat matn)")
+			}
 		}
 		go bot.Run(ctx)
 	} else {

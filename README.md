@@ -55,6 +55,49 @@ SMS'siz kirish (jadval: `sql/01-telegram-login.sql`):
 
 Havola 10 daqiqa amal qiladi va bir martalik. `secret` havolada yo'q, bazada faqat sha256 xeshi saqlanadi.
 
+## Botda «Usta chaqirish» (e'lon berish)
+
+Mijoz ilovasiz, botning o'zida e'lon beradi (`internal/telegram/order.go`). Operator kerak emas:
+
+1. Kirish: `t.me/<bot>?start=order`, `?start=order_<manba>` yoki `?start=order_<manba>__<kampaniya>` (reklama
+   havolasi, masalan `order_instagram__nov25`), `/usta` buyrug'i (bot menyusi) yoki havolasiz `/start` dagi
+   «🛠 Usta chaqirish» tugmasi.
+2. Kasb va tuman — tugmalar (Toshkent shahri tumanlari + «Boshqa viloyat» → viloyat → tuman). Tumanlar ro'yxati
+   `regions_gen.go` da: ilovadagi `regions.ts` o'zgarsa `node usta-api/scripts/gen-district-regions.mjs`.
+3. Muammo — 🎤 ovoz (`STT_API_KEY` bo'lsa matnga aylanadi) yoki matn; rasm (izohi bilan ham) ixtiyoriy. Ovoz
+   yoqilgan bo'lsa, muammo so'rovining o'zida ovoz qaysi xizmatga yuborilishi oldindan aytiladi (STT_URL bo'yicha:
+   OpenAI, Groq yoki manzil nomi) va yozib yuborish taklif qilinadi; ovozning o'zi saqlanmaydi.
+4. Manzil — 📍 joylashuv tugmasi yoki matn. Vaqt: Bugun / Shu hafta / Shoshilmayman («shoshilinch» yo'q — u faqat
+   «hozir bo'shman» belgilagan ustalarga boradi).
+5. Mijoz tayyor e'lonni ko'rib «✅ E'lon qilish» ni bosadi. Raqami noma'lum bo'lsa — «📱 Raqamni yuborish»
+   (kirishdagi kabi faqat o'z raqami). E'lon `post_job` orqali shu foydalanuvchi nomidan chiqadi — ustalarga xabar
+   odatdagidek; mijozga takliflarni ko'rish tugmasi (kirish kodi bilan) yuboriladi.
+
+Yangi jadval yo'q, qoralama xotirada (server qayta ishga tushsa yoki deploy paytida boshlangan qoralama yo'qoladi —
+eski tugma bosilsa bot «/usta bilan qayta boshlang» deydi). Himoyalar:
+
+- Takroriy e'lon: yangilanishlar ketma-ket ishlanadi (ikkinchi bosish qoralamasiz — «eskirgan»), bundan tashqari
+  baza xuddi shu mijozning xuddi shu e'lonini (kasb, tuman, tavsif) 10 daqiqa ichida qayta yaratmaydi.
+- Spam: bitta foydalanuvchi bot orqali 24 soatda 5 tadan ko'p e'lon bera olmaydi.
+- Sinov raqamlari (`ORDER_TEST_PHONES`): e'lon to'liq tekshiriladi (post_job, rasm, joylashuv, triggerlar), keyin
+  tranzaksiya bekor qilinadi — e'lon saqlanmaydi, ustalarga xabar ketmaydi; bot nechta usta va admin xabar olishini aytadi.
+
+Manba: reklama havolasidan kelgan tashrif `visit_sources` ga (`medium = telegram_bot`, `landing = tg-order`; menyu
+va tugma — tashrif emas), bot orqali ro'yxatdan o'tgan yangi mijozga `users.signup_source` (manba bo'lmasa
+`telegram_bot`). Admin «Trafik manbalari» ikkalasini ham ko'rsatadi.
+
+Sozlamalar:
+
+- `TELEGRAM_ORDERS` — `off` (standart, bo'sh ham) | `test` (faqat `ORDER_TEST_PHONES`, avval Telegram orqali
+  kirgan chatdan) | `on` (hamma uchun: salomlashuvda tugma, bot tavsifiga qo'shimcha, menyu `/usta`, `/start`).
+  `off`/`test` da bot profiliga tegilmaydi. `on` dan qaytarilsa menyu o'zi o'chmaydi (BotFather'da o'chiriladi).
+- `ORDER_TEST_PHONES` — vergul bilan, masalan `998901234567,998901112233`.
+- `STT_API_KEY` (bo'sh — ovoz qabul qilinmaydi), `STT_URL` (standart OpenAI `/v1/audio/transcriptions`; Groq va
+  boshqa mos xizmatlar ham bo'ladi), `STT_MODEL` (standart `gpt-4o-transcribe`).
+
+SQL sinovi (lokal PGlite, prod'ga tegmaydi — test lokal bo'lmagan manzilni rad etadi):
+`USTAME_PG_TEST_URL=postgres://postgres@127.0.0.1:5433/postgres?sslmode=disable&pool_max_conns=1 go test -run TestPgOrderStore ./internal/telegram/`
+
 ## Railway'ga joylash
 
 1. Railway → New Project → Deploy from GitHub repo → `ustame-backend`. Yig'ish `Dockerfile` va `railway.json` bo'yicha.
