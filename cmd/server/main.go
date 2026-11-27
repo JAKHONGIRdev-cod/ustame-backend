@@ -72,6 +72,13 @@ func main() {
 		Store: pushStore,
 		Wake:  outbox.Subscribe(),
 		Sent:  pushSent,
+		// Android'da o'ng tomonda rangli logo (FCM fonda large icon'ni faqat shu rasmdan oladi — internal/push/logo.go)
+		ImageURL: push.ImageURL(cfg.PushImageURL, cfg.PublicDomain),
+	}
+	if pusher.ImageURL != "" {
+		log.Printf("push: Android bildirishnomalarida rasm %s", pusher.ImageURL)
+	} else {
+		log.Print("push: bildirishnomalar rasmsiz (PUSH_IMAGE_URL=off yoki domen yo'q)")
 	}
 	go pusher.Run(ctx)
 	receipts := &push.ReceiptWorker{Expo: expo, Store: pushStore, Kick: pushSent}

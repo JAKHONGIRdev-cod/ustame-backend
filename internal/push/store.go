@@ -39,7 +39,8 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 		select (select count(*)::int from u), u.id, t.token, u.message, u.link, u.created_at,
 		       coalesce(to_jsonb(usr)->>'lang', ''), -- users.lang ustuni hali bo'lmasa ham xato bermaydi
 		       coalesce((to_jsonb(t)->>'channels')::int, 0), -- push_tokens.channels (2026-11-17) bo'lmasa ham
-		       u.audience, `+multiRoleSQL+` -- bir nechta rolli odam (matn boshidagi belgi uchun)
+		       u.audience, `+multiRoleSQL+`, -- bir nechta rolli odam (matn boshidagi belgi uchun)
+		       coalesce(t.platform, '') -- android | ios: rangli logo faqat Android'ga (logo.go)
 		from u left join push_tokens t on t.user_id = u.user_id
 		left join users usr on usr.id = u.user_id
 		order by u.id`, limit)
@@ -51,7 +52,8 @@ func (s *PgStore) Claim(ctx context.Context, limit int) (int, []Message, error) 
 	for rows.Next() {
 		var m Message
 		var token *string
-		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang, &m.Channels, &m.Audience, &m.MultiRole); err != nil {
+		if err := rows.Scan(&claimed, &m.ID, &token, &m.Text, &m.Link, &m.CreatedAt, &m.Lang, &m.Channels, &m.Audience, &m.MultiRole,
+			&m.Platform); err != nil {
 			rows.Close()
 			return 0, nil, err
 		}

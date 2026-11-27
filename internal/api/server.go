@@ -19,6 +19,7 @@ import (
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/auth"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/config"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/eskiz"
+	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/push"
 	"github.com/JAKHONGIRdev-cod/ustame-backend/internal/wakeup"
 )
 
@@ -80,6 +81,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/files", s.uploadFile)
 	mux.HandleFunc("DELETE /api/files", s.deleteFile)
 	mux.HandleFunc("POST /api/client-errors", s.clientError)
+	// Android bildirishnomasidagi rangli logo: telefon har push'da shu yerdan yuklaydi (internal/push/logo.go)
+	mux.HandleFunc("GET "+push.LogoPath, push.ServeLogo)
 	return securityHeaders(s.cors(recoverer(mux)))
 }
 

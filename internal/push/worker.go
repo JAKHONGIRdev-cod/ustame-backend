@@ -24,6 +24,7 @@ type Message struct {
 	// rolda (admin, usta, e'lon bergan mijoz, do'kon). Matn boshidagi belgi shulardan (internal/audience).
 	Audience  string
 	MultiRole bool
+	Platform  string // push_tokens.platform: android | ios
 }
 
 // Store — push ishchisi ishlatadigan baza amallari (pgx'dagisi: store.go).
@@ -68,6 +69,9 @@ type Worker struct {
 	// Sent — xabarlar Expo'ga topshirilgach signal (ReceiptWorker ~15 daqiqadan keyin receipt'larni tekshiradi).
 	// nil bo'lsa — signal yuborilmaydi. Kanal bufferli bo'lsin: signal kutib qolmaydi.
 	Sent chan<- struct{}
+
+	// ImageURL — Android bildirishnomasining o'ng tomonidagi rangli logo havolasi (logo.go, ImageURL). Bo'sh — rasmsiz.
+	ImageURL string
 }
 
 const (
@@ -147,6 +151,9 @@ func (w *Worker) send(ctx context.Context, part []Message) bool {
 		}
 		if m.Link != nil {
 			msgs[i].Data = map[string]string{"url": *m.Link}
+		}
+		if w.ImageURL != "" && m.Platform == "android" {
+			msgs[i].RichContent = &RichContent{Image: w.ImageURL}
 		}
 	}
 	tickets, err := w.Expo.Send(ctx, msgs)

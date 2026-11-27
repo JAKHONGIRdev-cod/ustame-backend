@@ -17,6 +17,7 @@ Biznes mantiq (e'lon, taklif, shartnoma, chat, baho, admin) va ruxsat tekshiruvl
 | `POST /api/rpc/{fn}` `{p_arg: ...}` | `sql/app.sql` dagi funksiya (faqat `authenticated` ga ruxsat berilganlari) |
 | `GET/POST/DELETE /api/files` | Rasmlar: avatar, e'lon rasmi, portfolio |
 | `GET /healthz` | Sog'liq tekshiruvi |
+| `GET /push/logo.png` | Android bildirishnomasidagi rangli logo (telefon har push'da yuklaydi, pastda) |
 
 Xatolar: `{"error": "KOD"}` — `AUTH_REQUIRED` 401, `NOT_ALLOWED` 403, `NOT_FOUND` 404, qolgan biznes xatolar 400.
 
@@ -41,6 +42,17 @@ Smoke test (8 tekshiruv): `powershell -ExecutionPolicy Bypass -File scripts\smok
 - Bot nomi ishga tushganda `app_secrets.telegram_bot_username` ga yoziladi (ilova shundan oladi).
 
 Tokenni faqat bitta joyda (Railway) bering: bir token bilan ikki server `getUpdates` qilsa, Telegram 409 qaytaradi.
+
+## Telefon bildirishnomalari (push)
+
+`internal/push` — `notification_outbox` dagi xabarlarni Expo Push orqali yuboradi (Android'da FCM). Android'da
+o'ng tomondagi rangli logo `richContent.image` bilan beriladi: ilova yopiq/orqa fonda bo'lsa bildirishnomani FCM'ning
+o'zi chizadi va ilovaga qo'yilgan large icon'ni o'qimaydi, rasmni faqat xabardagi havoladan oladi. Kichik belgi har
+doim oq siluet (Android qoidasi). Bildirishnoma ochilganda (pastga tortilganda) FCM rasmni katta qilib ko'rsatadi,
+matn bitta qatorda qoladi.
+
+- `PUSH_IMAGE_URL` — bo'sh (standart): serverning o'zidagi `/push/logo.png` (`RAILWAY_PUBLIC_DOMAIN` dan);
+  `off` — rasmsiz; boshqa qiymat — shu havola. Ishga tushganda log'da qaysi rasm ishlatilishi yoziladi.
 
 ## Telegram orqali kirish
 

@@ -33,6 +33,14 @@ type ExpoMessage struct {
 	Sound     string            `json:"sound"`
 	ChannelID string            `json:"channelId"` // ilovadagi Android kanali (src/lib/push.ts)
 	Priority  string            `json:"priority"`
+	// RichContent — o'ng tomondagi rangli logo (nega shunday — logo.go). Faqat Android tokenlariga: iOS'da rasm
+	// Notification Service Extension'siz ko'rinmaydi, ilovada esa u yo'q.
+	RichContent *RichContent `json:"richContent,omitempty"`
+}
+
+// RichContent — Expo Push API'ning richContent maydoni (Android'da FCM notification.image bo'ladi).
+type RichContent struct {
+	Image string `json:"image"`
 }
 
 // Ticket — Expo'ning har bir xabarga javobi (yuborilgan tartibda). Status "ok" bo'lsa ID beriladi —

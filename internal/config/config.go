@@ -26,6 +26,11 @@ type Config struct {
 	TelegramBotToken string
 	// EXPO_ACCESS_TOKEN — ixtiyoriy: faqat Expo'da "enhanced push security" yoqilsa kerak.
 	ExpoAccessToken string
+	// PUSH_IMAGE_URL — Android bildirishnomasidagi rangli logo (internal/push/logo.go): bo'sh — serverning o'zidagi
+	// /push/logo.png, "off" — rasmsiz, boshqa qiymat — shu havola.
+	PushImageURL string
+	// RAILWAY_PUBLIC_DOMAIN — serverning ommaviy domeni (Railway o'zi beradi); lokalda bo'sh.
+	PublicDomain string
 	// Web-sayt manzillari (CORS). "*" — hammasiga ruxsat (faqat lokal sinov uchun).
 	AllowedOrigins []string
 	// SMS_DAILY_LIMIT — 24 soatda yuboriladigan kod SMS'lari chegarasi (test raqamlarsiz). Bot ko'p
@@ -62,6 +67,8 @@ func Load() (*Config, error) {
 
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		ExpoAccessToken:  os.Getenv("EXPO_ACCESS_TOKEN"),
+		PushImageURL:     os.Getenv("PUSH_IMAGE_URL"),
+		PublicDomain:     os.Getenv("RAILWAY_PUBLIC_DOMAIN"),
 		SMSDailyLimit:    300,
 
 		TelegramOrders:  os.Getenv("TELEGRAM_ORDERS"),
