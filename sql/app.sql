@@ -1966,12 +1966,15 @@ $$;
 
 create or replace function public.notify_new_proposal()
 returns trigger language plpgsql security definer set search_path = public as $$
-declare v_client_id uuid; v_job_title text; v_provider_name text;
+declare v_client_id uuid; v_job_title text; v_provider_name text; v_n int;
 begin
   select client_id, title into v_client_id, v_job_title from jobs where id = new.job_id;
   select full_name into v_provider_name from profiles where id = new.provider_id;
+  -- 2026-11-24: xabarda narx va jami takliflar soni — mijoz narxni ko'rib, ilovaga qaytsin
+  select count(*) into v_n from proposals where job_id = new.job_id and status = 'submitted';
   perform queue_notification(v_client_id, format(
-    E'\U0001F514 "%s" e''loningizga yangi taklif keldi.\n%s', v_job_title, v_provider_name),
+    E'\U0001F514 "%s" e''loningizga taklif: %s, %s so''m.%s', v_job_title, v_provider_name, _som(new.price),
+    case when v_n > 1 then format(' Jami %s ta taklif.', v_n) else '' end),
     '/job/' || new.job_id);
   return new;
 end;
@@ -7312,11 +7315,11 @@ grant execute on function public.get_shop_prices(uuid), public.quote_estimate(js
 to anon, authenticated;
 
 -- ===== do'kon obunasi =====
--- Do'konlar ham oylik obuna to'laydi (subscription_settings.shop_price, 399 000 so'm). Bepul davrda (free_until gacha)
+-- Do'konlar ham oylik obuna to'laydi (subscription_settings.shop_price, 499 000 so'm; 2026-11-25 gacha 399 000). Bepul davrda (free_until gacha)
 -- hamma do'kon to'liq ishlaydi. Keyin obunasiz do'kon ro'yxat va xaritada bepul qoladi, lekin narxlari (do'kon
 -- sahifasi va "smeta qaysi do'konda qancha" — get_shop_prices, quote_estimate) faqat obunasi faol bo'lsa ko'rinadi.
 -- To'lov hozircha qo'lda: admin admin_extend_shop_subscription bilan uzaytiradi (subscription_payments, kind='shop').
-alter table public.subscription_settings add column if not exists shop_price int not null default 399000
+alter table public.subscription_settings add column if not exists shop_price int not null default 499000
   check (shop_price > 0);
 alter table public.subscription_payments add column if not exists kind text not null default 'provider'
   check (kind in ('provider', 'shop'));
@@ -7501,9 +7504,13 @@ from public, anon, authenticated;
 
 alter table public.jobs add column if not exists renewed_at timestamptz;
 alter table public.jobs add column if not exists stale_notified_at timestamptz;
+-- 2026-11-24: mijoz ochmagan takliflar eslatmasi (run_periodic_tasks 1b-bandi), ko'pi bilan 2 marta
+alter table public.jobs add column if not exists proposals_reminded_at timestamptz;
+alter table public.jobs add column if not exists proposals_reminders int not null default 0;
 alter table public.provider_profiles add column if not exists completeness_nudged_at timestamptz;
 alter table public.provider_profiles add column if not exists completeness_nudges int not null default 0;
--- 2026-11-23: alohida "ish joyini belgilang" eslatmasi (faqat joylashuvi yo'q ustalarga) — run_periodic_tasks 5-bandi
+-- 2026-11-23: alohida "ish joyini belgilang" eslatmasi edi; 2026-11-26 dan profil eslatmasiga qo'shildi va boshqa
+-- yuborilmaydi. Hisoblagich saqlanadi: avval olinganlari ham ikkala eslatmaning umumiy chegarasiga (2) kiradi.
 alter table public.provider_profiles add column if not exists location_nudged_at timestamptz;
 alter table public.provider_profiles add column if not exists location_nudges int not null default 0;
 
@@ -7627,7 +7634,7 @@ $$;
 --   1) Qo'ng'iroqdan 20 soat - 14 kun o'tib, baho qo'ymagan mijozga bir marta "Ustani baholang"
 --   2) 30 kundan beri ochiq e'lon egasiga "Usta topdingizmi?" (yana 30 kun qoldirish yoki yopish)
 --   3) Shundan keyin 7 kun javob bo'lmasa — e'lon avtomatik yopiladi
---   4) Profili to'liq bo'lmagan ustaga haftada bir, ko'pi bilan 3 marta "Profilingizni to'ldiring"
+--   4) Profili to'liq bo'lmagan ustaga (ish joyi ham shu xabarda) jami ko'pi bilan 2 marta "Profilingizni to'ldiring"
 create or replace function public.run_periodic_tasks()
 returns int language plpgsql security definer set search_path = public as $$
 declare
@@ -7638,10 +7645,20 @@ declare
 begin
   -- 1) Baho eslatmasi (shartnoma bo'lgan juftlikka emas — u yerda o'z baholash tartibi bor)
   for r in
-    select distinct on (c.client_id, c.provider_id) c.client_id, c.provider_id, p.full_name
+    select distinct on (c.client_id, c.provider_id) c.client_id, c.provider_id, p.full_name,
+           m.job_id, m.proposal_id, m.title
       from provider_contacts c
       join profiles p on p.id = c.provider_id
       join users u on u.id = c.client_id
+      -- 2026-11-24: mijozning ochiq e'loniga shu usta qo'ng'iroqdan oldin taklif bergan bo'lsa
+      left join lateral (
+        select j.id as job_id, pr.id as proposal_id, j.title
+          from proposals pr join jobs j on j.id = pr.job_id
+         where j.client_id = c.client_id and pr.provider_id = c.provider_id
+           and j.status = 'open' and pr.status = 'submitted' and pr.created_at < c.created_at
+         order by pr.created_at desc
+         limit 1
+      ) m on true
      where not v_quiet and c.kind = 'call'
        and c.created_at < now() - interval '20 hours'
        and c.created_at > now() - interval '14 days'
@@ -7656,12 +7673,52 @@ begin
      order by c.client_id, c.provider_id, c.created_at
      limit 200
   loop
-    perform queue_notification(r.client_id,
-      format(E'⭐ %s bilan ishladingizmi? Ustani baholang — bu boshqa mijozlarga yaxshi ustani tanlashga yordam beradi.',
-             r.full_name),
-      '/provider/' || r.provider_id || '?review=1');
+    if r.proposal_id is not null then
+      -- Telefonda kelishgan bo'lishi mumkin: ilovada belgilasa — taklif qabul qilinadi, shartnoma ochiladi
+      perform queue_notification(r.client_id,
+        format(E'\U0001F91D %s bilan "%s" ishi bo''yicha kelishdingizmi? Kelishgan bo''lsangiz, ilovada belgilab qo''ying: '
+               'narx va shartlar yozilib qoladi, ish tugagach ustani baholaysiz.', r.full_name, r.title),
+        '/job/' || r.job_id || '?agreed=' || r.proposal_id);
+    else
+      perform queue_notification(r.client_id,
+        format(E'⭐ %s bilan ishladingizmi? Ustani baholang — bu boshqa mijozlarga yaxshi ustani tanlashga yordam beradi.',
+               r.full_name),
+        '/provider/' || r.provider_id || '?review=1');
+    end if;
     update provider_contacts set review_reminded_at = now()
      where client_id = r.client_id and provider_id = r.provider_id;
+    v_n := v_n + 1;
+  end loop;
+
+  -- 1b) 2026-11-24: mijoz ochmagan takliflar eslatmasi — birinchisi birinchi taklifdan 3 soat keyin, ikkinchisi
+  --     yana 21 soatdan keyin, ko'pi bilan 2 marta. Mijoz takliflarni ochsa (client_viewed_at) — eslatma to'xtaydi.
+  for r in
+    select j.id, j.client_id, j.title, x.n, x.min_price
+      from jobs j
+      join users u on u.id = j.client_id
+      cross join lateral (
+        select count(*)::int as n, min(p.price) as min_price, min(p.created_at) as first_at
+          from proposals p
+         where p.job_id = j.id and p.status = 'submitted' and p.client_viewed_at is null
+      ) x
+     where not v_quiet and j.status = 'open'
+       and u.deleted_at is null and u.blocked_at is null
+       and x.n > 0
+       and j.proposals_reminders < 2
+       and x.first_at < now() - interval '3 hours'
+       and (j.proposals_reminded_at is null or j.proposals_reminded_at < now() - interval '21 hours')
+     limit 200
+  loop
+    perform queue_notification(r.client_id,
+      case when r.n = 1 then
+        format(E'\U0001F514 "%s" e''loningizga taklif keldi: %s so''m. Usta javobingizni kutyapti.',
+               r.title, _som(r.min_price))
+      else
+        format(E'\U0001F514 "%s" e''loningizga %s ta taklif keldi, eng arzoni %s so''m. Ustalar javobingizni kutyapti.',
+               r.title, r.n, _som(r.min_price))
+      end,
+      '/job/' || r.id);
+    update jobs set proposals_reminded_at = now(), proposals_reminders = proposals_reminders + 1 where id = r.id;
     v_n := v_n + 1;
   end loop;
 
@@ -7702,59 +7759,36 @@ begin
     v_n := v_n + 1;
   end loop;
 
-  -- 4) Profilni to'ldirish eslatmasi
+  -- 4) Profilni to'ldirish eslatmasi (2026-11-26: ish joyi ham shu bitta xabarda). Ilovani o'chirgan ustalar
+  --    faqat eslatma olgan edi (profil 3 + ish joyi 3, jami 6 tagacha). Endi: tasdiqlangandan 3 kun o'tib birinchisi,
+  --    kamida 7 kundan keyin ikkinchisi, jami ko'pi bilan 2 marta. Eski "ish joyi" eslatmalari (location_nudges)
+  --    ham shu 2 taga kiradi. Profili to'liq ustalar tanlanmaydi (limit 200 ularga band bo'lib qolmasin).
   for r in
     select pp.user_id
       from provider_profiles pp join users u on u.id = pp.user_id
      where not v_quiet and pp.status = 'approved'
        and u.deleted_at is null and u.blocked_at is null
-       and pp.created_at < now() - interval '2 days'
-       and pp.completeness_nudges < 3
-       and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '7 days')
+       and pp.created_at < now() - interval '3 days'
+       and pp.completeness_nudges + pp.location_nudges < 2
+       and coalesce(greatest(pp.completeness_nudged_at, pp.location_nudged_at), '-infinity') < now() - interval '7 days'
+       and cardinality(_provider_missing(pp.user_id)) > 0
      limit 200
   loop
-    -- Ish joyi bu ro'yxatga kirmaydi: unga alohida eslatma bor (5-band), ikki marta so'ramaymiz
-    v_missing := array_remove(_provider_missing(r.user_id), 'location');
-    if cardinality(v_missing) > 0 then
-      perform queue_notification(r.user_id,
-        format(E'\U0001F4F8 Profilingizni to''ldiring: %s. To''liq profilli ustalar ro''yxatda yuqorida chiqadi '
-               'va mijozlar ularga ko''proq qo''ng''iroq qiladi.',
-               array_to_string(array(
-                 select case m when 'avatar' then 'profil rasmi'
-                               when 'location' then 'ish joyi (xaritada)'
-                               when 'portfolio' then 'ishlaringiz rasmlari'
-                               when 'bio' then 'o''zingiz haqingizda'
-                        end
-                   from unnest(v_missing) m), ', ')),
-        '/profile');
-      update provider_profiles
-         set completeness_nudged_at = now(), completeness_nudges = completeness_nudges + 1
-       where user_id = r.user_id;
-      v_n := v_n + 1;
-    end if;
-  end loop;
-
-  -- 5) Ish joyi eslatmasi (2026-11-23) — FAQAT joylashuvi belgilanmagan tasdiqlangan ustalarga. Joyini belgilagan
-  --    ustaga hech qachon bormaydi. 5 kunda bir marta, ko'pi bilan 3 marta, tunda emas; profil eslatmasidan keyin
-  --    kamida 3 kun o'tgan bo'lsin (bir kunda ikki xil eslatma bormasin).
-  for r in
-    select pp.user_id
-      from provider_profiles pp join users u on u.id = pp.user_id
-     where not v_quiet and pp.status = 'approved'
-       and u.deleted_at is null and u.blocked_at is null
-       and (pp.lat is null or pp.lng is null)
-       and pp.created_at < now() - interval '1 day'
-       and pp.location_nudges < 3
-       and (pp.location_nudged_at is null or pp.location_nudged_at < now() - interval '5 days')
-       and (pp.completeness_nudged_at is null or pp.completeness_nudged_at < now() - interval '3 days')
-     limit 200
-  loop
+    v_missing := _provider_missing(r.user_id);
     perform queue_notification(r.user_id,
-      E'\U0001F4CD Ish joyingizni xaritada belgilang — yaqin atrofdagi mijozlar sizni ro''yxatda birinchi ko''radi '
-      'va qancha uzoqdaligingizni biladi. Bir daqiqalik ish.',
-      '/become-provider');
+      format(E'\U0001F4F8 Profilingizni to''ldiring: %s. To''liq profilli ustalar ro''yxatda yuqorida chiqadi '
+             'va mijozlar ularga ko''proq qo''ng''iroq qiladi.',
+             array_to_string(array(
+               select case m when 'avatar' then 'profil rasmi'
+                             when 'location' then 'ish joyi (xaritada)'
+                             when 'portfolio' then 'ishlaringiz rasmlari'
+                             when 'bio' then 'o''zingiz haqingizda'
+                      end
+                 from unnest(v_missing) m), ', ')),
+      -- Ish joyi, tavsif va ish rasmlari usta anketasida; faqat profil rasmi qolgan bo'lsa — profil sahifasi
+      case when 'location' = any (v_missing) then '/become-provider' else '/profile' end);
     update provider_profiles
-       set location_nudged_at = now(), location_nudges = location_nudges + 1
+       set completeness_nudged_at = now(), completeness_nudges = completeness_nudges + 1
      where user_id = r.user_id;
     v_n := v_n + 1;
   end loop;
