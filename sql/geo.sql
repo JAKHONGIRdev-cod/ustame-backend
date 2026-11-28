@@ -228,6 +228,9 @@ $$;
 -- Masofa yaxlitlangan koordinatadan (approx_coord, ~1 km) hisoblanadi — ustaning aniq joyi chiqib qolmasin.
 -- Joylashuv berilmasa — avval ish joyini belgilagan ustalar, keyin eski tartib (top_rated, reyting, bajarilgan ishlar).
 -- 2026-11-23: joylashuvi bor ustalar har doim joylashuvsizlardan yuqorida (mijoz ruxsat bermagan bo'lsa ham).
+-- 2026-11-28 (katalog + qo'ng'iroq modeli): oxirgi 7 kunda ilovaga kirgan usta (user_activity_days) bir masofa
+--   oralig'ida yuqoriroq; kartada «Yaqinda faol» belgisi uchun 'active_recently' qaytadi. Bu faqat kirish belgisi,
+--   qo'ng'iroqqa javob berish emas.
 drop function if exists public.search_providers(text, text, text, int, int);
 create or replace function public.search_providers(
   p_category text default null,
@@ -266,6 +269,7 @@ begin
                              when y.distance_km < 50 then 4
                              else 5 end,
                         y.has_location desc,
+                        y.active_recently desc,
                         y.top_rated desc, y.completeness desc, y.score desc, y.distance_km asc nulls last,
                         y.completed desc, y.created_at desc) as ord
       from (
@@ -281,8 +285,10 @@ begin
             'lat',               approx_coord(pp.lat),
             'lng',               approx_coord(pp.lng),
             'is_favorite',       exists (select 1 from favorites f where f.client_id = v_uid and f.provider_id = p.id),
-            'stats',             s.stats
+            'stats',             s.stats,
+            'active_recently',   a.active_recently
           ) as item,
+          a.active_recently,
           case when v_lat is not null and pp.lat is not null and pp.lng is not null then
             111.32 * sqrt(power(approx_coord(pp.lat) - v_lat, 2)
                           + power((approx_coord(pp.lng) - v_lng) * cos(radians(v_lat)), 2))
@@ -298,6 +304,11 @@ begin
         from provider_profiles pp
         join profiles p on p.id = pp.user_id
         cross join lateral (select provider_stats(pp.user_id) as stats) s
+        cross join lateral (
+          select exists (select 1 from user_activity_days d
+                          where d.user_id = pp.user_id
+                            and d.day >= (now() at time zone 'Asia/Tashkent')::date - 6) as active_recently
+        ) a
         where pp.status = 'approved'
           and pp.user_id is distinct from v_uid
           and not _blocked(v_uid, pp.user_id)
@@ -339,3 +350,27 @@ grant execute on function
 grant execute on function
   public.search_providers(text, text, text, int, int, double precision, double precision)
   to authenticated;
+
+-- 2026-11-28 (katalog + qo'ng'iroq modeli): usta kartasidagi «Qo'ng'iroq» tugmasi raqamni shu yerdan oladi.
+-- Raqamlar katalog ro'yxatiga qo'shilmaydi (hammasini bir so'rovda yig'ib bo'lmasin) — faqat tugma bosilganda,
+-- bittadan. Qoida get_provider_profile bilan bir xil: kirgan foydalanuvchi, tasdiqlangan usta, o'zaro bloklanmagan.
+-- Usta hisobi bloklangan yoki o'chirilgan bo'lsa — null.
+create or replace function public.get_provider_phone(p_provider_id uuid)
+returns text language plpgsql stable security definer set search_path = public as $$
+declare
+  v_uid   uuid := auth.uid();
+  v_phone text;
+begin
+  if v_uid is null then raise exception 'AUTH_REQUIRED'; end if;
+  select u.phone into v_phone
+    from provider_profiles pp
+    join users u on u.id = pp.user_id
+   where pp.user_id = p_provider_id
+     and pp.status = 'approved'
+     and u.blocked_at is null and u.deleted_at is null
+     and not _blocked(v_uid, pp.user_id);
+  return v_phone;
+end;
+$$;
+revoke execute on function public.get_provider_phone(uuid) from public, anon;
+grant execute on function public.get_provider_phone(uuid) to authenticated;

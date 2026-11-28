@@ -305,6 +305,22 @@ create table if not exists public.contact_reviews (
 create index if not exists contact_reviews_provider_idx on public.contact_reviews (provider_id, created_at desc);
 alter table public.contact_reviews enable row level security;
 
+-- 2026-11-28 (katalog + qo'ng'iroq modeli): qo'ng'iroqdan keyin mijoz «Kelishdingizmi?» ga javob beradi (ixtiyoriy).
+-- Kelishgan bo'lsa narx va ish sanasi ham yozilishi mumkin — nizoda dalil va «bajarilgan ishlar» hisobi uchun.
+-- Faqat record_contact_outcome orqali yoziladi (RLS yoqilgan, siyosat yo'q).
+create table if not exists public.contact_outcomes (
+  id          bigint generated always as identity primary key,
+  client_id   uuid not null references public.users (id) on delete cascade,
+  provider_id uuid not null references public.users (id) on delete cascade,
+  agreed      boolean not null,
+  price       int check (price between 1000 and 1000000000),
+  work_date   date,
+  created_at  timestamptz not null default now()
+);
+create index if not exists contact_outcomes_pair_idx on public.contact_outcomes (client_id, provider_id, created_at desc);
+create index if not exists contact_outcomes_provider_idx on public.contact_outcomes (provider_id, created_at desc);
+alter table public.contact_outcomes enable row level security;
+
 alter table public.provider_profiles enable row level security;
 
 alter table public.jobs              enable row level security;
@@ -7555,6 +7571,38 @@ begin
 end;
 $$;
 
+-- 2026-11-28: «Kelishdingizmi?» javobi. Faqat oxirgi 3 kunda shu ustaga qo'ng'iroq qilgan (yoki Telegram'da yozgan)
+-- mijoz yoza oladi. Kelishmagan bo'lsa narx va sana saqlanmaydi. Sana — Toshkent bo'yicha 30 kun oldindan 180 kun keyingacha.
+create or replace function public.record_contact_outcome(
+  p_provider_id uuid,
+  p_agreed      boolean,
+  p_price       int  default null,
+  p_work_date   date default null
+)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_uid   uuid := require_uid();
+  v_today date := (now() at time zone 'Asia/Tashkent')::date;
+begin
+  if p_agreed is null or p_provider_id is null then raise exception 'INVALID_INPUT'; end if;
+  if p_agreed and p_price is not null and p_price not between 1000 and 1000000000 then
+    raise exception 'INVALID_PRICE';
+  end if;
+  if p_agreed and p_work_date is not null and p_work_date not between v_today - 30 and v_today + 180 then
+    raise exception 'INVALID_INPUT';
+  end if;
+  if not exists (select 1 from provider_contacts
+                  where client_id = v_uid and provider_id = p_provider_id and kind in ('call', 'message')
+                    and created_at > now() - interval '3 days') then
+    raise exception 'NOT_ALLOWED';
+  end if;
+  insert into contact_outcomes (client_id, provider_id, agreed, price, work_date)
+  values (v_uid, p_provider_id, p_agreed,
+          case when p_agreed then p_price end,
+          case when p_agreed then p_work_date end);
+end;
+$$;
+
 -- Usta profilida: joriy foydalanuvchi bu ustani baholay oladimi (oldin qo'ng'iroq qilgan) va avvalgi bahosi
 create or replace function public.get_my_contact_review(p_provider_id uuid)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
@@ -7670,6 +7718,10 @@ begin
                         where cr.client_id = c.client_id and cr.provider_id = c.provider_id)
        and not exists (select 1 from contracts k
                         where k.client_id = c.client_id and k.provider_id = c.provider_id)
+       -- 2026-11-28: «Kelishdik» deb ish sanasini kelajakka belgilagan bo'lsa — baho so'rovi ish kunidan keyin
+       and not exists (select 1 from contact_outcomes o
+                        where o.client_id = c.client_id and o.provider_id = c.provider_id
+                          and o.agreed and o.work_date >= (now() at time zone 'Asia/Tashkent')::date)
      order by c.client_id, c.provider_id, c.created_at
      limit 200
   loop
@@ -7802,12 +7854,14 @@ revoke execute on function public._provider_missing(uuid), public.run_periodic_t
 
 revoke execute on function
   public.log_provider_contact(uuid, text), public.get_my_contact_review(uuid),
-  public.leave_contact_review(uuid, int, text), public.renew_job(uuid)
+  public.leave_contact_review(uuid, int, text), public.renew_job(uuid),
+  public.record_contact_outcome(uuid, boolean, int, date)
   from public, anon;
 
 grant execute on function
   public.log_provider_contact(uuid, text), public.get_my_contact_review(uuid),
-  public.leave_contact_review(uuid, int, text), public.renew_job(uuid)
+  public.leave_contact_review(uuid, int, text), public.renew_job(uuid),
+  public.record_contact_outcome(uuid, boolean, int, date)
   to authenticated;
 
 -- Admin: o'z telefoniga sinov bildirishnomasi (push to'g'ri ishlayotganini tekshirish uchun)
